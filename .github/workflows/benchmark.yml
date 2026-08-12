@@ -1,0 +1,124 @@
+name: "Benchmark"
+
+# First milestone of the OpenMS benchmarking effort (Issue #8788).
+#
+# Flow:
+#   fixed OpenMS SHA -> Linux build in GitHub Actions -> generated binaries
+#   -> smoke benchmark (Comet -> Percolator) -> results + resource info
+#
+# The MS2Rescore choice is plumbed through as a workflow input and recorded in
+# the results, but the actual MS2Rescore execution is part of the *extended*
+# benchmark (a later milestone) and is NOT run here. See README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      openms_sha:
+        description: "OpenMS commit SHA to build and benchmark"
+        required: false
+        default: "f1768367fa66f7901b4fa78a9ebece64b2ce9024"
+      use_ms2rescore:
+        description: "Request the extended (MS2Rescore) benchmark mode"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-openms:
+    name: "Build OpenMS (Linux, fixed SHA)"
+    runs-on: ubuntu-24.04
+    outputs:
+      openms_sha: ${{ steps.sha.outputs.sha }}
+      build_minutes: ${{ steps.build.outputs.minutes }}
+    steps:
+      - name: Checkout OpenMS at pinned SHA
+        uses: actions/checkout@v6
+        with:
+          repository: OpenMS/OpenMS
+          ref: ${{ inputs.openms_sha }}
+
+      # Resolve the full SHA so the results record exactly what was built,
+      # even when the input is a short SHA or a branch name.
+      - name: Resolve pinned SHA
+        id: sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Reuse OpenMS' own dependency script (the same one its CI uses) instead
+      # of duplicating the package list here. --skip-gui-deps keeps the build
+      # lean: TOPP tools do not need Qt, so WITH_GUI is disabled below.
+      - name: Install dependencies
+        shell: bash
+        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+
+      # Search engines (Comet, Percolator, ...) ship as the THIRDPARTY
+      # submodule of OpenMS; stage them exactly like OpenMS' CI does so the
+      # adapters can find them at runtime.
+      - name: Stage search engines
+        shell: bash
+        run: |
+          git submodule update --init THIRDPARTY
+          mkdir -p _thirdparty
+          cp -R THIRDPARTY/Linux/$(uname -m)/* _thirdparty/
+          cp -R THIRDPARTY/All/* _thirdparty/
+
+      - name: Configure (Release, Ninja)
+        shell: bash
+        env:
+          SEARCH_ENGINES_DIRECTORY: ${{ github.workspace }}/_thirdparty
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_GUI=OFF \
+            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          start=$(date +%s)
+          cmake --build build
+          end=$(date +%s)
+          echo "minutes=$(( (end - start) / 60 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Upload OpenMS binaries and search engines
+        uses: actions/upload-artifact@v7
+        with:
+          name: openms-bin-${{ steps.sha.outputs.sha }}
+          path: |
+            build/bin
+            _thirdparty
+          if-no-files-found: error
+
+  run-benchmark:
+    name: "Smoke benchmark (Comet -> Percolator)"
+    runs-on: ubuntu-24.04
+    needs: build-openms
+    env:
+      USE_MS2RESCORE: ${{ inputs.use_ms2rescore && 'true' || 'false' }}
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      - name: Download OpenMS binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: openms-bin-${{ needs.build-openms.outputs.openms_sha }}
+          path: openms
+
+      - name: Run smoke benchmark
+        shell: bash
+        env:
+          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
+          ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
+          OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
+          RESULTS_DIR: ${{ github.workspace }}/results
+        run: bash benchmark/run_smoke_benchmark.sh
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ needs.build-openms.outputs.openms_sha }}
+          path: results
+          if-no-files-found: error
