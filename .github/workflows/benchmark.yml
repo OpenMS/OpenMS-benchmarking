@@ -62,6 +62,9 @@ jobs:
           cp -R THIRDPARTY/Linux/$(uname -m)/* _thirdparty/
           cp -R THIRDPARTY/All/* _thirdparty/
 
+      # Headless build: no Qt, no docs. ENABLE_DOCS=OFF is required because the
+      # doc toolchain (TOPPDocumenter et al.) includes QtCore/QString even
+      # though we never build the docs themselves.
       - name: Configure (Release, Ninja)
         shell: bash
         env:
@@ -71,6 +74,7 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DWITH_GUI=OFF \
+            -DENABLE_DOCS=OFF \
             -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
 
       - name: Build
