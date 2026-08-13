@@ -111,6 +111,12 @@ jobs:
           name: openms-bin-${{ needs.build-openms.outputs.openms_sha }}
           path: openms
 
+      # GitHub's artifact pipeline does not reliably restore the Unix
+      # executable bit, so the downloaded binaries need chmod before use.
+      - name: Make downloaded binaries executable
+        shell: bash
+        run: chmod -R +x openms/build/bin openms/_thirdparty
+
       - name: Run smoke benchmark
         shell: bash
         env:
