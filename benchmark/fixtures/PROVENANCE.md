@@ -6,8 +6,8 @@ download in CI) and deterministic.
 
 | File | Source (OpenMS repo) | Size | Content |
 |---|---|---|---|
-| `smoke_input.mzML` | `src/tests/topp/AssayGeneratorMetabo_decoy_generation_input.mzML` | 191 KB | 51 spectra (17 MS1 / 34 MS2), real indexed mzML |
-| `smoke_input.fasta` | `src/tests/topp/FileInfo_17_input.fasta` | 2.8 KB | 11 protein sequences (crab crystallin) |
+| `smoke_input.mzML` | `src/tests/topp/SimpleSearchEngine_1.mzML` | 40 KB | real search-engine test spectra |
+| `smoke_input.fasta` | `src/tests/topp/DecoyDatabase_1.fasta` | 4.0 KB | 3 protein sequences (clean, decoy-free: the FASTA fed to DecoyDatabase must not already contain decoys) |
 
 Copied from OpenMS commit `f1768367fa66f7901b4fa78a9ebece64b2ce9024`
 (upstream develop, 2026-08-12).

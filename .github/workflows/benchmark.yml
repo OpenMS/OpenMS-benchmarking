@@ -86,9 +86,11 @@ jobs:
           end=$(date +%s)
           echo "minutes=$(( (end - start) / 60 ))" >> "$GITHUB_OUTPUT"
 
-      # Ship the shared library too: TOPP binaries link against libOpenMS.so
-      # (build/lib), and the build-tree RPATH does not exist on the runner -
-      # without the library the smoke job gets exit 127 on every tool.
+      # Ship the shared library and shared data too: TOPP binaries link
+      # against libOpenMS.so (build/lib) and need OpenMS' share/OpenMS data
+      # at runtime. Neither the build-tree RPATH nor the compiled-in data
+      # paths exist on the runner, so without them the smoke job gets exit
+      # 127 / "Cannot find shared data" on every tool.
       - name: Upload OpenMS binaries and search engines
         uses: actions/upload-artifact@v7
         with:
@@ -96,6 +98,7 @@ jobs:
           path: |
             build/bin
             build/lib
+            share/OpenMS
             _thirdparty
           if-no-files-found: error
 
@@ -138,6 +141,7 @@ jobs:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh

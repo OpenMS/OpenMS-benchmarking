@@ -4,3 +4,8 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=lf
+
+# Data fixtures must stay LF as well: CRLF breaks the FASTA parser
+# on Linux runners (DecoyDatabase rejects '' in sequences).
+*.fasta text eol=lf
+*.mzML text eol=lf
