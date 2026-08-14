@@ -86,12 +86,16 @@ jobs:
           end=$(date +%s)
           echo "minutes=$(( (end - start) / 60 ))" >> "$GITHUB_OUTPUT"
 
+      # Ship the shared library too: TOPP binaries link against libOpenMS.so
+      # (build/lib), and the build-tree RPATH does not exist on the runner -
+      # without the library the smoke job gets exit 127 on every tool.
       - name: Upload OpenMS binaries and search engines
         uses: actions/upload-artifact@v7
         with:
           name: openms-bin-${{ steps.sha.outputs.sha }}
           path: |
             build/bin
+            build/lib
             _thirdparty
           if-no-files-found: error
 
@@ -104,6 +108,13 @@ jobs:
     steps:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
+
+      # The smoke job runs on a fresh runner, but the downloaded binaries
+      # need OpenMS' runtime libraries (xerces, hdf5, libzip, boost, ...).
+      # Install the same non-GUI deps the build job uses.
+      - name: Install runtime dependencies
+        shell: bash
+        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
         uses: actions/download-artifact@v8
@@ -122,6 +133,7 @@ jobs:
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh
