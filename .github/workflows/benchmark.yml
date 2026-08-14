@@ -111,10 +111,14 @@ jobs:
 
       # The smoke job runs on a fresh runner, but the downloaded binaries
       # need OpenMS' runtime libraries (xerces, hdf5, libzip, boost, ...).
-      # Install the same non-GUI deps the build job uses.
+      # Install the same non-GUI deps the build job uses. The deps script
+      # lives in the OpenMS repo (not this one), so fetch it at the exact
+      # pinned SHA rather than duplicating the package list here.
       - name: Install runtime dependencies
         shell: bash
-        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
         uses: actions/download-artifact@v8
