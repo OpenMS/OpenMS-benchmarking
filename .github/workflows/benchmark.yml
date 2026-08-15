@@ -51,6 +51,32 @@ jobs:
         shell: bash
         run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
 
+      # ccache: the same compiler-cache strategy OpenMS CI uses (see
+      # .github/actions/build/action.yml in OpenMS), transplanted here. The
+      # cache is keyed by the *pinned SHA*, so repeated benchmarks of the same
+      # SHA skip the ~70 min cold build entirely, while benchmarks of nearby
+      # SHAs still hit most entries because ccache keys on file content, not
+      # on the commit. This is what maintainer @jpfeuffer suggested.
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: openms-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.sha.outputs.sha }}
+          restore-keys: |
+            openms-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.sha.outputs.sha }}
+            openms-ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ccache"
+          {
+            echo "CCACHE_COMPRESS=true"
+            echo "CCACHE_COMPRESSLEVEL=6"
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_MAXSIZE=1G"
+          } >> "$GITHUB_ENV"
+
       # Search engines (Comet, Percolator, ...) ship as the THIRDPARTY
       # submodule of OpenMS; stage them exactly like OpenMS' CI does so the
       # adapters can find them at runtime.
@@ -64,7 +90,8 @@ jobs:
 
       # Headless build: no Qt, no docs. ENABLE_DOCS=OFF is required because the
       # doc toolchain (TOPPDocumenter et al.) includes QtCore/QString even
-      # though we never build the docs themselves.
+      # though we never build the docs themselves. The compiler launchers make
+      # every compile go through ccache.
       - name: Configure (Release, Ninja)
         shell: bash
         env:
@@ -73,6 +100,8 @@ jobs:
           cmake -S . -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DWITH_GUI=OFF \
             -DENABLE_DOCS=OFF \
             -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"

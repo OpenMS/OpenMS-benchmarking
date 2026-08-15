@@ -188,11 +188,15 @@ run_stage "comet" true \
   -in "${FIXTURES_DIR}/smoke_input.mzML" \
   -database "${RESULTS_DIR}/decoy.fasta" \
   -comet_executable "${COMET_ENGINE}" \
+  -num_hits 5 \
+  -missed_cleavages 3 \
   -out "${RESULTS_DIR}/comet.idXML"
 
-# Optional: the smoke fixture is tiny, so Percolator may legitimately refuse to
-# run (too few PSMs). Its outcome is recorded either way; it becomes required
-# once the real PXD028735 benchmark runs in a later milestone.
+# Optional: the fixture is small, so Percolator may legitimately refuse to run
+# (too few PSMs). Its outcome is recorded either way; it becomes required once
+# the real PXD028735 benchmark runs in a later milestone. The fixture is
+# CometAdapter_3 from OpenMS' own tests, whose spectra yield both target and
+# decoy PSMs at these parameters, so Percolator normally does run here.
 run_stage "percolator" false \
   "${OPENMS_BIN}/PercolatorAdapter" \
   -in "${RESULTS_DIR}/comet.idXML" \
