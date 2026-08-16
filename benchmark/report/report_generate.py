@@ -108,6 +108,46 @@ def tool_metrics(tool_result):
     """The flat metric bag of a tool/reference result."""
     return dict(tool_result.get("metrics", {}))
 
+def build_tldr(current, baseline, tool_results):
+    """One human paragraph summing the report up in plain words.
+
+    Tables are for the machine; this is the sentence you can paste into a
+    message to a colleague without losing anything important.
+    """
+    bench = current.get("benchmark", "benchmark")
+    run_id = current.get("run_id", "?")
+    verdict = current.get("verdict", "unknown")
+    sha = short_sha(current.get("openms_sha", "unknown"))
+    out = []
+    if verdict == "pass":
+        out.append(f"The {bench} run {run_id} (OpenMS {sha}) passed - nothing failed on its own.")
+    else:
+        out.append(f"The {bench} run {run_id} (OpenMS {sha}) did not pass (verdict: {verdict}).")
+    if baseline:
+        b_id = baseline.get("run_id", "?")
+        c_cache = current.get("cache") or "unknown"
+        b_cache = baseline.get("cache") or "unknown"
+        out.append(f"Compared with the previous run {b_id}, the required stages still pass.")
+        if c_cache != b_cache:
+            out.append(f"The build times are not directly comparable, though: this run had a {c_cache} ccache, the previous one a {b_cache} one.")
+        else:
+            bw = (baseline.get("build") or {}).get("wall_time_s")
+            cw = (current.get("build") or {}).get("wall_time_s")
+            if bw and cw:
+                pct = (cw - bw) / bw * 100.0
+                sign = "+" if pct >= 0 else ""
+                out.append(f"Build time is {fmt_seconds(cw)} vs {fmt_seconds(bw)} before ({sign}{pct:.1f}%).")
+    if len(tool_results) >= 2:
+        first, last = tool_results[0], tool_results[-1]
+        m0, m1 = tool_metrics(first), tool_metrics(last)
+        q0, q1 = m0.get("quantified_precursors"), m1.get("quantified_precursors")
+        if q0 and q1:
+            diff = q1 - q0
+            pct = diff / q0 * 100.0
+            sign = "+" if diff >= 0 else ""
+            out.append(f"On the ProteoBench reference set, {last.get('label')} quantified {q1:,} precursors vs {q0:,} for {first.get('label')} ({sign}{pct:.1f}%).")
+    return " ".join(out)
+
 
 def fmt_seconds(s):
     """123.0 -> '2m 03s'; 4581 -> '1h 16m 21s'."""
@@ -200,59 +240,101 @@ def pick_baseline(current, openms_runs):
 
 CSS = """
 :root {
-  --ink: #1f2430; --muted: #6b7280; --line: #e5e7eb; --bg: #ffffff;
-  --accent: #1a56db; --ok: #047857; --ok-bg: #ecfdf5; --bad: #b91c1c;
-  --bad-bg: #fef2f2; --warn: #b45309; --warn-bg: #fffbeb;
+  /* OpenMS brand palette, lifted from the project logo
+     (cmake/MacOSX/openms_logo_large_transparent.png): a dark purple-black
+     ink with orange, red, magenta, purple and blue bars. */
+  --om-ink: #1d0f28;
+  --om-orange: #e07000;
+  --om-red: #d64545;
+  --om-magenta: #d915a8;
+  --om-purple: #7a2fe0;
+  --om-blue: #2f54e0;
+
+  /* semantic status colors, kept warm to sit with the brand */
+  --ok: #0d8a5c;   --ok-bg: #e9f6f0;   --ok-line: #bfe6d4;
+  --bad: #c02e2e;  --bad-bg: #fcf0f0;  --bad-line: #f0c6c6;
+  --warn: #a96a00; --warn-bg: #fdf5e8; --warn-line: #f0d9ae;
+
+  --bg: #f6f1ea;      /* warm paper */
+  --card: #fffdf9;
+  --line: #ece2d3;    /* warm hairline */
+  --muted: #8b7a6d;
+  --ink: #262033;
+
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: #f3f4f6; color: var(--ink);
-       font: 14px/1.55 var(--sans); }
-.page { max-width: 980px; margin: 24px auto; padding: 0 16px; }
-.card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
-        margin-bottom: 18px; overflow: hidden; }
-.card > h2 { margin: 0; padding: 12px 18px; font-size: 13px; letter-spacing: .08em;
-             text-transform: uppercase; color: var(--muted);
-             border-bottom: 1px solid var(--line); background: #fafafa; }
-.card > h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
-.inner { padding: 14px 18px 18px; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14.5px/1.6 var(--sans); }
+.page { max-width: 1000px; margin: 28px auto; padding: 0 16px; }
 
-h1 { font-size: 22px; margin: 0 0 4px; }
-.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 8px 24px; margin-top: 12px; }
-.meta div { display: flex; justify-content: space-between; gap: 16px;
-            border-bottom: 1px dashed var(--line); padding: 3px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+        margin-bottom: 18px; overflow: hidden;
+        box-shadow: 0 1px 2px rgba(38,32,51,.05), 0 12px 30px -18px rgba(38,32,51,.28); }
+.card > h2 { margin: 0; padding: 13px 20px; font-size: 12px; letter-spacing: .09em;
+            text-transform: uppercase; color: var(--muted);
+            border-bottom: 1px solid var(--line); background: #fbf7f0; font-weight: 600; }
+.card > h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.card > h2::before { content: ""; display: inline-block; width: 9px; height: 9px;
+                     border-radius: 2.5px; margin-right: 9px; background: var(--om-blue);
+                     vertical-align: 1px; }
+.acc-orange > h2::before { background: var(--om-orange); }
+.acc-red > h2::before { background: var(--om-red); }
+.acc-magenta > h2::before { background: var(--om-magenta); }
+.acc-purple > h2::before { background: var(--om-purple); }
+.acc-blue > h2::before { background: var(--om-blue); }
+.acc-ok > h2::before { background: var(--ok); }
+.inner { padding: 16px 20px 20px; }
+
+.hero { background: linear-gradient(140deg, var(--om-ink) 0%, #2a143f 60%, #3c1b58 100%);
+        color: #fff; }
+.hero .spectrum { height: 6px; background: linear-gradient(90deg, var(--om-orange),
+                  var(--om-red), var(--om-magenta), var(--om-purple), var(--om-blue)); }
+.hero h1 { font-family: var(--serif); font-size: 27px; margin: 0 0 3px;
+           font-weight: 600; letter-spacing: .2px; }
+.hero .subtitle { color: #d8c7e8; font-size: 13px; }
+
+.tl { border-left: 4px solid var(--om-magenta); }
+.tl-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .14em;
+            color: var(--om-magenta); font-weight: 700; margin-bottom: 5px; }
+.tldr { margin: 0; font-size: 14.5px; line-height: 1.65; }
+
+.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 4px 28px; margin: 0; }
+.meta div { display: flex; justify-content: space-between; gap: 14px;
+            border-bottom: 1px dashed var(--line); padding: 6px 0; }
 .meta dt { color: var(--muted); }
 .meta dd { margin: 0; font-family: var(--mono); font-size: 13px; text-align: right; }
 
-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left;
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: left;
          vertical-align: top; }
-thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
-           color: var(--muted); background: #fafafa; white-space: nowrap; }
+thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+           color: var(--muted); background: #fbf7f0; white-space: nowrap; font-weight: 600; }
 td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: none; }
-tbody tr:nth-child(even) { background: #fcfcfd; }
+tbody tr:nth-child(even) { background: #fcf9f4; }
 .mono { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
 
-.chip { display: inline-block; padding: 1px 9px; border-radius: 999px;
-        font-size: 12px; font-weight: 600; margin-left: 6px; vertical-align: 2px; }
-.chip.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid #a7f3d0; }
-.chip.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid #fecaca; }
-.chip.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; }
-.chip.neutral { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; }
+.chip { display: inline-block; padding: 2px 10px; border-radius: 999px;
+        font-size: 12px; font-weight: 600; margin-left: 6px; vertical-align: 2px;
+        border: 1px solid transparent; }
+.chip.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok-line); }
+.chip.bad { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-line); }
+.chip.warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn-line); }
+.chip.neutral { background: #f3eee6; color: #5d5147; border-color: #e2d6c4; }
 
-.status-line { font-size: 15px; font-weight: 600; }
+.status-line { font-size: 16px; font-weight: 650; }
 .status-line .ok { color: var(--ok); }
 .status-line .bad { color: var(--bad); }
 .status-line .warn { color: var(--warn); }
-.note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
-.note code, code { font-family: var(--mono); font-size: 12px; background: #f3f4f6;
-                   padding: 0 4px; border-radius: 4px; }
+.note { color: var(--muted); font-size: 12.5px; margin-top: 12px; line-height: 1.55; }
+.note code, code { font-family: var(--mono); font-size: 12px; background: #f4eee4;
+                   padding: 1px 5px; border-radius: 5px; }
 .dim { color: var(--muted); }
-footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 0 24px; }
-.badrow td { background: #fef2f2; }
+footer { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 0 28px; }
+.badrow td { background: var(--bad-bg); }
 """
 
 
@@ -316,19 +398,28 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     # ----- header ----------------------------------------------------------
     sha = current.get("openms_sha", "unknown")
     head = f"""
+    <div class="card hero">
+      <div class="spectrum"></div>
+      <div class="inner">
+        <h1>OpenMS Benchmark Report</h1>
+        <div class="subtitle">{esc(current.get('benchmark', 'unknown'))} benchmark &middot; generated {esc(generated.strftime('%d %b %Y, %H:%M %Z'))}</div>
+      </div>
+    </div>
     <div class="card"><div class="inner">
-      <h1>OpenMS Benchmark Report</h1>
-      <div class="dim">{esc(current.get('benchmark', 'unknown'))} benchmark —
-      generated {esc(generated.strftime('%Y-%m-%d %H:%M %Z'))}</div>
       <dl class="meta">
-        <div><dt>OpenMS SHA</dt><dd>{esc(short_sha(sha))} <span class="mono" title="{esc(sha)}">({esc(sha[:6])})</span></dd></div>
+        <div><dt>OpenMS SHA</dt><dd><span class="mono" title="{esc(sha)}">{esc(short_sha(sha))}</span></dd></div>
         <div><dt>Run</dt><dd>{esc(current.get('run_id', '—'))} <span class="dim">({esc(current.get('_file', ''))})</span></dd></div>
         <div><dt>Run at</dt><dd>{esc(str(current.get('run_at', '—')))}</dd></div>
         <div><dt>Cache</dt><dd>{_chip(cache, cache_cls)}</dd></div>
         <div><dt>Rescoring</dt><dd>{'on' if current.get('use_ms2rescore') else 'off'}</dd></div>
         <div><dt>Verdict</dt><dd>{_chip(verdict, verdict_cls)}</dd></div>
       </dl>
+    </div></div>
+    <div class="card tl"><div class="inner">
+      <div class="tl-label">In one sentence</div>
+      <p class="tldr">{esc(build_tldr(current, baseline, tool_results))}</p>
     </div></div>"""
+
 
     # ----- build -----------------------------------------------------------
     build = current.get("build") or {}
@@ -344,23 +435,21 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
         if current.get("head_sha") else ""
     )
     build_section = f"""
-    <div class="card"><h2>Build</h2><div class="inner">
+    <div class="card acc-orange"><h2>Build</h2><div class="inner">
       <table><tbody>{build_rows}</tbody></table>
-      <div class="note">Build metrics come from the run metadata recorded at
-      <code>normalize</code> time (CI knows them; the smoke script itself does not).</div>
+      <div class="note">Where does this come from? CI records build time, artifact size and the ccache state when the result is normalized - the smoke script itself only measures the pipeline stages below.</div>
     </div></div>"""
 
     # ----- identification (pipeline stages) --------------------------------
     if current.get("stages"):
         ident_section = f"""
-        <div class="card"><h2>Pipeline stages <span class="sub">— identification &amp; rescoring</span></h2><div class="inner">
+        <div class="card acc-blue"><h2>Pipeline stages <span class="sub">— identification &amp; rescoring</span></h2><div class="inner">
           <table>
             <thead><tr><th>Stage</th><th>Result</th><th class="num">Wall</th>
             <th class="num">CPU</th><th class="num">Peak RSS</th></tr></thead>
             <tbody>{_stage_rows(current)}</tbody>
           </table>
-          <div class="note">PSM / peptide / protein counts are not measured in
-          smoke mode — they require the PXD028735 milestone.</div>
+          <div class="note">PSM / peptide / protein counts are not measured in smoke mode — those need the PXD028735 milestone.</div>
         </div></div>"""
     else:
         ident_section = ""
@@ -374,7 +463,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             f"<tr><td>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
             for k, v in sorted(qmetrics.items()))
         quant_section = f"""
-        <div class="card"><h2>Quantification</h2><div class="inner">
+        <div class="card acc-purple"><h2>Quantification</h2><div class="inner">
           <table><tbody>{qrows}</tbody></table>
         </div></div>"""
     else:
@@ -404,13 +493,13 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                     cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
                 delta_rows += f"<tr><td>{esc(h)}</td>{cells}</tr>"
         pb_rows = f"""
-        <div class="card"><h2>ProteoBench <span class="sub">— reference results (local scorer, v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))})</span></h2><div class="inner">
+        <div class="card acc-magenta"><h2>ProteoBench <span class="sub">— reference results (local scorer, v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))})</span></h2><div class="inner">
           <table>
             <thead><tr><th>Metric</th>{"".join(f"<th class='num'>{esc(l)}</th>" for l in labels)}{delta_col}</tr></thead>
             <tbody>{delta_rows or '<tr><td class="dim" colspan="%d">No numeric headline metrics found in the tool results.</td></tr>' % (len(labels) + 2)}</tbody>
           </table>
           <div class="note">Generated locally by <code>run_proteobench_local.py</code>
-          (reproduces proteobench.io results bit-exactly, incl. the intermediate hash).</div>
+          (reproduces proteobench.io bit-for-bit — intermediate hash included).</div>
         </div></div>"""
     else:
         pb_rows = ""
@@ -446,7 +535,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                 f"<b>{esc(baseline.get('cache'))}</b>), so the build-time Δ reflects "
                 "the ccache state, not a code change.</div>")
         comp_section = f"""
-        <div class="card"><h2>Comparison <span class="sub">— current vs stored baseline</span></h2><div class="inner">
+        <div class="card acc-purple"><h2>Comparison <span class="sub">— current vs stored baseline</span></h2><div class="inner">
           <table>
             <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">{esc(baseline.get('run_id', ''))}</span></th>
             <th class="num">Current<br><span class="dim">{esc(current.get('run_id', ''))}</span></th>
@@ -454,10 +543,10 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             <tbody>{rows}</tbody>
           </table>
           {cache_note}
-          <div class="note">Baseline = previous OpenMS run of the same benchmark
-          ({esc(baseline.get('_file', ''))}). Only metrics present in both runs are
-          compared; stage wall times at smoke scale vary with runner load, so
-          treat their Δs as indicative, not as regression signals.</div>
+          <div class="note">We compare against the previous OpenMS run of the same benchmark
+          ({esc(baseline.get('_file', ''))}). Only metrics both runs share are
+          compared. Stage wall times at this scale jump around with runner
+          load, so treat their Δs as hints, not regressions.</div>
         </div></div>"""
     else:
         comp_section = ""
@@ -481,7 +570,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                 f"<td class='num'>{fmt_seconds(build_s) if build_s else '—'}</td></tr>"
             )
         history_section = f"""
-        <div class="card"><h2>Run history</h2><div class="inner">
+        <div class="card acc-orange"><h2>Run history</h2><div class="inner">
           <table>
             <thead><tr><th>Run</th><th>Run at</th><th>OpenMS SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
@@ -508,12 +597,12 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     skip_note = (f"<div class='note'>Optional stages skipped: {esc(', '.join(skipped))}.</div>"
                  if skipped else "")
     status_section = f"""
-    <div class="card"><h2>Status</h2><div class="inner">
+    <div class="card acc-ok"><h2>Status</h2><div class="inner">
       <div class="status-line">{status}</div>
       {skip_note}
-      <div class="note">Regression = required stage flipping pass → fail/skipped, or
-      a non-pass verdict, relative to the stored baseline. Wall-time changes alone
-      are reported but not treated as regressions.</div>
+      <div class="note">A regression here means the verdict flipped, or a required stage went
+      from pass to fail/skipped compared with the baseline. Wall-time changes
+      alone are reported but not treated as regressions.</div>
     </div></div>"""
 
     # ----- assemble -----------------------------------------------------------
@@ -531,8 +620,8 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
 {comp_section}
 {history_section}
 {status_section}
-<footer>Generated by <code>benchmark/report/report_generate.py</code>
-({esc(generated.strftime('%Y-%m-%d %H:%M %Z'))}) · results schema {esc(SCHEMA)} ·
+<footer>OpenMS Benchmark Report &middot; prototype report generator<br>
+<code>benchmark/report/report_generate.py</code> &middot; results schema {esc(SCHEMA)} &middot;
 regenerate with <code>python3 benchmark/report/report_generate.py render</code></footer>
 </div></body></html>"""
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
