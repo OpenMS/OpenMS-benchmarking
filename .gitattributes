@@ -6,6 +6,10 @@
 *.md text eol=lf
 
 # Data fixtures must stay LF as well: CRLF breaks the FASTA parser
-# on Linux runners (DecoyDatabase rejects '' in sequences).
+# on Linux runners (DecoyDatabase rejects bare CR characters in sequences).
 *.fasta text eol=lf
 *.mzML text eol=lf
+
+# The report generator and result JSONs are read/run on Linux too.
+*.py text eol=lf
+*.json text eol=lf

@@ -62,6 +62,57 @@ OPENMS_SHA=$(git -C /path/to/openms rev-parse HEAD) \
 bash benchmark/run_smoke_benchmark.sh
 ```
 
+## Benchmark report
+
+`benchmark/report/report_generate.py` turns machine-readable result JSONs into
+one self-contained HTML report (current run vs the stored baseline, plus
+reference results from other tools such as the local ProteoBench scorer):
+
+```
+benchmark run  ->  JSON result  ->  report_generate.py render  ->  report.html
+```
+
+The generator discovers whatever results exist; nothing is hard-coded to a
+specific run. Result layout (schema `openms-benchmarking/report/v1`):
+
+```
+benchmark/results/
+  openms/   smoke-<run-id>.json     # OpenMS benchmark runs (the comparison history)
+  tools/    proteobench-*.json      # reference results from other tools/sources
+```
+
+Normalize a raw CI `smoke.json` (adding the run metadata the smoke script
+cannot know: build wall time, ccache state, run id):
+
+```bash
+python3 benchmark/report/report_generate.py normalize smoke smoke.json \
+    --run-id 31881021123 --cache warm --build-time 363 \
+    --artifact-bytes 149265170 --run-at 2026-08-15T11:01:59Z \
+    --out benchmark/results/openms/smoke-31881021123.json
+```
+
+Add a local ProteoBench result as a reference:
+
+```bash
+python3 benchmark/report/report_generate.py normalize proteobench \
+    proteobench_local_exp2.json --label "Exp 2 (Comet->MS2Rescore->Percolator)" \
+    --out benchmark/results/tools/proteobench-exp2.json
+```
+
+Render the report (compares the most recent OpenMS run against the previous
+one; `--current` picks a specific run):
+
+```bash
+python3 benchmark/report/report_generate.py render
+# -> benchmark/reports/report.html
+```
+
+The report answers: which OpenMS SHA, when, cold or warm build, the stage
+results, how they compare with the stored baseline, and whether anything
+regressed (verdict / required-stage pass->fail). Wall-time deltas are reported
+but deliberately not treated as regressions - at smoke scale they are
+dominated by runner load.
+
 ## Repository layout
 
 ```
@@ -69,6 +120,12 @@ bash benchmark/run_smoke_benchmark.sh
 benchmark/
   run_smoke_benchmark.sh          # smoke benchmark script
   fixtures/                       # tiny vendored inputs (see PROVENANCE.md)
+  report/
+    report_generate.py            # HTML report generator (stdlib only)
+  results/
+    openms/                       # stored OpenMS run results (comparison baseline)
+    tools/                        # reference results from other tools
+  reports/                        # generated report.html
 ```
 
 ## Out of scope (later milestones)
@@ -76,5 +133,6 @@ benchmark/
 - The full PXD028735 / ProteoBench LFQ DDA benchmark.
 - MS2Rescore execution and the regular-vs-extended benchmark distinction.
 - ProteoBench scoring in CI (the local scorer already reproduces results
-  bit-exactly; see the GSOC notebook, Day-10 Task-12).
-- Scheduled (nightly) runs and baseline comparison.
+  bit-exactly; see the GSOC notebook, Day-10 Task-12). ProteoBench *results*
+  can already be pulled into the HTML report as reference results.
+- Scheduled (nightly) runs.

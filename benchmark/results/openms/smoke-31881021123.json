@@ -1,0 +1,58 @@
+{
+  "schema": "openms-benchmarking/report/v1",
+  "source": "openms",
+  "benchmark": "smoke",
+  "milestone": 1,
+  "run_id": "31881021123",
+  "run_at": "2026-08-15T11:01:59Z",
+  "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024",
+  "cache": "warm",
+  "use_ms2rescore": false,
+  "ms2rescore_note": "off - regular (Comet -> Percolator) benchmark mode",
+  "build": {
+    "wall_time_s": 363.0,
+    "artifact_bytes": 149265170
+  },
+  "stages": [
+    {
+      "name": "decoy_database",
+      "required": true,
+      "exit_code": 0,
+      "wall_time_s": 5.05,
+      "cpu_time_s": 0.01,
+      "peak_rss_kb": 41328,
+      "status": "pass",
+      "reason": ""
+    },
+    {
+      "name": "comet",
+      "required": true,
+      "exit_code": 0,
+      "wall_time_s": 5.23,
+      "cpu_time_s": 0.22,
+      "peak_rss_kb": 62072,
+      "status": "pass",
+      "reason": ""
+    },
+    {
+      "name": "percolator",
+      "required": false,
+      "exit_code": 0,
+      "wall_time_s": 5.06,
+      "cpu_time_s": 0.06,
+      "peak_rss_kb": 50004,
+      "status": "pass",
+      "reason": ""
+    }
+  ],
+  "verdict": "pass",
+  "skipped_optional": [],
+  "tool_versions": {
+    "FileConverter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "CometAdapter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "DecoyDatabase_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "PercolatorAdapter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "comet_engine_version": "",
+    "percolator_engine_version": "Exception caught: Percolator version 3.06.0, Build Date Mar 11 2025 11:26:42"
+  }
+}
