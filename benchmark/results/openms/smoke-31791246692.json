@@ -7,6 +7,7 @@
   "run_at": "2026-08-14T10:12:02Z",
   "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024",
   "cache": "none",
+  "dataset": "smoke fixture (CometAdapter_3)",
   "use_ms2rescore": false,
   "ms2rescore_note": "off - regular (Comet -> Percolator) benchmark mode",
   "build": {

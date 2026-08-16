@@ -327,6 +327,16 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     verdict = current.get("verdict", "unknown")
     verdict_cls = status_class(verdict)
 
+    # which tier this run belongs to, and which dataset(s) it involves:
+    # smoke runs are CI validation on a tiny fixture; the scientific tier is
+    # the PXD028735 reference section (present as tool results when available)
+    tier_cur = {"smoke": "Smoke (CI)", "proteobench": "Scientific"}.get(
+        current.get("benchmark"), str(current.get("benchmark", "?")))
+    tier_str = tier_cur + (" + Scientific (reference)" if tool_results and current.get("benchmark") != "proteobench" else "")
+    cur_dataset = current.get("dataset") or "smoke fixture"
+    tool_dataset = tool_results[0].get("dataset") if tool_results else ""
+    dataset_str = cur_dataset + (f" / {tool_dataset}" if tool_dataset and tool_dataset != cur_dataset else "")
+
     # ----- header ----------------------------------------------------------
     sha = current.get("openms_sha", "unknown")
     head = f"""
@@ -340,6 +350,8 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
         <div><dt>Run at</dt><dd>{esc(str(current.get('run_at', '—')))}</dd></div>
         <div><dt>Cache</dt><dd>{_chip(cache, cache_cls)}</dd></div>
         <div><dt>Rescoring</dt><dd>{'on' if current.get('use_ms2rescore') else 'off'}</dd></div>
+        <div><dt>Tier</dt><dd>{esc(tier_str)}</dd></div>
+        <div><dt>Dataset</dt><dd>{esc(dataset_str)}</dd></div>
         <div><dt>Verdict</dt><dd>{_chip(verdict, verdict_cls)}</dd></div>
       </dl>
     </div></div>"""
@@ -418,7 +430,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                     cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
                 delta_rows += f"<tr><td>{esc(h)}</td>{cells}</tr>"
         pb_rows = f"""
-        <div class="card"><h2>Scientific benchmark <span class="sub">— {esc(tool_results[0].get('dataset', '?'))} · ProteoBench v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))}</span></h2><div class="inner">
+        <div class="card"><h2>Scientific benchmark <span class="sub">— reference results · {esc(tool_results[0].get('dataset', '?'))} · ProteoBench v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))}</span></h2><div class="inner">
           <dl class="meta">
             <div><dt>Dataset</dt><dd>{esc(tool_results[0].get('dataset', '—'))}</dd></div>
             <div><dt>Module</dt><dd>{esc(tool_results[0].get('proteobench', {}).get('module', '—'))}</dd></div>
@@ -429,8 +441,11 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             <thead><tr><th>Metric</th>{"".join(f"<th class='num'>{esc(l)}</th>" for l in labels)}{delta_col}</tr></thead>
             <tbody>{delta_rows or '<tr><td class="dim" colspan="%d">No numeric headline metrics found in the tool results.</td></tr>' % (len(labels) + 2)}</tbody>
           </table>
-          <div class="note">Scored locally with <code>run_proteobench_local.py</code>, which
-          reproduces proteobench.io results bit-exactly, incl. the intermediate hash.</div>
+          <div class="note">Reference results from the earlier PXD028735 benchmark
+          experiments — not metrics from the smoke fixture in this run (Exp 1:
+          Comet → Percolator; Exp 2: Comet → MS²Rescore → Percolator). Scored
+          locally with <code>run_proteobench_local.py</code>, which reproduces
+          proteobench.io results bit-exactly, incl. the intermediate hash.</div>
         </div></div>"""
 
     else:
@@ -601,6 +616,7 @@ def normalize_smoke(args):
         "run_at": args.run_at or "",
         "openms_sha": raw.get("openms_sha", ""),
         "cache": args.cache or "unknown",
+        "dataset": args.dataset or "smoke fixture (CometAdapter_3)",
         "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
         "ms2rescore_note": raw.get("ms2rescore_note", ""),
         "build": {"wall_time_s": float(args.build_time), "artifact_bytes": int(args.artifact_bytes)},
@@ -702,6 +718,8 @@ def main():
     ps.add_argument("--build-time", type=float, required=True)
     ps.add_argument("--artifact-bytes", type=int, required=True)
     ps.add_argument("--run-at", default="")
+    ps.add_argument("--dataset", default="",
+                    help="what was benchmarked (default: smoke fixture)")
     ps.add_argument("--results-dir", default="benchmark/results")
     ps.add_argument("--out")
     ps.set_defaults(fn=normalize_smoke)
