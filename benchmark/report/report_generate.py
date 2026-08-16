@@ -147,6 +147,20 @@ def fmt_delta(cur, prev, numeric):
     return f"{sign}{d:.3f} ({sign}{pct:.1f}%)" if abs(d) < 1 else f"{sign}{d:.1f} ({sign}{pct:.1f}%)"
 
 
+def fmt_delta_abs(cur, prev):
+    """Absolute delta for smoke-stage wall times: '+3.9s', not '+299.2%'.
+
+    Stage runtimes at smoke scale jump around with runner load, so a
+    percentage would look like a regression when it is just noise; the
+    absolute seconds still show what changed.
+    """
+    if cur is None or prev is None or prev == 0:
+        return "—"
+    d = cur - prev
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.1f}s"
+
+
 def short_sha(sha):
     return sha[:10] + "…" if len(sha) > 10 else sha
 
@@ -353,7 +367,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     # ----- identification (pipeline stages) --------------------------------
     if current.get("stages"):
         ident_section = f"""
-        <div class="card"><h2>Pipeline stages <span class="sub">— identification &amp; rescoring</span></h2><div class="inner">
+        <div class="card"><h2>Smoke benchmark <span class="sub">— DecoyDatabase → Comet → Percolator (tiny fixture)</span></h2><div class="inner">
           <table>
             <thead><tr><th>Stage</th><th>Result</th><th class="num">Wall</th>
             <th class="num">CPU</th><th class="num">Peak RSS</th></tr></thead>
@@ -404,14 +418,21 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                     cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
                 delta_rows += f"<tr><td>{esc(h)}</td>{cells}</tr>"
         pb_rows = f"""
-        <div class="card"><h2>ProteoBench <span class="sub">— reference results (local scorer, v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))})</span></h2><div class="inner">
+        <div class="card"><h2>Scientific benchmark <span class="sub">— {esc(tool_results[0].get('dataset', '?'))} · ProteoBench v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))}</span></h2><div class="inner">
+          <dl class="meta">
+            <div><dt>Dataset</dt><dd>{esc(tool_results[0].get('dataset', '—'))}</dd></div>
+            <div><dt>Module</dt><dd>{esc(tool_results[0].get('proteobench', {}).get('module', '—'))}</dd></div>
+            <div><dt>Input format</dt><dd>{esc(tool_results[0].get('proteobench', {}).get('input_format', '—'))}</dd></div>
+            <div><dt>ProteoBench</dt><dd>v{esc(tool_results[0].get('proteobench', {}).get('version', '—'))}</dd></div>
+          </dl>
           <table>
             <thead><tr><th>Metric</th>{"".join(f"<th class='num'>{esc(l)}</th>" for l in labels)}{delta_col}</tr></thead>
             <tbody>{delta_rows or '<tr><td class="dim" colspan="%d">No numeric headline metrics found in the tool results.</td></tr>' % (len(labels) + 2)}</tbody>
           </table>
-          <div class="note">Generated locally by <code>run_proteobench_local.py</code>
-          (reproduces proteobench.io results bit-exactly, incl. the intermediate hash).</div>
+          <div class="note">Scored locally with <code>run_proteobench_local.py</code>, which
+          reproduces proteobench.io results bit-exactly, incl. the intermediate hash.</div>
         </div></div>"""
+
     else:
         pb_rows = ""
 
@@ -432,11 +453,17 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             seen.add(key)
             cur_v, base_v = cur_m.get(key), base_m.get(key)
             numeric = isinstance(cur_v, (int, float)) or isinstance(base_v, (int, float))
+            if key.startswith("stage.") and key.endswith("wall_time_s"):
+                # smoke-stage runtimes are dominated by runner load; show the
+                # absolute seconds, not a scary-looking +299% figure
+                delta_cell = html.escape(fmt_delta_abs(cur_v, base_v))
+            else:
+                delta_cell = html.escape(fmt_delta(cur_v, base_v, numeric))
             rows += (
                 f"<tr><td class='mono'>{esc(key)}</td>"
                 f"<td class='num'>{_fmt_metric(key, base_v)}</td>"
                 f"<td class='num'>{_fmt_metric(key, cur_v)}</td>"
-                f"<td class='num'>{html.escape(fmt_delta(cur_v, base_v, numeric))}</td></tr>"
+                f"<td class='num'>{delta_cell}</td></tr>"
             )
         cache_note = ""
         if (current.get("cache") or "") != (baseline.get("cache") or ""):
@@ -446,7 +473,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                 f"<b>{esc(baseline.get('cache'))}</b>), so the build-time Δ reflects "
                 "the ccache state, not a code change.</div>")
         comp_section = f"""
-        <div class="card"><h2>Comparison <span class="sub">— current vs stored baseline</span></h2><div class="inner">
+        <div class="card"><h2>Comparison <span class="sub">— current vs previous OpenMS run</span></h2><div class="inner">
           <table>
             <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">{esc(baseline.get('run_id', ''))}</span></th>
             <th class="num">Current<br><span class="dim">{esc(current.get('run_id', ''))}</span></th>
@@ -456,8 +483,10 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
           {cache_note}
           <div class="note">Baseline = previous OpenMS run of the same benchmark
           ({esc(baseline.get('_file', ''))}). Only metrics present in both runs are
-          compared; stage wall times at smoke scale vary with runner load, so
-          treat their Δs as indicative, not as regression signals.</div>
+          compared. Smoke-stage timings are informational only — they are not
+          used for regression decisions. External-tool comparisons (e.g.
+          ProteoBench uploads) will join this section once multi-reference
+          support lands.</div>
         </div></div>"""
     else:
         comp_section = ""
@@ -619,6 +648,9 @@ def normalize_proteobench(args):
             "input_format": raw.get("input_format", "?"),
             "intermediate_hash": raw.get("intermediate_hash", ""),
         },
+        # which dataset was scored; default to the PXD id in the input file
+        # name, or let the caller spell it out (e.g. with the species mix)
+        "dataset": args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown",
         "metrics": metrics,
     }
     # labels are meant for display and may contain characters that are not
@@ -677,6 +709,8 @@ def main():
     pp = pn.add_parser("proteobench", help="normalize a local ProteoBench scoring JSON")
     pp.add_argument("pb_json")
     pp.add_argument("--label", required=True)
+    pp.add_argument("--dataset", default="",
+                    help="dataset id/label, e.g. PXD028735 (HYE mixed-species)")
     pp.add_argument("--results-dir", default="benchmark/results")
     pp.add_argument("--out")
     pp.set_defaults(fn=normalize_proteobench)

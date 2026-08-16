@@ -17,6 +17,7 @@
     "input_format": "quantms",
     "intermediate_hash": "97177cc5854414cb06b6fa5390e4cf6a875a633e"
   },
+  "dataset": "PXD028735 (HYE mixed-species)",
   "metrics": {
     "quantified_precursors": 41379,
     "median_abs_epsilon": 0.21859387974159894,
