@@ -4,114 +4,68 @@
 <title>OpenMS Benchmark Report — f1768367fa…</title>
 <style>
 :root {
-  /* OpenMS brand palette, lifted from the project logo
-     (cmake/MacOSX/openms_logo_large_transparent.png): a dark purple-black
-     ink with orange, red, magenta, purple and blue bars. */
-  --om-ink: #1d0f28;
-  --om-orange: #e07000;
-  --om-red: #d64545;
-  --om-magenta: #d915a8;
-  --om-purple: #7a2fe0;
-  --om-blue: #2f54e0;
-
-  /* semantic status colors, kept warm to sit with the brand */
-  --ok: #0d8a5c;   --ok-bg: #e9f6f0;   --ok-line: #bfe6d4;
-  --bad: #c02e2e;  --bad-bg: #fcf0f0;  --bad-line: #f0c6c6;
-  --warn: #a96a00; --warn-bg: #fdf5e8; --warn-line: #f0d9ae;
-
-  --bg: #f6f1ea;      /* warm paper */
-  --card: #fffdf9;
-  --line: #ece2d3;    /* warm hairline */
-  --muted: #8b7a6d;
-  --ink: #262033;
-
+  --ink: #1f2430; --muted: #6b7280; --line: #e5e7eb; --bg: #ffffff;
+  --accent: #1a56db; --ok: #047857; --ok-bg: #ecfdf5; --bad: #b91c1c;
+  --bad-bg: #fef2f2; --warn: #b45309; --warn-bg: #fffbeb;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 14.5px/1.6 var(--sans); }
-.page { max-width: 1000px; margin: 28px auto; padding: 0 16px; }
-
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-        margin-bottom: 18px; overflow: hidden;
-        box-shadow: 0 1px 2px rgba(38,32,51,.05), 0 12px 30px -18px rgba(38,32,51,.28); }
-.card > h2 { margin: 0; padding: 13px 20px; font-size: 12px; letter-spacing: .09em;
-            text-transform: uppercase; color: var(--muted);
-            border-bottom: 1px solid var(--line); background: #fbf7f0; font-weight: 600; }
+body { margin: 0; background: #f3f4f6; color: var(--ink);
+       font: 14px/1.55 var(--sans); }
+.page { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+.card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+        margin-bottom: 18px; overflow: hidden; }
+.card > h2 { margin: 0; padding: 12px 18px; font-size: 13px; letter-spacing: .08em;
+             text-transform: uppercase; color: var(--muted);
+             border-bottom: 1px solid var(--line); background: #fafafa; }
 .card > h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
-.card > h2::before { content: ""; display: inline-block; width: 9px; height: 9px;
-                     border-radius: 2.5px; margin-right: 9px; background: var(--om-blue);
-                     vertical-align: 1px; }
-.acc-orange > h2::before { background: var(--om-orange); }
-.acc-red > h2::before { background: var(--om-red); }
-.acc-magenta > h2::before { background: var(--om-magenta); }
-.acc-purple > h2::before { background: var(--om-purple); }
-.acc-blue > h2::before { background: var(--om-blue); }
-.acc-ok > h2::before { background: var(--ok); }
-.inner { padding: 16px 20px 20px; }
+.inner { padding: 14px 18px 18px; }
 
-.hero { background: linear-gradient(140deg, var(--om-ink) 0%, #2a143f 60%, #3c1b58 100%);
-        color: #fff; }
-.hero .spectrum { height: 6px; background: linear-gradient(90deg, var(--om-orange),
-                  var(--om-red), var(--om-magenta), var(--om-purple), var(--om-blue)); }
-.hero h1 { font-family: var(--serif); font-size: 27px; margin: 0 0 3px;
-           font-weight: 600; letter-spacing: .2px; }
-.hero .subtitle { color: #d8c7e8; font-size: 13px; }
-
-.tl { border-left: 4px solid var(--om-magenta); }
-.tl-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .14em;
-            color: var(--om-magenta); font-weight: 700; margin-bottom: 5px; }
-.tldr { margin: 0; font-size: 14.5px; line-height: 1.65; }
-
-.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-        gap: 4px 28px; margin: 0; }
-.meta div { display: flex; justify-content: space-between; gap: 14px;
-            border-bottom: 1px dashed var(--line); padding: 6px 0; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 8px 24px; margin-top: 12px; }
+.meta div { display: flex; justify-content: space-between; gap: 16px;
+            border-bottom: 1px dashed var(--line); padding: 3px 0; }
 .meta dt { color: var(--muted); }
 .meta dd { margin: 0; font-family: var(--mono); font-size: 13px; text-align: right; }
 
-table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
-th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: left;
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left;
          vertical-align: top; }
-thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
-           color: var(--muted); background: #fbf7f0; white-space: nowrap; font-weight: 600; }
+thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+           color: var(--muted); background: #fafafa; white-space: nowrap; }
 td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: none; }
-tbody tr:nth-child(even) { background: #fcf9f4; }
+tbody tr:nth-child(even) { background: #fcfcfd; }
 .mono { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
 
-.chip { display: inline-block; padding: 2px 10px; border-radius: 999px;
-        font-size: 12px; font-weight: 600; margin-left: 6px; vertical-align: 2px;
-        border: 1px solid transparent; }
-.chip.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok-line); }
-.chip.bad { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-line); }
-.chip.warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn-line); }
-.chip.neutral { background: #f3eee6; color: #5d5147; border-color: #e2d6c4; }
+.chip { display: inline-block; padding: 1px 9px; border-radius: 999px;
+        font-size: 12px; font-weight: 600; margin-left: 6px; vertical-align: 2px; }
+.chip.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid #a7f3d0; }
+.chip.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid #fecaca; }
+.chip.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; }
+.chip.neutral { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; }
 
-.status-line { font-size: 16px; font-weight: 650; }
+.status-line { font-size: 15px; font-weight: 600; }
 .status-line .ok { color: var(--ok); }
 .status-line .bad { color: var(--bad); }
 .status-line .warn { color: var(--warn); }
-.note { color: var(--muted); font-size: 12.5px; margin-top: 12px; line-height: 1.55; }
-.note code, code { font-family: var(--mono); font-size: 12px; background: #f4eee4;
-                   padding: 1px 5px; border-radius: 5px; }
+.note { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+.note code, code { font-family: var(--mono); font-size: 12px; background: #f3f4f6;
+                   padding: 0 4px; border-radius: 4px; }
 .dim { color: var(--muted); }
-footer { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 0 28px; }
-.badrow td { background: var(--bad-bg); }
+footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 0 24px; }
+.badrow td { background: #fef2f2; }
 </style></head>
 <body><div class="page">
 
-    <div class="card hero">
-      <div class="spectrum"></div>
-      <div class="inner">
-        <h1>OpenMS Benchmark Report</h1>
-        <div class="subtitle">smoke benchmark &middot; generated 16 Aug 2026, 05:47 UTC</div>
-      </div>
-    </div>
     <div class="card"><div class="inner">
+      <h1>OpenMS Benchmark Report</h1>
+      <div class="dim">smoke benchmark —
+      generated 2026-08-16 05:50 UTC</div>
       <dl class="meta">
-        <div><dt>OpenMS SHA</dt><dd><span class="mono" title="f1768367fa66f7901b4fa78a9ebece64b2ce9024">f1768367fa…</span></dd></div>
+        <div><dt>OpenMS SHA</dt><dd>f1768367fa… <span class="mono" title="f1768367fa66f7901b4fa78a9ebece64b2ce9024">(f17683)</span></dd></div>
         <div><dt>Run</dt><dd>31881021123 <span class="dim">(openms/smoke-31881021123.json)</span></dd></div>
         <div><dt>Run at</dt><dd>2026-08-15T11:01:59Z</dd></div>
         <div><dt>Cache</dt><dd><span class="chip ok">warm</span></dd></div>
@@ -119,36 +73,34 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 
         <div><dt>Verdict</dt><dd><span class="chip ok">pass</span></dd></div>
       </dl>
     </div></div>
-    <div class="card tl"><div class="inner">
-      <div class="tl-label">In one sentence</div>
-      <p class="tldr">The smoke run 31881021123 (OpenMS f1768367fa…) passed - nothing failed on its own. Compared with the previous run 31875286910, the required stages still pass. The build times are not directly comparable, though: this run had a warm ccache, the previous one a cold one. On the ProteoBench reference set, Exp 2 (Comet-&gt;MS2Rescore-&gt;Percolator) quantified 41,379 precursors vs 34,635 for Exp 1 (Comet-&gt;Percolator) (+19.5%).</p>
-    </div></div>
 
-    <div class="card acc-orange"><h2>Build</h2><div class="inner">
+    <div class="card"><h2>Build</h2><div class="inner">
       <table><tbody><tr><td>Build wall time</td><td class='num'>6m 03s</td></tr><tr><td>Artifact size</td><td class='num'>142.4 MiB</td></tr><tr><td>Cache state</td><td class='num'>warm</td></tr></tbody></table>
-      <div class="note">Where does this come from? CI records build time, artifact size and the ccache state when the result is normalized - the smoke script itself only measures the pipeline stages below.</div>
+      <div class="note">Build metrics come from the run metadata recorded at
+      <code>normalize</code> time (CI knows them; the smoke script itself does not).</div>
     </div></div>
 
-        <div class="card acc-blue"><h2>Pipeline stages <span class="sub">— identification &amp; rescoring</span></h2><div class="inner">
+        <div class="card"><h2>Pipeline stages <span class="sub">— identification &amp; rescoring</span></h2><div class="inner">
           <table>
             <thead><tr><th>Stage</th><th>Result</th><th class="num">Wall</th>
             <th class="num">CPU</th><th class="num">Peak RSS</th></tr></thead>
             <tbody><tr><td class='mono'>decoy_database</td><td><span class="chip ok">pass</span> <span class='dim'>(required)</span></td><td class='num'>5.0s</td><td class='num'>0.01 s</td><td class='num'>40.4 MiB</td></tr><tr><td class='mono'>comet</td><td><span class="chip ok">pass</span> <span class='dim'>(required)</span></td><td class='num'>5.2s</td><td class='num'>0.22 s</td><td class='num'>60.6 MiB</td></tr><tr><td class='mono'>percolator</td><td><span class="chip ok">pass</span> <span class='dim'>(optional)</span></td><td class='num'>5.1s</td><td class='num'>0.06 s</td><td class='num'>48.8 MiB</td></tr></tbody>
           </table>
-          <div class="note">PSM / peptide / protein counts are not measured in smoke mode — those need the PXD028735 milestone.</div>
+          <div class="note">PSM / peptide / protein counts are not measured in
+          smoke mode — they require the PXD028735 milestone.</div>
         </div></div>
 
 
-        <div class="card acc-magenta"><h2>ProteoBench <span class="sub">— reference results (local scorer, v0.18.2)</span></h2><div class="inner">
+        <div class="card"><h2>ProteoBench <span class="sub">— reference results (local scorer, v0.18.2)</span></h2><div class="inner">
           <table>
             <thead><tr><th>Metric</th><th class='num'>Exp 1 (Comet-&gt;Percolator)</th><th class='num'>Exp 2 (Comet-&gt;MS2Rescore-&gt;Percolator)</th><th class='num'>Δ</th></tr></thead>
             <tbody><tr><td>Quantified precursors</td><td class='num'>34,635</td><td class='num'>41,379</td><td class='num'>+6744.0 (+19.5%)</td></tr><tr><td>Median |ε| (global)</td><td class='num'>0.211</td><td class='num'>0.219</td><td class='num'>+0.008 (+3.6%)</td></tr><tr><td>Mean |ε| (global)</td><td class='num'>0.307</td><td class='num'>0.321</td><td class='num'>+0.014 (+4.7%)</td></tr><tr><td>CV (median)</td><td class='num'>0.227</td><td class='num'>0.228</td><td class='num'>+0.001 (+0.6%)</td></tr><tr><td>ROC AUC</td><td class='num'>0.894</td><td class='num'>0.884</td><td class='num'>-0.010 (-1.1%)</td></tr><tr><td>Intermediate hash</td><td class='num'>2a381c9b2065b7c97705c414acd76c5eeef702ba</td><td class='num'>97177cc5854414cb06b6fa5390e4cf6a875a633e</td></tr></tbody>
           </table>
           <div class="note">Generated locally by <code>run_proteobench_local.py</code>
-          (reproduces proteobench.io bit-for-bit — intermediate hash included).</div>
+          (reproduces proteobench.io results bit-exactly, incl. the intermediate hash).</div>
         </div></div>
 
-        <div class="card acc-purple"><h2>Comparison <span class="sub">— current vs stored baseline</span></h2><div class="inner">
+        <div class="card"><h2>Comparison <span class="sub">— current vs stored baseline</span></h2><div class="inner">
           <table>
             <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">31875286910</span></th>
             <th class="num">Current<br><span class="dim">31881021123</span></th>
@@ -156,13 +108,13 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 
             <tbody><tr><td class='mono'>verdict</td><td class='num'>pass</td><td class='num'>pass</td><td class='num'>same</td></tr><tr><td class='mono'>build.wall_time_s</td><td class='num'>1h 23m 08s</td><td class='num'>6m 03s</td><td class='num'>-4625.0 (-92.7%)</td></tr><tr><td class='mono'>build.artifact_bytes</td><td class='num'>142.4 MiB</td><td class='num'>142.4 MiB</td><td class='num'>+0.000 (+0.0%)</td></tr><tr><td class='mono'>stage.decoy_database.wall_time_s</td><td class='num'>1.5s</td><td class='num'>5.0s</td><td class='num'>+3.5 (+230.1%)</td></tr><tr><td class='mono'>stage.comet.wall_time_s</td><td class='num'>1.3s</td><td class='num'>5.2s</td><td class='num'>+3.9 (+299.2%)</td></tr><tr><td class='mono'>stage.percolator.wall_time_s</td><td class='num'>1.0s</td><td class='num'>5.1s</td><td class='num'>+4.1 (+427.1%)</td></tr><tr><td class='mono'>stage.decoy_database.peak_rss_kb</td><td class='num'>42.3 MiB</td><td class='num'>40.4 MiB</td><td class='num'>-1964.0 (-4.5%)</td></tr><tr><td class='mono'>stage.comet.peak_rss_kb</td><td class='num'>61.6 MiB</td><td class='num'>60.6 MiB</td><td class='num'>-1032.0 (-1.6%)</td></tr><tr><td class='mono'>stage.percolator.peak_rss_kb</td><td class='num'>49.7 MiB</td><td class='num'>48.8 MiB</td><td class='num'>-904.0 (-1.8%)</td></tr></tbody>
           </table>
           <div class="note">⚠ Cache state differs between the two runs (current = <b>warm</b>, baseline = <b>cold</b>), so the build-time Δ reflects the ccache state, not a code change.</div>
-          <div class="note">We compare against the previous OpenMS run of the same benchmark
-          (openms/smoke-31875286910.json). Only metrics both runs share are
-          compared. Stage wall times at this scale jump around with runner
-          load, so treat their Δs as hints, not regressions.</div>
+          <div class="note">Baseline = previous OpenMS run of the same benchmark
+          (openms/smoke-31875286910.json). Only metrics present in both runs are
+          compared; stage wall times at smoke scale vary with runner load, so
+          treat their Δs as indicative, not as regression signals.</div>
         </div></div>
 
-        <div class="card acc-orange"><h2>Run history</h2><div class="inner">
+        <div class="card"><h2>Run history</h2><div class="inner">
           <table>
             <thead><tr><th>Run</th><th>Run at</th><th>OpenMS SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
@@ -170,14 +122,14 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 6px 
           </table>
         </div></div>
 
-    <div class="card acc-ok"><h2>Status</h2><div class="inner">
+    <div class="card"><h2>Status</h2><div class="inner">
       <div class="status-line"><span class="ok">✓ No regression detected</span></div>
       
-      <div class="note">A regression here means the verdict flipped, or a required stage went
-      from pass to fail/skipped compared with the baseline. Wall-time changes
-      alone are reported but not treated as regressions.</div>
+      <div class="note">Regression = required stage flipping pass → fail/skipped, or
+      a non-pass verdict, relative to the stored baseline. Wall-time changes alone
+      are reported but not treated as regressions.</div>
     </div></div>
-<footer>OpenMS Benchmark Report &middot; prototype report generator<br>
-<code>benchmark/report/report_generate.py</code> &middot; results schema openms-benchmarking/report/v1 &middot;
+<footer>Generated by <code>benchmark/report/report_generate.py</code>
+(2026-08-16 05:50 UTC) · results schema openms-benchmarking/report/v1 ·
 regenerate with <code>python3 benchmark/report/report_generate.py render</code></footer>
 </div></body></html>
