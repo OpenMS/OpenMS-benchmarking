@@ -5,6 +5,7 @@ name: "Benchmark"
 # Flow:
 #   fixed OpenMS SHA -> Linux build in GitHub Actions -> generated binaries
 #   -> smoke benchmark (Comet -> Percolator) -> results + resource info
+#   -> OpenSwath DIA benchmark -> results + resource info
 #
 # The MS2Rescore choice is plumbed through as a workflow input and recorded in
 # the results, but the actual MS2Rescore execution is part of the *extended*
@@ -131,7 +132,7 @@ jobs:
             _thirdparty
           if-no-files-found: error
 
-  run-benchmark:
+  run-smoke-benchmark:
     name: "Smoke benchmark (Comet -> Percolator)"
     runs-on: ubuntu-24.04
     needs: build-openms
@@ -180,4 +181,45 @@ jobs:
         with:
           name: benchmark-results-${{ needs.build-openms.outputs.openms_sha }}
           path: results
+          if-no-files-found: error
+
+  run-openswath-benchmark:
+    name: "OpenSwath DIA benchmark"
+    runs-on: ubuntu-24.04
+    needs: build-openms
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
+
+      - name: Download OpenMS binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: openms-bin-${{ needs.build-openms.outputs.openms_sha }}
+          path: openms
+
+      - name: Make downloaded binaries executable
+        shell: bash
+        run: chmod -R +x openms/build/bin openms/_thirdparty
+
+      - name: Run OpenSwath benchmark
+        shell: bash
+        env:
+          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
+          OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
+          RESULTS_DIR: ${{ github.workspace }}/results-openswath
+        run: bash benchmark/run_openswath_benchmark.sh
+
+      - name: Upload OpenSwath benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-openswath-${{ needs.build-openms.outputs.openms_sha }}
+          path: results-openswath
           if-no-files-found: error
