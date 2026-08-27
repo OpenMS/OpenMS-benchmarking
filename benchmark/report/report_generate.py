@@ -67,7 +67,9 @@ import os
 import re
 import sys
 
-SCHEMA = "openms-benchmarking/report/v1"
+SCHEMA_V1 = "openms-benchmarking/report/v1"
+SCHEMA_V2 = "openms-benchmarking/report/v2"
+SCHEMA = SCHEMA_V2  # default output schema
 
 # ---------------------------------------------------------------------------
 # metric helpers
@@ -174,19 +176,86 @@ def status_class(status):
 # ---------------------------------------------------------------------------
 
 
+def _promote_v1(data):
+    """Promote a v1 result to v2 schema by wrapping fields in the v2 structure."""
+    if data.get("schema") == SCHEMA_V2:
+        return data
+    # v1 -> v2 promotion
+    promoted = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": data.get("benchmark", "smoke"),
+            "benchmark_version": data.get("milestone", 1),
+            "dataset": data.get("dataset", "smoke fixture"),
+            "software": {
+                "name": "OpenMS",
+                "version": data.get("openms_sha", ""),
+            },
+            "configuration": {
+                "use_ms2rescore": data.get("use_ms2rescore", False),
+            },
+        },
+        "run": {
+            "run_id": data.get("run_id", ""),
+            "run_at": data.get("run_at", ""),
+            "cache": data.get("cache", "unknown"),
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in data.get("stages", [])),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in data.get("stages", [])),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in data.get("stages", [])), default=0),
+            "build": data.get("build", {}),
+            "stages": data.get("stages", []),
+        },
+        "metrics": {
+            "verdict": data.get("verdict", "unknown"),
+        },
+        # Keep v1 fields for backward compatibility
+        "_v1_compat": {k: data[k] for k in ["source", "milestone", "openms_sha", "cache", "use_ms2rescore", "build", "stages", "verdict", "skipped_optional", "tool_versions"] if k in data},
+    }
+    return promoted
+
+
 def load_results(results_dir):
-    """Load every result JSON. Returns (openms_runs, tool_results)."""
+    """Load every result JSON. Returns (openms_runs, tool_results).
+    
+    Supports both v1 (flat openms/tools directories) and v2 (benchmark-specific
+    subdirectories) layouts, with automatic v1->v2 promotion.
+    """
     openms_runs, tool_results = [], []
+    
+    # v1 layout: results/openms/*.json and results/tools/*.json
     for path in sorted(glob.glob(os.path.join(results_dir, "openms", "*.json"))):
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-        openms_runs.append(data)
+        openms_runs.append(_promote_v1(data))
     for path in sorted(glob.glob(os.path.join(results_dir, "tools", "*.json"))):
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-        tool_results.append(data)
+        tool_results.append(_promote_v1(data))
+    
+    # v2 layout: results/<benchmark>/openms/*.json and results/<benchmark>/reference/*.json
+    for benchmark_dir in sorted(glob.glob(os.path.join(results_dir, "*"))):
+        if not os.path.isdir(benchmark_dir):
+            continue
+        benchmark_name = os.path.basename(benchmark_dir)
+        if benchmark_name in ("openms", "tools"):
+            continue  # already handled above
+        # OpenMS runs
+        for path in sorted(glob.glob(os.path.join(benchmark_dir, "openms", "*.json"))):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
+            openms_runs.append(_promote_v1(data))
+        # Reference/tool results
+        for path in sorted(glob.glob(os.path.join(benchmark_dir, "reference", "*.json"))):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
+            tool_results.append(_promote_v1(data))
+    
     # oldest first; the "current" run is the most recent one
     openms_runs.sort(key=lambda r: r.get("run_at", ""))
     return openms_runs, tool_results
@@ -591,6 +660,7 @@ regenerate with <code>python3 benchmark/report/report_generate.py render</code><
 
 
 def normalize_smoke(args):
+    """Convert a raw CI smoke.json into a normalized v2 OpenMS run result."""
     with open(args.smoke_json, encoding="utf-8") as fh:
         raw = json.load(fh)
     if not args.build_time or not args.artifact_bytes or not args.run_id:
@@ -607,25 +677,56 @@ def normalize_smoke(args):
             "status": st.get("status"),
             "reason": st.get("reason", ""),
         })
+    # v2 schema: identity, run, performance, metrics
     out = {
-        "schema": SCHEMA,
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": raw.get("benchmark", "smoke"),
+            "benchmark_version": raw.get("milestone", 1),
+            "dataset": args.dataset or "smoke fixture (CometAdapter_3)",
+            "software": {
+                "name": "OpenMS",
+                "version": raw.get("openms_sha", ""),
+            },
+            "configuration": {
+                "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
+            },
+        },
+        "run": {
+            "run_id": args.run_id,
+            "run_at": args.run_at or "",
+            "cache": args.cache or "unknown",
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
+            "build": {
+                "wall_time_s": float(args.build_time),
+                "artifact_bytes": int(args.artifact_bytes),
+            },
+            "stages": stages,
+        },
+        "metrics": {
+            "verdict": raw.get("verdict", "unknown"),
+        },
+        # v1 compat fields (for backward compatibility during transition)
         "source": "openms",
-        "benchmark": raw.get("benchmark", "smoke"),
         "milestone": raw.get("milestone"),
-        "run_id": args.run_id,
-        "run_at": args.run_at or "",
         "openms_sha": raw.get("openms_sha", ""),
         "cache": args.cache or "unknown",
-        "dataset": args.dataset or "smoke fixture (CometAdapter_3)",
         "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
-        "ms2rescore_note": raw.get("ms2rescore_note", ""),
         "build": {"wall_time_s": float(args.build_time), "artifact_bytes": int(args.artifact_bytes)},
         "stages": stages,
         "verdict": raw.get("verdict", "unknown"),
         "skipped_optional": raw.get("skipped_optional", []),
         "tool_versions": raw.get("tool_versions", {}),
     }
-    out_path = args.out or os.path.join(args.results_dir, "openms", f"{raw.get('benchmark', 'run')}-{args.run_id}.json")
+    # default output path: benchmark/results/smoke/openms/<benchmark>-<run_id>.json
+    out_path = args.out or os.path.join(
+        args.results_dir, raw.get("benchmark", "smoke"), "openms",
+        f"{raw.get('benchmark', 'run')}-{args.run_id}.json"
+    )
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(out, fh, indent=2)
@@ -633,6 +734,7 @@ def normalize_smoke(args):
 
 
 def normalize_proteobench(args):
+    """Convert a local ProteoBench scoring JSON into a normalized v2 tool result."""
     with open(args.pb_json, encoding="utf-8") as fh:
         raw = json.load(fh)
     hm = raw.get("headline_metrics") or {}
@@ -645,13 +747,31 @@ def normalize_proteobench(args):
     }
     metrics = {k: v for k, v in metrics.items() if v is not None}
     ui = raw.get("user_input") or {}
+    dataset = args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown"
+    # v2 schema: identity, run, metrics
     out = {
-        "schema": SCHEMA,
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": "proteobench",
+            "benchmark_version": 1,
+            "dataset": dataset,
+            "software": {
+                "name": ui.get("software_name", "?"),
+                "version": ui.get("software_version", "?"),
+            },
+            "configuration": {
+                "search_engine": ui.get("search_engine", "?"),
+                "search_engine_version": ui.get("search_engine_version", "?"),
+            },
+        },
+        "run": {
+            "run_id": args.label or raw.get("module_id", "proteobench"),
+            "run_at": raw.get("scored_at", ""),
+        },
+        "metrics": metrics,
+        # v1 compat fields (for backward compatibility during transition)
         "source": "tool",
-        "benchmark": "proteobench",
-        "run_id": args.label or raw.get("module_id", "proteobench"),
         "label": args.label or raw.get("module_id", "proteobench"),
-        "run_at": raw.get("scored_at", ""),
         "tool": {
             "name": ui.get("software_name", "?"),
             "version": ui.get("software_version", "?"),
@@ -664,16 +784,16 @@ def normalize_proteobench(args):
             "input_format": raw.get("input_format", "?"),
             "intermediate_hash": raw.get("intermediate_hash", ""),
         },
-        # which dataset was scored; default to the PXD id in the input file
-        # name, or let the caller spell it out (e.g. with the species mix)
-        "dataset": args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown",
-        "metrics": metrics,
+        "dataset": dataset,
     }
     # labels are meant for display and may contain characters that are not
     # valid in file names on every OS (e.g. '>' on Windows); sanitize only
     # the file name, never the stored label.
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", args.label or "result").strip("-")
-    out_path = args.out or os.path.join(args.results_dir, "tools", f"proteobench-{safe}.json")
+    # default output path: benchmark/results/proteobench/reference/proteobench-<label>.json
+    out_path = args.out or os.path.join(
+        args.results_dir, "proteobench", "reference", f"proteobench-{safe}.json"
+    )
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(out, fh, indent=2)
