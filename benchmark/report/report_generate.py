@@ -7,17 +7,28 @@ Turns machine-readable benchmark results into one self-contained HTML report:
     benchmark run  ->  JSON result  ->  report_generate.py render  ->  report.html
 
 The generator deliberately knows nothing about specific runs: it discovers
-every result JSON under <results-dir>/{openms,tools} and renders whatever
-metrics the current run and the stored baseline actually share. That keeps the
-same machinery usable for OpenMS version-vs-version comparisons, cold-vs-warm
-builds, ProteoBench results, and eventually results uploaded by other tools
-(no hard-coded Exp 1 / Exp 2 numbers anywhere in the report).
+every result JSON under <results-dir>/{openms,tools}/ or <results-dir>/<benchmark>/
+and renders whatever metrics the current run and the stored baseline actually
+share.  That keeps the same machinery usable for OpenMS version-vs-version
+comparisons, cold-vs-warm builds, ProteoBench results, OpenSwath results,
+and eventually results uploaded by other tools.
 
-Result layout (schema "openms-benchmarking/report/v1"):
+Result layout (schema "openms-benchmarking/report/v2"):
 
     results/openms/<run-id>.json    OpenMS benchmark runs (smoke today)
     results/tools/<tool-id>.json    reference results from other tools/sources
                                     (e.g. the local ProteoBench scorer)
+    results/<benchmark>/openms/*.json     v2 layout: OpenMS runs
+    results/<benchmark>/reference/*.json  v2 layout: tool results
+
+The renderer reads exclusively from v2 schema fields:
+
+    identity   – benchmark, dataset, software, configuration
+    run        – run_id, run_at, cache
+    performance – build, stages[], wall/cpu/rss
+    metrics    – flat bag of name/value pairs (compared dynamically)
+    correctness – optional validation data
+    tool       – optional external software metadata
 
 Subcommands:
 
@@ -25,37 +36,13 @@ Subcommands:
                     --build-time SECONDS --artifact-bytes N
                     [--run-at ISO8601] [--out PATH]
         Convert a raw CI smoke.json into a normalized OpenMS run result.
-        The smoke script records the pipeline metrics; the run metadata it
-        cannot know (build wall time, ccache state, run id, artifact size)
-        is passed here, so the report can still answer "was this build cold
-        or warm?" without the workflow being able to see inside the runner.
 
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
-        Convert a local ProteoBench scoring result (the JSON produced by
-        benchmark-data/run_proteobench_local.py) into a tool result whose
-        headline metrics can be compared across runs.
+        Convert a local ProteoBench scoring result into a tool result.
 
     render [--results-dir DIR] [--current PATH] [--out report.html]
         Discover all results, compare the current run against the stored
-        baseline (the previous OpenMS run of the same benchmark), and render
-        report.html. --current defaults to the most recent OpenMS run.
-
-Examples:
-
-    # seed/refresh an OpenMS run result from a CI smoke.json
-    python3 benchmark/report/report_generate.py normalize smoke \
-        smoke.json --run-id 31881021123 --cache warm \
-        --build-time 363 --artifact-bytes 149265170 \
-        --run-at 2026-08-15T11:01:59Z \
-        --out benchmark/results/openms/smoke-31881021123.json
-
-    # add a ProteoBench reference result
-    python3 benchmark/report/report_generate.py normalize proteobench \
-        proteobench_local_exp2.json --label "Exp 2 (MS2Rescore)" \
-        --out benchmark/results/tools/proteobench-exp2.json
-
-    # render the report (discovers the rest)
-    python3 benchmark/report/report_generate.py render
+        baseline, and render report.html.
 """
 
 import argparse
@@ -74,41 +61,6 @@ SCHEMA = SCHEMA_V2  # default output schema
 # ---------------------------------------------------------------------------
 # metric helpers
 # ---------------------------------------------------------------------------
-
-
-def _stage_metrics(stage):
-    """Flatten one stage entry into comparable metric rows."""
-    name = stage.get("name", "?")
-    return {
-        f"stage.{name}.status": stage.get("status", ""),
-        f"stage.{name}.wall_time_s": stage.get("wall_time_s"),
-        f"stage.{name}.cpu_time_s": stage.get("cpu_time_s"),
-        f"stage.{name}.peak_rss_kb": stage.get("peak_rss_kb"),
-    }
-
-
-def openms_metrics(run):
-    """The flat metric bag of an OpenMS run result (keys stable across runs)."""
-    m = {
-        "verdict": run.get("verdict", ""),
-        "use_ms2rescore": bool(run.get("use_ms2rescore")),
-    }
-    build = run.get("build") or {}
-    if build.get("wall_time_s") is not None:
-        m["build.wall_time_s"] = build["wall_time_s"]
-    if build.get("artifact_bytes") is not None:
-        m["build.artifact_bytes"] = build["artifact_bytes"]
-    for stage in run.get("stages", []):
-        m.update(_stage_metrics(stage))
-    # scientific metrics (PSMs/peptides/proteins/quantified precursors) come
-    # from future extended runs; if a run carries them, they compare naturally.
-    m.update(run.get("metrics", {}))
-    return m
-
-
-def tool_metrics(tool_result):
-    """The flat metric bag of a tool/reference result."""
-    return dict(tool_result.get("metrics", {}))
 
 
 def fmt_seconds(s):
@@ -145,17 +97,11 @@ def fmt_delta(cur, prev, numeric):
     d = cur - prev
     pct = d / prev * 100.0
     sign = "+" if d >= 0 else ""
-    # deltas near zero (e.g. epsilon metrics) need more digits than seconds
     return f"{sign}{d:.3f} ({sign}{pct:.1f}%)" if abs(d) < 1 else f"{sign}{d:.1f} ({sign}{pct:.1f}%)"
 
 
 def fmt_delta_abs(cur, prev):
-    """Absolute delta for smoke-stage wall times: '+3.9s', not '+299.2%'.
-
-    Stage runtimes at smoke scale jump around with runner load, so a
-    percentage would look like a regression when it is just noise; the
-    absolute seconds still show what changed.
-    """
+    """Absolute delta for stage wall times: '+3.9s', not '+299.2%'."""
     if cur is None or prev is None or prev == 0:
         return "—"
     d = cur - prev
@@ -171,8 +117,109 @@ def status_class(status):
     return {"pass": "ok", "fail": "bad", "skipped": "warn"}.get(status, "warn")
 
 
+def _chip(text, cls):
+    return f'<span class="chip {cls}">{html.escape(text)}</span>'
+
+
+def _fmt_metric(name, value):
+    """Human formatting for a known metric name, else raw."""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        if name.endswith("artifact_bytes"):
+            return fmt_bytes(value)
+        if name.endswith("wall_time_s"):
+            return fmt_seconds(value)
+        if name.endswith("cpu_time_s"):
+            return f"{value:.2f} s"
+        if name.endswith("peak_rss_kb"):
+            return fmt_bytes(float(value) * 1024)
+        if name.endswith("_s"):
+            return fmt_seconds(value)
+        if abs(value) < 10:
+            return f"{value:.3f}"
+        return f"{value:,.0f}"
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
-# discovery + comparison
+# v2 data access helpers
+# ---------------------------------------------------------------------------
+
+def _identity(result):
+    """Return the identity dict from a v2 result."""
+    return result.get("identity", {})
+
+
+def _run(result):
+    """Return the run dict from a v2 result."""
+    return result.get("run", {})
+
+
+def _performance(result):
+    """Return the performance dict from a v2 result."""
+    return result.get("performance", {})
+
+
+def _metrics(result):
+    """Return the metrics dict from a v2 result."""
+    return result.get("metrics", {})
+
+
+def _software_version(result):
+    """Return the software version/SHA from a v2 result."""
+    return _identity(result).get("software", {}).get("version", "unknown")
+
+
+def _benchmark_name(result):
+    """Return the benchmark name from a v2 result."""
+    return _identity(result).get("benchmark", "unknown")
+
+
+def _dataset(result):
+    """Return the dataset from a v2 result."""
+    return _identity(result).get("dataset", "unknown")
+
+
+def _stages(result):
+    """Return the stages list from a v2 result."""
+    return _performance(result).get("stages", [])
+
+
+def _build(result):
+    """Return the build dict from a v2 result."""
+    return _performance(result).get("build", {})
+
+
+def _verdict(result):
+    """Return the verdict from a v2 result."""
+    return _metrics(result).get("verdict", "unknown")
+
+
+def _cache(result):
+    """Return the cache state from a v2 result."""
+    return _run(result).get("cache", "unknown")
+
+
+def _run_id(result):
+    """Return the run_id from a v2 result."""
+    return _run(result).get("run_id", "")
+
+
+def _run_at(result):
+    """Return the run_at from a v2 result."""
+    return _run(result).get("run_at", "")
+
+
+def _configuration(result):
+    """Return the configuration dict from a v2 result."""
+    return _identity(result).get("configuration", {})
+
+
+# ---------------------------------------------------------------------------
+# v1 → v2 promotion
 # ---------------------------------------------------------------------------
 
 
@@ -188,15 +235,15 @@ def _promote_v1(data):
             "benchmark_version": data.get("milestone", 1),
             "dataset": data.get("dataset", "smoke fixture"),
             "software": {
-                "name": "OpenMS",
-                "version": data.get("openms_sha", ""),
+                "name": data.get("source", "OpenMS") if data.get("source") == "tool" else "OpenMS",
+                "version": data.get("openms_sha", data.get("tool", {}).get("version", "")),
             },
             "configuration": {
                 "use_ms2rescore": data.get("use_ms2rescore", False),
             },
         },
         "run": {
-            "run_id": data.get("run_id", ""),
+            "run_id": data.get("run_id", data.get("label", "")),
             "run_at": data.get("run_at", ""),
             "cache": data.get("cache", "unknown"),
         },
@@ -210,20 +257,39 @@ def _promote_v1(data):
         "metrics": {
             "verdict": data.get("verdict", "unknown"),
         },
-        # Keep v1 fields for backward compatibility
-        "_v1_compat": {k: data[k] for k in ["source", "milestone", "openms_sha", "cache", "use_ms2rescore", "build", "stages", "verdict", "skipped_optional", "tool_versions"] if k in data},
     }
+    # Carry over tool-specific fields for tool results
+    if data.get("source") == "tool":
+        promoted["tool"] = data.get("tool", {})
+        promoted["metrics"].update(data.get("metrics", {}))
+        # Keep proteobench metadata
+        if data.get("proteobench"):
+            promoted["proteobench"] = data["proteobench"]
+    # Carry over correctness for OpenSwath-like results
+    if data.get("correctness"):
+        promoted["correctness"] = data["correctness"]
+    # Carry over tool_versions for pipeline results
+    if data.get("tool_versions"):
+        promoted["tool_versions"] = data["tool_versions"]
+    # Carry over openms metrics that aren't verdict
+    if data.get("metrics"):
+        promoted["metrics"].update(data["metrics"])
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# discovery + comparison
+# ---------------------------------------------------------------------------
 
 
 def load_results(results_dir):
     """Load every result JSON. Returns (openms_runs, tool_results).
-    
+
     Supports both v1 (flat openms/tools directories) and v2 (benchmark-specific
     subdirectories) layouts, with automatic v1->v2 promotion.
     """
     openms_runs, tool_results = [], []
-    
+
     # v1 layout: results/openms/*.json and results/tools/*.json
     for path in sorted(glob.glob(os.path.join(results_dir, "openms", "*.json"))):
         with open(path, encoding="utf-8") as fh:
@@ -235,7 +301,7 @@ def load_results(results_dir):
             data = json.load(fh)
         data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
         tool_results.append(_promote_v1(data))
-    
+
     # v2 layout: results/<benchmark>/openms/*.json and results/<benchmark>/reference/*.json
     for benchmark_dir in sorted(glob.glob(os.path.join(results_dir, "*"))):
         if not os.path.isdir(benchmark_dir):
@@ -255,9 +321,9 @@ def load_results(results_dir):
                 data = json.load(fh)
             data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
             tool_results.append(_promote_v1(data))
-    
+
     # oldest first; the "current" run is the most recent one
-    openms_runs.sort(key=lambda r: r.get("run_at", ""))
+    openms_runs.sort(key=lambda r: _run_at(r))
     return openms_runs, tool_results
 
 
@@ -265,15 +331,16 @@ def pick_baseline(current, openms_runs):
     """The stored baseline = the previous OpenMS run of the same benchmark."""
     if not openms_runs:
         return None
-    cur_at = current.get("run_at", "")
+    cur_at = _run_at(current)
+    cur_bench = _benchmark_name(current)
     same_bench = [r for r in openms_runs
-                  if r.get("benchmark") == current.get("benchmark") and r is not current]
+                  if _benchmark_name(r) == cur_bench and r is not current]
     if not same_bench:
         return None
-    same_bench.sort(key=lambda r: r.get("run_at", ""))
+    same_bench.sort(key=lambda r: _run_at(r))
     if not cur_at:
         return same_bench[-1]
-    before = [r for r in same_bench if r.get("run_at", "") < cur_at]
+    before = [r for r in same_bench if _run_at(r) < cur_at]
     return before[-1] if before else same_bench[-1]
 
 
@@ -339,13 +406,10 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 
 """
 
 
-def _chip(text, cls):
-    return f'<span class="chip {cls}">{html.escape(text)}</span>'
-
-
-def _stage_rows(run):
+def _stage_rows(stages):
+    """Render stage rows dynamically from the stages list."""
     rows = ""
-    for st in run.get("stages", []):
+    for st in stages:
         cls = status_class(st.get("status", ""))
         req = "required" if st.get("required") else "optional"
         reason = st.get("reason") or ""
@@ -362,187 +426,154 @@ def _stage_rows(run):
     return rows
 
 
-def _empty_row(what, why):
-    return f"<tr><td class='dim' colspan='5'>{html.escape(what)} — {html.escape(why)}</td></tr>"
-
-
-def _fmt_metric(name, value):
-    """Human formatting for a known metric name, else raw."""
-    if value is None:
-        return "—"
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    if isinstance(value, (int, float)):
-        if name.endswith("artifact_bytes"):
-            return fmt_bytes(value)
-        if name.endswith("wall_time_s"):
-            return fmt_seconds(value)
-        if name.endswith("cpu_time_s"):
-            return f"{value:.2f} s"
-        if name.endswith("peak_rss_kb"):
-            return fmt_bytes(float(value) * 1024)
-        if name.endswith("_s"):
-            return fmt_seconds(value)
-        if abs(value) < 10:
-            return f"{value:.3f}"
-        return f"{value:,.0f}"
-    return str(value)
+def _discover_shared_metrics(current, baseline):
+    """Dynamically discover metrics present in both current and baseline."""
+    cur_m = _metrics(current)
+    base_m = _metrics(baseline)
+    shared = sorted(set(cur_m.keys()) | set(base_m.keys()))
+    return shared
 
 
 def render(current, baseline, openms_runs, tool_results, out_path, generated):
     esc = html.escape
-    cache = current.get("cache", "unknown")
+    cache = _cache(current)
     cache_cls = {"cold": "warn", "warm": "ok", "none": "neutral"}.get(cache, "neutral")
-    verdict = current.get("verdict", "unknown")
+    verdict = _verdict(current)
     verdict_cls = status_class(verdict)
-
-    # which tier this run belongs to, and which dataset(s) it involves:
-    # smoke runs are CI validation on a tiny fixture; the scientific tier is
-    # the PXD028735 reference section (present as tool results when available)
-    tier_cur = {"smoke": "Smoke (CI)", "proteobench": "Scientific"}.get(
-        current.get("benchmark"), str(current.get("benchmark", "?")))
-    tier_str = tier_cur + (" + Scientific (reference)" if tool_results and current.get("benchmark") != "proteobench" else "")
-    cur_dataset = current.get("dataset") or "smoke fixture"
-    tool_dataset = tool_results[0].get("dataset") if tool_results else ""
-    dataset_str = cur_dataset + (f" / {tool_dataset}" if tool_dataset and tool_dataset != cur_dataset else "")
+    bench = _benchmark_name(current)
+    sha = _software_version(current)
 
     # ----- header ----------------------------------------------------------
-    sha = current.get("openms_sha", "unknown")
     head = f"""
     <div class="card"><div class="inner">
       <h1>OpenMS Benchmark Report</h1>
-      <div class="dim">{esc(current.get('benchmark', 'unknown'))} benchmark —
+      <div class="dim">{esc(bench)} benchmark —
       generated {esc(generated.strftime('%Y-%m-%d %H:%M %Z'))}</div>
       <dl class="meta">
-        <div><dt>OpenMS SHA</dt><dd>{esc(short_sha(sha))} <span class="mono" title="{esc(sha)}">({esc(sha[:6])})</span></dd></div>
-        <div><dt>Run</dt><dd>{esc(current.get('run_id', '—'))} <span class="dim">({esc(current.get('_file', ''))})</span></dd></div>
-        <div><dt>Run at</dt><dd>{esc(str(current.get('run_at', '—')))}</dd></div>
+        <div><dt>Software SHA</dt><dd>{esc(short_sha(sha))} <span class="mono" title="{esc(sha)}">({esc(sha[:6])})</span></dd></div>
+        <div><dt>Run</dt><dd>{esc(_run_id(current))} <span class="dim">({esc(current.get('_file', ''))})</span></dd></div>
+        <div><dt>Run at</dt><dd>{esc(_run_at(current))}</dd></div>
         <div><dt>Cache</dt><dd>{_chip(cache, cache_cls)}</dd></div>
-        <div><dt>Rescoring</dt><dd>{'on' if current.get('use_ms2rescore') else 'off'}</dd></div>
-        <div><dt>Tier</dt><dd>{esc(tier_str)}</dd></div>
-        <div><dt>Dataset</dt><dd>{esc(dataset_str)}</dd></div>
+        <div><dt>Dataset</dt><dd>{esc(_dataset(current))}</dd></div>
         <div><dt>Verdict</dt><dd>{_chip(verdict, verdict_cls)}</dd></div>
       </dl>
     </div></div>"""
 
-    # ----- build -----------------------------------------------------------
-    build = current.get("build") or {}
-    build_rows = ""
+    # ----- build (optional) ------------------------------------------------
+    build = _build(current)
+    build_section = ""
     if build:
-        build_rows += (
+        build_rows = (
             f"<tr><td>Build wall time</td><td class='num'>{fmt_seconds(build.get('wall_time_s', 0))}</td></tr>"
             f"<tr><td>Artifact size</td><td class='num'>{fmt_bytes(build.get('artifact_bytes', 0))}</td></tr>"
+            f"<tr><td>Cache state</td><td class='num'>{esc(cache)}</td></tr>"
         )
-    build_rows += f"<tr><td>Cache state</td><td class='num'>{esc(cache)}</td></tr>"
-    build_rows += (
-        f"<tr><td>Commit</td><td class='num mono'>{esc(current.get('head_sha', sha[:10]))}</td></tr>"
-        if current.get("head_sha") else ""
-    )
-    build_section = f"""
-    <div class="card"><h2>Build</h2><div class="inner">
-      <table><tbody>{build_rows}</tbody></table>
-      <div class="note">Build metrics come from the run metadata recorded at
-      <code>normalize</code> time (CI knows them; the smoke script itself does not).</div>
-    </div></div>"""
+        build_section = f"""
+        <div class="card"><h2>Build</h2><div class="inner">
+          <table><tbody>{build_rows}</tbody></table>
+          <div class="note">Build metrics come from the run metadata recorded at
+          <code>normalize</code> time (CI knows them; the benchmark script itself does not).</div>
+        </div></div>"""
 
-    # ----- identification (pipeline stages) --------------------------------
-    if current.get("stages"):
-        ident_section = f"""
-        <div class="card"><h2>Smoke benchmark <span class="sub">— DecoyDatabase → Comet → Percolator (tiny fixture)</span></h2><div class="inner">
+    # ----- stages (optional, dynamically discovered) ------------------------
+    stages = _stages(current)
+    stages_section = ""
+    if stages:
+        stage_names = ", ".join(s.get("name", "?") for s in stages)
+        stages_section = f"""
+        <div class="card"><h2>Pipeline stages <span class="sub">— {esc(stage_names)}</span></h2><div class="inner">
           <table>
             <thead><tr><th>Stage</th><th>Result</th><th class="num">Wall</th>
             <th class="num">CPU</th><th class="num">Peak RSS</th></tr></thead>
-            <tbody>{_stage_rows(current)}</tbody>
+            <tbody>{_stage_rows(stages)}</tbody>
           </table>
-          <div class="note">PSM / peptide / protein counts are not measured in
-          smoke mode — they require the PXD028735 milestone.</div>
         </div></div>"""
-    else:
-        ident_section = ""
 
-    # ----- quantification ----------------------------------------------------
-    qmetrics = {k: v for k, v in openms_metrics(current).items()
-                if k.startswith("quantified_") or k.startswith("proteins_")
-                or k.startswith("peptides_") or k.startswith("psms_")}
-    if qmetrics:
-        qrows = "".join(
-            f"<tr><td>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
-            for k, v in sorted(qmetrics.items()))
-        quant_section = f"""
-        <div class="card"><h2>Quantification</h2><div class="inner">
-          <table><tbody>{qrows}</tbody></table>
+    # ----- correctness (optional) -------------------------------------------
+    correctness = current.get("correctness", {})
+    correctness_section = ""
+    if correctness:
+        crows = "".join(
+            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
+            for k, v in sorted(correctness.items())
+        )
+        correctness_section = f"""
+        <div class="card"><h2>Correctness</h2><div class="inner">
+          <table><tbody>{crows}</tbody></table>
         </div></div>"""
-    else:
-        quant_section = ""
 
-    # ----- ProteoBench reference results ------------------------------------
-    pb_rows = ""
+    # ----- metrics (dynamic, flat key-value table) --------------------------
+    metrics = _metrics(current)
+    # Exclude verdict from the metrics table (already shown in header)
+    display_metrics = {k: v for k, v in sorted(metrics.items()) if k != "verdict"}
+    metrics_section = ""
+    if display_metrics:
+        mrows = "".join(
+            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
+            for k, v in display_metrics.items()
+        )
+        metrics_section = f"""
+        <div class="card"><h2>Metrics</h2><div class="inner">
+          <table><tbody>{mrows}</tbody></table>
+        </div></div>"""
+
+    # ----- tool / reference results (dynamic) ------------------------------
+    tool_section = ""
     if tool_results:
-        pb_headers = ["Quantified precursors", "Median |ε| (global)", "Mean |ε| (global)",
-                      "CV (median)", "ROC AUC", "Intermediate hash"]
-        def pb_vals(t):
-            m = tool_metrics(t)
-            return [m.get("quantified_precursors"), m.get("median_abs_epsilon"),
-                    m.get("mean_abs_epsilon"), m.get("cv_median"), m.get("roc_auc"),
-                    t.get("proteobench", {}).get("intermediate_hash")]
-        labels = [t.get("label", t.get("run_id", "?")) for t in tool_results]
-        delta_col = f"<th class='num'>Δ</th>" if len(tool_results) > 1 else ""
-        delta_rows = ""
-        if len(tool_results) > 1:
-            for i, h in enumerate(pb_headers):
-                vals = [pb_vals(t)[i] for t in tool_results]
-                # one column per tool result, in discovery order, so the
-                # numbers always sit under their own label
-                cells = "".join(
-                    f"<td class='num'>{_fmt_metric('x', v)}</td>" for v in vals)
-                if all(isinstance(v, (int, float)) for v in vals):
-                    cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
-                delta_rows += f"<tr><td>{esc(h)}</td>{cells}</tr>"
-        pb_rows = f"""
-        <div class="card"><h2>Scientific benchmark <span class="sub">— reference results · {esc(tool_results[0].get('dataset', '?'))} · ProteoBench v{esc(tool_results[0].get('proteobench', {}).get('version', '?'))}</span></h2><div class="inner">
+        # Collect all unique metric keys across tool results
+        all_metric_keys = []
+        for t in tool_results:
+            for k in sorted(_metrics(t).keys()):
+                if k not in all_metric_keys:
+                    all_metric_keys.append(k)
+        labels = [_run_id(t) or "?" for t in tool_results]
+        delta_col = "<th class='num'>Δ</th>" if len(tool_results) > 1 else ""
+        trows = ""
+        for mk in all_metric_keys:
+            vals = [_metrics(t).get(mk) for t in tool_results]
+            cells = "".join(
+                f"<td class='num'>{_fmt_metric(mk, v)}</td>" for v in vals
+            )
+            if all(isinstance(v, (int, float)) for v in vals if v is not None):
+                cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
+            trows += f"<tr><td>{esc(mk)}</td>{cells}</tr>"
+        # Build tool metadata display
+        tool_meta_rows = ""
+        if tool_results:
+            t = tool_results[0]
+            tool_info = t.get("tool", {})
+            if tool_info:
+                for tk, tv in sorted(tool_info.items()):
+                    tool_meta_rows += f"<tr><td>{esc(tk)}</td><dd>{esc(str(tv))}</dd></tr>"
+            pb_info = t.get("proteobench", {})
+            if pb_info:
+                for pk, pv in sorted(pb_info.items()):
+                    tool_meta_rows += f"<tr><td>{esc(pk)}</td><dd>{esc(str(pv))}</dd></tr>"
+        meta_html = f"""
           <dl class="meta">
-            <div><dt>Dataset</dt><dd>{esc(tool_results[0].get('dataset', '—'))}</dd></div>
-            <div><dt>Module</dt><dd>{esc(tool_results[0].get('proteobench', {}).get('module', '—'))}</dd></div>
-            <div><dt>Input format</dt><dd>{esc(tool_results[0].get('proteobench', {}).get('input_format', '—'))}</dd></div>
-            <div><dt>ProteoBench</dt><dd>v{esc(tool_results[0].get('proteobench', {}).get('version', '—'))}</dd></div>
-          </dl>
+            <div><dt>Tool</dt><dd>{esc(tool_results[0].get('tool', {}).get('name', '—'))}</dd></div>
+            <div><dt>Version</dt><dd>{esc(tool_results[0].get('tool', {}).get('version', '—'))}</dd></div>
+          </dl>""" if tool_results[0].get("tool") else ""
+        tool_section = f"""
+        <div class="card"><h2>Reference results <span class="sub">— {esc(_dataset(tool_results[0]))}</span></h2><div class="inner">
+          {meta_html}
           <table>
             <thead><tr><th>Metric</th>{"".join(f"<th class='num'>{esc(l)}</th>" for l in labels)}{delta_col}</tr></thead>
-            <tbody>{delta_rows or '<tr><td class="dim" colspan="%d">No numeric headline metrics found in the tool results.</td></tr>' % (len(labels) + 2)}</tbody>
+            <tbody>{trows or '<tr><td class="dim" colspan="%d">No metrics found.</td></tr>' % (len(labels) + 2)}</tbody>
           </table>
-          <div class="note">Reference results from the earlier PXD028735 benchmark
-          experiments — not metrics from the smoke fixture in this run (Exp 1:
-          Comet → Percolator; Exp 2: Comet → MS²Rescore → Percolator). Scored
-          locally with <code>run_proteobench_local.py</code>, which reproduces
-          proteobench.io results bit-exactly, incl. the intermediate hash.</div>
         </div></div>"""
 
-    else:
-        pb_rows = ""
-
-    # ----- comparison: current vs baseline ----------------------------------
+    # ----- comparison: current vs baseline (dynamic) -----------------------
+    comp_section = ""
     if baseline:
-        cur_m = openms_metrics(current)
-        base_m = openms_metrics(baseline)
-        order = ["verdict", "build.wall_time_s", "build.artifact_bytes",
-                 "stage.decoy_database.wall_time_s", "stage.comet.wall_time_s",
-                 "stage.percolator.wall_time_s",
-                 "stage.decoy_database.peak_rss_kb", "stage.comet.peak_rss_kb",
-                 "stage.percolator.peak_rss_kb"]
+        shared = _discover_shared_metrics(current, baseline)
+        cur_m = _metrics(current)
+        base_m = _metrics(baseline)
         rows = ""
-        seen = set()
-        for key in order:
-            if key not in cur_m and key not in base_m:
-                continue
-            seen.add(key)
+        for key in shared:
             cur_v, base_v = cur_m.get(key), base_m.get(key)
             numeric = isinstance(cur_v, (int, float)) or isinstance(base_v, (int, float))
-            if key.startswith("stage.") and key.endswith("wall_time_s"):
-                # smoke-stage runtimes are dominated by runner load; show the
-                # absolute seconds, not a scary-looking +299% figure
-                delta_cell = html.escape(fmt_delta_abs(cur_v, base_v))
-            else:
-                delta_cell = html.escape(fmt_delta(cur_v, base_v, numeric))
+            delta_cell = html.escape(fmt_delta(cur_v, base_v, numeric))
             rows += (
                 f"<tr><td class='mono'>{esc(key)}</td>"
                 f"<td class='num'>{_fmt_metric(key, base_v)}</td>"
@@ -550,86 +581,76 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
                 f"<td class='num'>{delta_cell}</td></tr>"
             )
         cache_note = ""
-        if (current.get("cache") or "") != (baseline.get("cache") or ""):
+        if _cache(current) != _cache(baseline):
             cache_note = (
                 '<div class="note">⚠ Cache state differs between the two runs '
-                f"(current = <b>{esc(current.get('cache'))}</b>, baseline = "
-                f"<b>{esc(baseline.get('cache'))}</b>), so the build-time Δ reflects "
+                f"(current = <b>{esc(_cache(current))}</b>, baseline = "
+                f"<b>{esc(_cache(baseline))}</b>), so the build-time Δ reflects "
                 "the ccache state, not a code change.</div>")
         comp_section = f"""
-        <div class="card"><h2>Comparison <span class="sub">— current vs previous OpenMS run</span></h2><div class="inner">
+        <div class="card"><h2>Comparison <span class="sub">— current vs previous run</span></h2><div class="inner">
           <table>
-            <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">{esc(baseline.get('run_id', ''))}</span></th>
-            <th class="num">Current<br><span class="dim">{esc(current.get('run_id', ''))}</span></th>
+            <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">{esc(_run_id(baseline))}</span></th>
+            <th class="num">Current<br><span class="dim">{esc(_run_id(current))}</span></th>
             <th class="num">Δ</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
           {cache_note}
           <div class="note">Baseline = previous OpenMS run of the same benchmark
           ({esc(baseline.get('_file', ''))}). Only metrics present in both runs are
-          compared. Smoke-stage timings are informational only — they are not
-          used for regression decisions. External-tool comparisons (e.g.
-          ProteoBench uploads) will join this section once multi-reference
-          support lands.</div>
+          compared.</div>
         </div></div>"""
-    else:
-        comp_section = ""
 
-    # ----- history -----------------------------------------------------------
+    # ----- history ---------------------------------------------------------
+    history_section = ""
     if len(openms_runs) > 1:
         hist = ""
         for r in reversed(openms_runs):
-            r_cache = r.get("cache", "?")
-            r_verdict = r.get("verdict", "?")
+            r_cache = _cache(r)
+            r_verdict = _verdict(r)
             cls = status_class(r_verdict)
-            skipped = r.get("skipped_optional") or []
-            skip = f" <span class='dim'>(skipped: {esc(', '.join(skipped))})</span>" if skipped else ""
-            build_s = (r.get("build") or {}).get("wall_time_s")
+            build_s = _build(r).get("wall_time_s")
             hist += (
-                f"<tr><td class='mono'>{esc(r.get('run_id', ''))}</td>"
-                f"<td>{esc(str(r.get('run_at', '')))}</td>"
-                f"<td class='mono'>{esc(short_sha(r.get('openms_sha', '')))}</td>"
+                f"<tr><td class='mono'>{esc(_run_id(r))}</td>"
+                f"<td>{esc(_run_at(r))}</td>"
+                f"<td class='mono'>{esc(short_sha(_software_version(r)))}</td>"
                 f"<td>{_chip(r_cache, {'cold': 'warn', 'warm': 'ok', 'none': 'neutral'}.get(r_cache, 'neutral'))}</td>"
-                f"<td>{_chip(r_verdict, cls)}{skip}</td>"
+                f"<td>{_chip(r_verdict, cls)}</td>"
                 f"<td class='num'>{fmt_seconds(build_s) if build_s else '—'}</td></tr>"
             )
         history_section = f"""
         <div class="card"><h2>Run history</h2><div class="inner">
           <table>
-            <thead><tr><th>Run</th><th>Run at</th><th>OpenMS SHA</th><th>Cache</th>
+            <thead><tr><th>Run</th><th>Run at</th><th>SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
             <tbody>{hist}</tbody>
           </table>
         </div></div>"""
-    else:
-        history_section = ""
 
-    # ----- status ------------------------------------------------------------
+    # ----- status ----------------------------------------------------------
     if verdict == "pass":
         status = '<span class="ok">✓ No regression detected</span>'
-        extra = ""
         if baseline:
+            cur_m = _metrics(current)
+            base_m = _metrics(baseline)
             regressed = []
-            for key in ["stage.decoy_database.status", "stage.comet.status", "stage.percolator.status"]:
-                if cur_m.get(key) != "pass" and base_m.get(key) == "pass":
-                    regressed.append(key)
+            for key in shared:
+                if key.startswith("stage.") and key.endswith(".status"):
+                    if cur_m.get(key) != "pass" and base_m.get(key) == "pass":
+                        regressed.append(key)
             if regressed:
                 status = f'<span class="bad">✗ Regression detected: {esc(", ".join(regressed))}</span>'
     else:
         status = f'<span class="bad">✗ Verdict is {esc(verdict)}</span>'
-    skipped = current.get("skipped_optional") or []
-    skip_note = (f"<div class='note'>Optional stages skipped: {esc(', '.join(skipped))}.</div>"
-                 if skipped else "")
     status_section = f"""
     <div class="card"><h2>Status</h2><div class="inner">
       <div class="status-line">{status}</div>
-      {skip_note}
       <div class="note">Regression = required stage flipping pass → fail/skipped, or
       a non-pass verdict, relative to the stored baseline. Wall-time changes alone
       are reported but not treated as regressions.</div>
     </div></div>"""
 
-    # ----- assemble -----------------------------------------------------------
+    # ----- assemble --------------------------------------------------------
     doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -638,9 +659,10 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
 <body><div class="page">
 {head}
 {build_section}
-{ident_section}
-{quant_section}
-{pb_rows}
+{stages_section}
+{correctness_section}
+{metrics_section}
+{tool_section}
 {comp_section}
 {history_section}
 {status_section}
@@ -677,7 +699,7 @@ def normalize_smoke(args):
             "status": st.get("status"),
             "reason": st.get("reason", ""),
         })
-    # v2 schema: identity, run, performance, metrics
+    # v2 schema only — no duplicate v1 fields
     out = {
         "schema": SCHEMA_V2,
         "identity": {
@@ -710,19 +732,9 @@ def normalize_smoke(args):
         "metrics": {
             "verdict": raw.get("verdict", "unknown"),
         },
-        # v1 compat fields (for backward compatibility during transition)
-        "source": "openms",
-        "milestone": raw.get("milestone"),
-        "openms_sha": raw.get("openms_sha", ""),
-        "cache": args.cache or "unknown",
-        "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
-        "build": {"wall_time_s": float(args.build_time), "artifact_bytes": int(args.artifact_bytes)},
-        "stages": stages,
-        "verdict": raw.get("verdict", "unknown"),
-        "skipped_optional": raw.get("skipped_optional", []),
         "tool_versions": raw.get("tool_versions", {}),
     }
-    # default output path: benchmark/results/smoke/openms/<benchmark>-<run_id>.json
+    # default output path
     out_path = args.out or os.path.join(
         args.results_dir, raw.get("benchmark", "smoke"), "openms",
         f"{raw.get('benchmark', 'run')}-{args.run_id}.json"
@@ -748,7 +760,7 @@ def normalize_proteobench(args):
     metrics = {k: v for k, v in metrics.items() if v is not None}
     ui = raw.get("user_input") or {}
     dataset = args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown"
-    # v2 schema: identity, run, metrics
+    # v2 schema only — no duplicate v1 fields
     out = {
         "schema": SCHEMA_V2,
         "identity": {
@@ -769,9 +781,6 @@ def normalize_proteobench(args):
             "run_at": raw.get("scored_at", ""),
         },
         "metrics": metrics,
-        # v1 compat fields (for backward compatibility during transition)
-        "source": "tool",
-        "label": args.label or raw.get("module_id", "proteobench"),
         "tool": {
             "name": ui.get("software_name", "?"),
             "version": ui.get("software_version", "?"),
@@ -784,13 +793,8 @@ def normalize_proteobench(args):
             "input_format": raw.get("input_format", "?"),
             "intermediate_hash": raw.get("intermediate_hash", ""),
         },
-        "dataset": dataset,
     }
-    # labels are meant for display and may contain characters that are not
-    # valid in file names on every OS (e.g. '>' on Windows); sanitize only
-    # the file name, never the stored label.
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", args.label or "result").strip("-")
-    # default output path: benchmark/results/proteobench/reference/proteobench-<label>.json
     out_path = args.out or os.path.join(
         args.results_dir, "proteobench", "reference", f"proteobench-{safe}.json"
     )
