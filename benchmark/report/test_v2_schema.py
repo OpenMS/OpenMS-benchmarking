@@ -56,9 +56,11 @@ def test_v1_promotion():
     # Check metrics
     assert promoted["metrics"]["verdict"] == "pass"
     
-    # Check v1 compat fields
-    assert "_v1_compat" in promoted
-    assert promoted["_v1_compat"]["openms_sha"] == "abc123def456"
+    # v1 compat fields should NOT exist at top level
+    assert "_v1_compat" not in promoted, "_v1_compat should not exist in clean v2 output"
+    assert "openms_sha" not in promoted, "openms_sha should not exist at top level"
+    assert "cache" not in promoted, "cache should not exist at top level"
+    assert "verdict" not in promoted, "verdict should not exist at top level"
     
     print("PASS: v1 promotion test")
     return True
