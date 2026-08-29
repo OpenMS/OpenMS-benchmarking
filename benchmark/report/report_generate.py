@@ -426,11 +426,49 @@ def _stage_rows(stages):
     return rows
 
 
+def _flat_compare(result):
+    """Flatten a result into comparable key-value pairs.
+
+    Reads from metrics[], performance.build, performance.stages[], and
+    correctness — without duplicating data in the stored schema.  The
+caller gets a single dict suitable for comparison.
+    """
+    out = {}
+    # Scientific / benchmark-specific metrics
+    for k, v in _metrics(result).items():
+        out[k] = v
+    # Build performance
+    b = _build(result)
+    if b.get("wall_time_s") is not None:
+        out["build.wall_time_s"] = b["wall_time_s"]
+    if b.get("artifact_bytes") is not None:
+        out["build.artifact_bytes"] = b["artifact_bytes"]
+    # Stage metrics (dynamically discovered)
+    for stage in _stages(result):
+        name = stage.get("name", "?")
+        if stage.get("status") is not None:
+            out[f"stage.{name}.status"] = stage["status"]
+        if stage.get("wall_time_s") is not None:
+            out[f"stage.{name}.wall_time_s"] = stage["wall_time_s"]
+        if stage.get("cpu_time_s") is not None:
+            out[f"stage.{name}.cpu_time_s"] = stage["cpu_time_s"]
+        if stage.get("peak_rss_kb") is not None:
+            out[f"stage.{name}.peak_rss_kb"] = stage["peak_rss_kb"]
+    # Correctness metrics (e.g. OpenSwath feature counts)
+    for k, v in (result.get("correctness") or {}).items():
+        out[f"correctness.{k}"] = v
+    return out
+
+
 def _discover_shared_metrics(current, baseline):
-    """Dynamically discover metrics present in both current and baseline."""
-    cur_m = _metrics(current)
-    base_m = _metrics(baseline)
-    shared = sorted(set(cur_m.keys()) | set(base_m.keys()))
+    """Dynamically discover metrics present in both current and baseline.
+
+    Uses _flat_compare() so build, stage, and correctness data are
+    included alongside the flat metrics dict.
+    """
+    cur_c = _flat_compare(current)
+    base_c = _flat_compare(baseline)
+    shared = sorted(set(cur_c.keys()) | set(base_c.keys()))
     return shared
 
 
@@ -567,11 +605,11 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     comp_section = ""
     if baseline:
         shared = _discover_shared_metrics(current, baseline)
-        cur_m = _metrics(current)
-        base_m = _metrics(baseline)
+        cur_c = _flat_compare(current)
+        base_c = _flat_compare(baseline)
         rows = ""
         for key in shared:
-            cur_v, base_v = cur_m.get(key), base_m.get(key)
+            cur_v, base_v = cur_c.get(key), base_c.get(key)
             numeric = isinstance(cur_v, (int, float)) or isinstance(base_v, (int, float))
             delta_cell = html.escape(fmt_delta(cur_v, base_v, numeric))
             rows += (
@@ -631,12 +669,12 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     if verdict == "pass":
         status = '<span class="ok">✓ No regression detected</span>'
         if baseline:
-            cur_m = _metrics(current)
-            base_m = _metrics(baseline)
+            cur_c = _flat_compare(current)
+            base_c = _flat_compare(baseline)
             regressed = []
             for key in shared:
                 if key.startswith("stage.") and key.endswith(".status"):
-                    if cur_m.get(key) != "pass" and base_m.get(key) == "pass":
+                    if cur_c.get(key) != "pass" and base_c.get(key) == "pass":
                         regressed.append(key)
             if regressed:
                 status = f'<span class="bad">✗ Regression detected: {esc(", ".join(regressed))}</span>'
