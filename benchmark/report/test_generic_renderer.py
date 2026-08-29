@@ -26,7 +26,7 @@ from report_generate import (
     _promote_v1, load_results, render, _identity, _run, _performance,
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
-    fmt_seconds, fmt_bytes, fmt_delta
+    _flat_compare, fmt_seconds, fmt_bytes, fmt_delta
 )
 
 
@@ -439,6 +439,219 @@ def test_no_duplicate_v2_fields():
         shutil.rmtree(tmpdir)
 
 
+def test_flat_compare_includes_stage_and_build():
+    """_flat_compare should flatten stage and build data for comparison."""
+    from report_generate import _flat_compare
+    result = {
+        "schema": "openms-benchmarking/report/v2",
+        "identity": {"benchmark": "smoke", "software": {"version": "abc"}},
+        "run": {"run_id": "1", "run_at": "2026-08-01"},
+        "performance": {
+            "build": {"wall_time_s": 363.0, "artifact_bytes": 149265170},
+            "stages": [
+                {"name": "comet", "status": "pass", "wall_time_s": 5.0, "cpu_time_s": 0.2, "peak_rss_kb": 60000},
+                {"name": "percolator", "status": "pass", "wall_time_s": 4.0, "cpu_time_s": 0.1, "peak_rss_kb": 50000},
+            ],
+        },
+        "metrics": {"verdict": "pass"},
+        "correctness": {"feature_count": 6},
+    }
+    flat = _flat_compare(result)
+    assert flat["verdict"] == "pass"
+    assert flat["build.wall_time_s"] == 363.0
+    assert flat["build.artifact_bytes"] == 149265170
+    assert flat["stage.comet.status"] == "pass"
+    assert flat["stage.comet.wall_time_s"] == 5.0
+    assert flat["stage.comet.cpu_time_s"] == 0.2
+    assert flat["stage.comet.peak_rss_kb"] == 60000
+    assert flat["stage.percolator.status"] == "pass"
+    assert flat["correctness.feature_count"] == 6
+    print("  PASS: _flat_compare includes stage and build")
+
+
+def test_flat_compare_empty_sections():
+    """_flat_compare should not produce spurious keys for empty sections."""
+    from report_generate import _flat_compare
+    result = {
+        "schema": "openms-benchmarking/report/v2",
+        "identity": {"benchmark": "proteobench", "software": {"version": "v1"}},
+        "run": {"run_id": "1"},
+        "performance": {"build": {}, "stages": []},
+        "metrics": {"verdict": "unknown", "roc_auc": 0.89},
+    }
+    flat = _flat_compare(result)
+    assert "verdict" in flat
+    assert "roc_auc" in flat
+    # No stage or build keys for empty sections
+    assert not any(k.startswith("stage.") for k in flat)
+    assert not any(k.startswith("build.") for k in flat)
+    print("  PASS: _flat_compare empty sections")
+
+
+def test_smoke_comparison_shows_stage_data():
+    """Comparison table should include stage and build metrics for Smoke runs."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "smoke", "openms"), exist_ok=True)
+        base = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "smoke", "dataset": "test", "software": {"version": "old"}},
+            "run": {"run_id": "1", "run_at": "2026-08-01", "cache": "warm"},
+            "performance": {
+                "build": {"wall_time_s": 500.0, "artifact_bytes": 100000},
+                "stages": [
+                    {"name": "decoy_database", "wall_time_s": 5.0, "cpu_time_s": 0.01, "peak_rss_kb": 40000, "status": "pass"},
+                    {"name": "comet", "wall_time_s": 5.0, "cpu_time_s": 0.2, "peak_rss_kb": 60000, "status": "pass"},
+                ],
+            },
+            "metrics": {"verdict": "pass"},
+        }
+        current = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "smoke", "dataset": "test", "software": {"version": "new"}},
+            "run": {"run_id": "2", "run_at": "2026-08-02", "cache": "warm"},
+            "performance": {
+                "build": {"wall_time_s": 360.0, "artifact_bytes": 100000},
+                "stages": [
+                    {"name": "decoy_database", "wall_time_s": 3.0, "cpu_time_s": 0.01, "peak_rss_kb": 40000, "status": "pass"},
+                    {"name": "comet", "wall_time_s": 4.0, "cpu_time_s": 0.2, "peak_rss_kb": 60000, "status": "pass"},
+                ],
+            },
+            "metrics": {"verdict": "pass"},
+        }
+        with open(os.path.join(tmpdir, "smoke", "openms", "smoke-1.json"), "w") as f:
+            json.dump(base, f)
+        with open(os.path.join(tmpdir, "smoke", "openms", "smoke-2.json"), "w") as f:
+            json.dump(current, f)
+
+        openms_runs, tool_results = load_results(tmpdir)
+        cur = openms_runs[-1]
+        bl = openms_runs[0]
+
+        shared = _discover_shared_metrics(cur, bl)
+        # Must include stage and build keys, not just verdict
+        assert "stage.decoy_database.wall_time_s" in shared
+        assert "stage.comet.wall_time_s" in shared
+        assert "build.wall_time_s" in shared
+        assert "verdict" in shared
+
+        # Render and check HTML contains stage data
+        import datetime as _dt
+        out_path = os.path.join(tmpdir, "report.html")
+        render(cur, bl, openms_runs, tool_results, out_path, _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as f:
+            html_content = f.read()
+        assert "stage.decoy_database.wall_time_s" in html_content
+        assert "build.wall_time_s" in html_content
+        print("  PASS: smoke comparison shows stage data")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_stage_regression_detection():
+    """Stage pass->fail regression should be detected."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "smoke", "openms"), exist_ok=True)
+        base = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "smoke", "dataset": "test", "software": {"version": "old"}},
+            "run": {"run_id": "1", "run_at": "2026-08-01", "cache": "warm"},
+            "performance": {
+                "build": {},
+                "stages": [
+                    {"name": "comet", "wall_time_s": 5.0, "status": "pass"},
+                ],
+            },
+            "metrics": {"verdict": "pass"},
+        }
+        current = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "smoke", "dataset": "test", "software": {"version": "new"}},
+            "run": {"run_id": "2", "run_at": "2026-08-02", "cache": "warm"},
+            "performance": {
+                "build": {},
+                "stages": [
+                    {"name": "comet", "wall_time_s": 5.0, "status": "fail"},
+                ],
+            },
+            "metrics": {"verdict": "pass"},
+        }
+        with open(os.path.join(tmpdir, "smoke", "openms", "smoke-1.json"), "w") as f:
+            json.dump(base, f)
+        with open(os.path.join(tmpdir, "smoke", "openms", "smoke-2.json"), "w") as f:
+            json.dump(current, f)
+
+        openms_runs, tool_results = load_results(tmpdir)
+        cur = openms_runs[-1]
+        bl = openms_runs[0]
+
+        # Directly test regression detection logic
+        shared = _discover_shared_metrics(cur, bl)
+        cur_c = _flat_compare(cur)
+        base_c = _flat_compare(bl)
+        regressed = []
+        for key in shared:
+            if key.startswith("stage.") and key.endswith(".status"):
+                if cur_c.get(key) != "pass" and base_c.get(key) == "pass":
+                    regressed.append(key)
+        assert "stage.comet.status" in regressed, f"Expected regression detected, got {regressed}"
+
+        # Also verify the rendered HTML contains "Regression detected"
+        import datetime as _dt
+        out_path = os.path.join(tmpdir, "report.html")
+        render(cur, bl, openms_runs, tool_results, out_path, _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as f:
+            html_content = f.read()
+        assert "Regression detected" in html_content
+        print("  PASS: stage regression detection")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_proteobench_no_spurious_stage_keys():
+    """ProteoBench comparison should not invent stage/build keys."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "proteobench", "reference"), exist_ok=True)
+        base = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "proteobench", "dataset": "PXD028735", "software": {"version": "quantms-1.0"}},
+            "run": {"run_id": "Exp 1", "run_at": "2026-08-01"},
+            "performance": {"build": {}, "stages": []},
+            "metrics": {"verdict": "unknown", "roc_auc": 0.89, "quantified_precursors": 34635},
+            "tool": {"name": "quantms", "version": "1.0"},
+        }
+        current = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "proteobench", "dataset": "PXD028735", "software": {"version": "quantms-1.1"}},
+            "run": {"run_id": "Exp 2", "run_at": "2026-08-02"},
+            "performance": {"build": {}, "stages": []},
+            "metrics": {"verdict": "unknown", "roc_auc": 0.91, "quantified_precursors": 41379},
+            "tool": {"name": "quantms", "version": "1.1"},
+        }
+        with open(os.path.join(tmpdir, "proteobench", "reference", "pb-1.json"), "w") as f:
+            json.dump(base, f)
+        with open(os.path.join(tmpdir, "proteobench", "reference", "pb-2.json"), "w") as f:
+            json.dump(current, f)
+
+        _, tool_results = load_results(tmpdir)
+        cur = tool_results[-1]
+        bl = tool_results[0]
+
+        shared = _discover_shared_metrics(cur, bl)
+        # Should only have real metrics, no stage/build keys
+        stage_keys = [k for k in shared if k.startswith('stage.')]
+        build_keys = [k for k in shared if k.startswith('build.')]
+        assert not stage_keys, f'Unexpected stage keys: {stage_keys}'
+        assert not build_keys, f'Unexpected build keys: {build_keys}'
+        assert "roc_auc" in shared
+        assert "quantified_precursors" in shared
+        print("  PASS: proteobench no spurious stage keys")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def test_formatter_helpers():
     """Test formatting helper functions."""
     assert fmt_seconds(5.05) == "5.0s"
@@ -463,6 +676,11 @@ def main():
         test_dynamic_stage_discovery,
         test_dynamic_metric_comparison,
         test_no_duplicate_v2_fields,
+        test_flat_compare_includes_stage_and_build,
+        test_flat_compare_empty_sections,
+        test_smoke_comparison_shows_stage_data,
+        test_stage_regression_detection,
+        test_proteobench_no_spurious_stage_keys,
     ]
     passed = 0
     failed = 0
