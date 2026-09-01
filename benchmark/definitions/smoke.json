@@ -1,0 +1,14 @@
+{
+  "id": "smoke",
+  "name": "Smoke Test (DDA Pipeline)",
+  "description": "Minimal DDA pipeline benchmark proving binary correctness: DecoyDatabase → CometAdapter → PercolatorAdapter",
+  "runner": "benchmark/run_smoke_benchmark.sh",
+  "fixtures": [
+    "benchmark/fixtures/smoke_input.fasta",
+    "benchmark/fixtures/smoke_input.mzML"
+  ],
+  "normalization": {
+    "script": "benchmark/report/report_generate.py",
+    "function": "normalize_smoke"
+  }
+}

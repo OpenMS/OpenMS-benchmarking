@@ -1,0 +1,15 @@
+{
+  "id": "openswath",
+  "name": "OpenSwath DIA Benchmark",
+  "description": "DIA benchmark for OpenSwathWorkflow: spectral library search with retention time calibration",
+  "runner": "benchmark/run_openswath_benchmark.sh",
+  "fixtures": [
+    "benchmark/fixtures/OpenSwathWorkflow_1_input.mzML",
+    "benchmark/fixtures/OpenSwathWorkflow_1_input.TraML",
+    "benchmark/fixtures/OpenSwathWorkflow_1_input.trafoXML"
+  ],
+  "normalization": {
+    "script": "benchmark/run_openswath_benchmark.sh",
+    "note": "inline Python in runner script (lines 100-160)"
+  }
+}

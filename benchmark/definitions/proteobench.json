@@ -1,0 +1,12 @@
+{
+  "id": "proteobench",
+  "name": "ProteoBench Reference Results",
+  "description": "Reference results from ProteoBench scoring of external tools (quantms, etc.) on PXD028735 dataset",
+  "runner": null,
+  "fixtures": [],
+  "normalization": {
+    "script": "benchmark/report/report_generate.py",
+    "function": "normalize_proteobench"
+  },
+  "note": "ProteoBench results are generated externally and normalized locally. No runner script needed."
+}
