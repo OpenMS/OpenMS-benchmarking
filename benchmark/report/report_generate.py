@@ -40,12 +40,18 @@ Subcommands:
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
         Convert a local ProteoBench scoring result into a tool result.
 
+    normalize openswath --run-id ID [--cache cold|warm|none] [--results-dir DIR] [--out PATH]
+        Convert raw OpenSwath benchmark output into a normalized v2 OpenMS run result.
+        Reads stages.tsv, meta.txt, output.featureXML, and output.json from the
+        raw results directory.
+
     render [--results-dir DIR] [--current PATH] [--out report.html]
         Discover all results, compare the current run against the stored
         baseline, and render report.html.
 """
 
 import argparse
+import csv
 import datetime as _dt
 import glob
 import html
@@ -53,6 +59,7 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 
 SCHEMA_V1 = "openms-benchmarking/report/v1"
 SCHEMA_V2 = "openms-benchmarking/report/v2"
@@ -268,9 +275,6 @@ def _promote_v1(data):
     # Carry over correctness for OpenSwath-like results
     if data.get("correctness"):
         promoted["correctness"] = data["correctness"]
-    # Carry over tool_versions for pipeline results
-    if data.get("tool_versions"):
-        promoted["tool_versions"] = data["tool_versions"]
     # Carry over openms metrics that aren't verdict
     if data.get("metrics"):
         promoted["metrics"].update(data["metrics"])
@@ -770,7 +774,6 @@ def normalize_smoke(args):
         "metrics": {
             "verdict": raw.get("verdict", "unknown"),
         },
-        "tool_versions": raw.get("tool_versions", {}),
     }
     # default output path
     out_path = args.out or os.path.join(
@@ -842,6 +845,130 @@ def normalize_proteobench(args):
     print(f"normalized tool result -> {out_path}")
 
 
+def normalize_openswath(args):
+    """Convert raw OpenSwath benchmark output into a normalized v2 OpenMS run result.
+
+    Reads stages.tsv, meta.txt, output.featureXML, and output.json from the
+    results directory produced by run_openswath_benchmark.sh and writes a v2
+    canonical result JSON.
+    """
+    results_dir = args.results_dir
+
+    # Read meta
+    meta = {}
+    meta_path = os.path.join(results_dir, "meta.txt")
+    if os.path.exists(meta_path):
+        with open(meta_path) as fh:
+            for line in fh:
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    meta[k.strip()] = v.strip()
+
+    # Read stages
+    stages = []
+    stages_path = os.path.join(results_dir, "stages.tsv")
+    if os.path.exists(stages_path):
+        with open(stages_path) as fh:
+            for row in csv.reader(fh, delimiter="\t"):
+                if not row:
+                    continue
+                name, required, rc, wall, cpu, peak, status, reason = (row + [""] * 8)[:8]
+                stages.append({
+                    "name": name,
+                    "required": required == "true",
+                    "exit_code": int(rc),
+                    "wall_time_s": float(wall),
+                    "cpu_time_s": float(cpu),
+                    "peak_rss_kb": int(peak),
+                    "status": status,
+                    "reason": reason,
+                })
+
+    # Parse featureXML for correctness metrics
+    feature_count = 0
+    overall_qualities = []
+    intensities = []
+    featurexml_path = os.path.join(results_dir, "output.featureXML")
+    if os.path.exists(featurexml_path):
+        tree = ET.parse(featurexml_path)
+        root = tree.getroot()
+        # featureList may be the root element or a child of featureMap
+        feature_list = root if root.tag == "featureList" else root.find("featureList")
+        if feature_list is not None:
+            features = feature_list.findall("feature")
+            feature_count = len(features)
+            for feat in features:
+                oq = feat.find("overallquality")
+                if oq is not None and oq.text:
+                    try:
+                        overall_qualities.append(float(oq.text))
+                    except ValueError:
+                        pass
+                intensity = feat.find("intensity")
+                if intensity is not None and intensity.text:
+                    try:
+                        intensities.append(float(intensity.text))
+                    except ValueError:
+                        pass
+
+    # Parse QC JSON
+    qc_metrics = {}
+    qc_path = os.path.join(results_dir, "output.json")
+    if os.path.exists(qc_path):
+        with open(qc_path) as fh:
+            qc_metrics = json.load(fh)
+
+    required_ok = all(s["status"] == "pass" for s in stages if s["required"])
+    verdict = "pass" if required_ok else "fail"
+
+    # v2 schema — no duplicate v1 fields
+    out = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": "openswath_dia",
+            "dataset": args.dataset or "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+            "software": {
+                "name": "OpenMS",
+                "version": meta.get("openms_sha", ""),
+            },
+            "configuration": {},
+        },
+        "run": {
+            "run_id": args.run_id,
+            "run_at": args.run_at or "",
+            "cache": args.cache or "unknown",
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
+            "build": {},
+            "stages": stages,
+        },
+        "metrics": {
+            "verdict": verdict,
+        },
+        "correctness": {
+            "expected_features": 6,
+            "actual_features": feature_count,
+            "features_match": feature_count == 6,
+            "overall_quality_sum": round(sum(overall_qualities), 6) if overall_qualities else 0,
+            "total_intensity": round(sum(intensities), 2) if intensities else 0,
+            "qc_charge_distribution": qc_metrics.get("ChargeDistributionMS1", []),
+        },
+    }
+
+    # default output path — inside --results-dir so CI artifact upload captures it
+    out_path = args.out or os.path.join(
+        args.results_dir, "openswath", "openms",
+        f"openswath-{args.run_id}.json"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"normalized OpenSwath run result -> {out_path}")
+
+
 def render_cmd(args):
     results_dir = args.results_dir
     openms_runs, tool_results = load_results(results_dir)
@@ -894,6 +1021,17 @@ def main():
     pp.add_argument("--results-dir", default="benchmark/results")
     pp.add_argument("--out")
     pp.set_defaults(fn=normalize_proteobench)
+
+    po = pn.add_parser("openswath", help="normalize raw OpenSwath benchmark output into v2")
+    po.add_argument("--run-id", required=True)
+    po.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="unknown")
+    po.add_argument("--run-at", default="")
+    po.add_argument("--dataset", default="",
+                    help="what was benchmarked (default: OpenSwathWorkflow_1 fixture)")
+    po.add_argument("--results-dir", required=True,
+                    help="raw results directory from run_openswath_benchmark.sh")
+    po.add_argument("--out")
+    po.set_defaults(fn=normalize_openswath)
 
     r = sub.add_parser("render", help="discover results and render report.html")
     r.add_argument("--results-dir", default="benchmark/results")

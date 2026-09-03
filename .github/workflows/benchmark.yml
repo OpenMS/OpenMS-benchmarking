@@ -176,6 +176,24 @@ jobs:
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh
 
+      # Compute artifact size for the normalization step (build job does not
+      # expose this directly).
+      - name: Compute artifact size
+        id: artifact-size
+        shell: bash
+        run: echo "bytes=$(du -sb openms/build/bin openms/build/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize smoke results to v2
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize smoke \
+            results/smoke.json \
+            --run-id "${{ github.run_id }}" \
+            --cache none \
+            --build-time "$(echo '${{ needs.build-openms.outputs.build_minutes }} * 60' | bc)" \
+            --artifact-bytes "${{ steps.artifact-size.outputs.bytes }}" \
+            --results-dir results
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
         with:
@@ -216,6 +234,14 @@ jobs:
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-openswath
         run: bash benchmark/run_openswath_benchmark.sh
+
+      - name: Normalize OpenSwath results to v2
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize openswath \
+            --run-id "${{ github.run_id }}" \
+            --cache none \
+            --results-dir results-openswath
 
       - name: Upload OpenSwath benchmark results
         uses: actions/upload-artifact@v7
