@@ -849,6 +849,156 @@ def test_normalize_openswath_required_stage_fail():
         shutil.rmtree(tmpdir)
 
 
+def test_normalize_openswath_missing_stages():
+    """Missing stages.tsv must produce verdict=fail, not pass."""
+    from report_generate import normalize_openswath
+    import argparse
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_dir = os.path.join(tmpdir, "raw")
+        os.makedirs(raw_dir)
+        # No stages.tsv at all
+        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
+            f.write("openms_sha=sha789\n")
+
+        out_path = os.path.join(tmpdir, "result.json")
+        args = argparse.Namespace(
+            run_id="no-stages",
+            cache="none",
+            run_at="",
+            dataset="",
+            results_dir=raw_dir,
+            out=out_path,
+        )
+        normalize_openswath(args)
+
+        with open(out_path) as f:
+            result = json.load(f)
+        assert result["metrics"]["verdict"] == "fail", (
+            f"verdict should be 'fail' for missing stages, got '{result['metrics']['verdict']}'"
+        )
+        assert result["performance"]["stages"] == []
+        assert result["performance"]["wall_time_s"] == 0
+        assert result["performance"]["peak_rss_kb"] == 0
+        print("  PASS: normalize_openswath missing stages")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_empty_stages():
+    """Empty stages.tsv (header only or blank) must produce verdict=fail."""
+    from report_generate import normalize_openswath
+    import argparse
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_dir = os.path.join(tmpdir, "raw")
+        os.makedirs(raw_dir)
+        # stages.tsv exists but is empty
+        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
+            f.write("")
+        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
+            f.write("openms_sha=sha000\n")
+
+        out_path = os.path.join(tmpdir, "result.json")
+        args = argparse.Namespace(
+            run_id="empty-stages",
+            cache="none",
+            run_at="",
+            dataset="",
+            results_dir=raw_dir,
+            out=out_path,
+        )
+        normalize_openswath(args)
+
+        with open(out_path) as f:
+            result = json.load(f)
+        assert result["metrics"]["verdict"] == "fail", (
+            f"verdict should be 'fail' for empty stages, got '{result['metrics']['verdict']}'"
+        )
+        assert result["performance"]["stages"] == []
+        print("  PASS: normalize_openswath empty stages")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_partial_tsv_rows():
+    """Partial TSV rows with empty numeric fields should not crash."""
+    from report_generate import normalize_openswath
+    import argparse
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_dir = os.path.join(tmpdir, "raw")
+        os.makedirs(raw_dir)
+        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
+            f.write("openms_sha=shaPartial\n")
+        # Stage with empty exit_code, wall_time, cpu_time, peak_rss
+        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
+            f.write("openswath_workflow\ttrue\t\t\t\t\tpass\t\n")
+
+        out_path = os.path.join(tmpdir, "result.json")
+        args = argparse.Namespace(
+            run_id="partial-tsv",
+            cache="none",
+            run_at="",
+            dataset="",
+            results_dir=raw_dir,
+            out=out_path,
+        )
+        normalize_openswath(args)
+
+        with open(out_path) as f:
+            result = json.load(f)
+        stage = result["performance"]["stages"][0]
+        assert stage["exit_code"] == 0, f"expected exit_code=0, got {stage['exit_code']}"
+        assert stage["wall_time_s"] == 0.0, f"expected wall_time_s=0.0, got {stage['wall_time_s']}"
+        assert stage["cpu_time_s"] == 0.0, f"expected cpu_time_s=0.0, got {stage['cpu_time_s']}"
+        assert stage["peak_rss_kb"] == 0, f"expected peak_rss_kb=0, got {stage['peak_rss_kb']}"
+        assert stage["status"] == "pass"
+        assert result["metrics"]["verdict"] == "pass"
+        assert result["performance"]["wall_time_s"] == 0.0
+        print("  PASS: normalize_openswath partial TSV rows")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_malformed_numeric():
+    """Non-numeric values in numeric TSV columns should default to 0, not crash."""
+    from report_generate import normalize_openswath
+    import argparse
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_dir = os.path.join(tmpdir, "raw")
+        os.makedirs(raw_dir)
+        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
+            f.write("openms_sha=shaBad\n")
+        # Malformed numeric fields
+        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
+            f.write("openswath_workflow\ttrue\tN/A\tnot-a-number\t\tabc\tpass\t\n")
+
+        out_path = os.path.join(tmpdir, "result.json")
+        args = argparse.Namespace(
+            run_id="malformed",
+            cache="none",
+            run_at="",
+            dataset="",
+            results_dir=raw_dir,
+            out=out_path,
+        )
+        normalize_openswath(args)
+
+        with open(out_path) as f:
+            result = json.load(f)
+        stage = result["performance"]["stages"][0]
+        assert stage["exit_code"] == 0, f"expected exit_code=0 for 'N/A', got {stage['exit_code']}"
+        assert stage["wall_time_s"] == 0.0, f"expected wall_time_s=0.0 for 'not-a-number', got {stage['wall_time_s']}"
+        assert stage["peak_rss_kb"] == 0, f"expected peak_rss_kb=0 for 'abc', got {stage['peak_rss_kb']}"
+        assert stage["status"] == "pass"
+        assert result["metrics"]["verdict"] == "pass"
+        print("  PASS: normalize_openswath malformed numeric")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -872,6 +1022,10 @@ def main():
         test_normalize_openswath_loads_via_load_results,
         test_normalize_openswath_missing_files,
         test_normalize_openswath_required_stage_fail,
+        test_normalize_openswath_missing_stages,
+        test_normalize_openswath_empty_stages,
+        test_normalize_openswath_partial_tsv_rows,
+        test_normalize_openswath_malformed_numeric,
     ]
     passed = 0
     failed = 0
