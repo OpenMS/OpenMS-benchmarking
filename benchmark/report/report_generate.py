@@ -873,13 +873,29 @@ def normalize_openswath(args):
                 if not row:
                     continue
                 name, required, rc, wall, cpu, peak, status, reason = (row + [""] * 8)[:8]
+                try:
+                    exit_code = int(rc)
+                except (ValueError, TypeError):
+                    exit_code = 0
+                try:
+                    wall_time = float(wall)
+                except (ValueError, TypeError):
+                    wall_time = 0.0
+                try:
+                    cpu_time = float(cpu)
+                except (ValueError, TypeError):
+                    cpu_time = 0.0
+                try:
+                    peak_rss = int(peak)
+                except (ValueError, TypeError):
+                    peak_rss = 0
                 stages.append({
                     "name": name,
                     "required": required == "true",
-                    "exit_code": int(rc),
-                    "wall_time_s": float(wall),
-                    "cpu_time_s": float(cpu),
-                    "peak_rss_kb": int(peak),
+                    "exit_code": exit_code,
+                    "wall_time_s": wall_time,
+                    "cpu_time_s": cpu_time,
+                    "peak_rss_kb": peak_rss,
                     "status": status,
                     "reason": reason,
                 })
@@ -918,8 +934,13 @@ def normalize_openswath(args):
         with open(qc_path) as fh:
             qc_metrics = json.load(fh)
 
-    required_ok = all(s["status"] == "pass" for s in stages if s["required"])
-    verdict = "pass" if required_ok else "fail"
+    # Empty/missing stages are never a pass — all([]) is True, but a
+    # benchmark with no stages did not run successfully.
+    if not stages:
+        verdict = "fail"
+    else:
+        required_ok = all(s["status"] == "pass" for s in stages if s["required"])
+        verdict = "pass" if required_ok else "fail"
 
     # v2 schema — no duplicate v1 fields
     out = {
