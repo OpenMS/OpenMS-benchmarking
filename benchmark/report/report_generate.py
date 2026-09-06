@@ -990,6 +990,128 @@ def normalize_openswath(args):
     print(f"normalized OpenSwath run result -> {out_path}")
 
 
+def normalize_prose_peptdeep(args):
+    """Convert raw ProSE+PeptDeep benchmark output into a normalized v2 run result.
+
+    Reads prose.json, stages.tsv and meta.txt from the results directory
+    produced by run_prose_benchmark.sh and writes a v2 canonical result JSON.
+    The two arms (baseline, peptdeep) are configurations of one benchmark and
+    stay in one result: the headline metrics become arm-qualified metric keys
+    (target_psms_at_1pct_fdr_baseline / _peptdeep), which the generic renderer
+    compares like any other metric. The peptdeep arm's wall time and peak RSS
+    are the whole-run performance figures (both arms run the same search, so
+    they are directly comparable across runs of the same SHA).
+    """
+    results_dir = args.results_dir
+
+    # Read meta
+    meta = {}
+    meta_path = os.path.join(results_dir, "meta.txt")
+    if os.path.exists(meta_path):
+        with open(meta_path) as fh:
+            for line in fh:
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    meta[k.strip()] = v.strip()
+
+    # Read stages (the raw prose.json already carries them; stages.tsv is the
+    # fallback when only a CI artifact subset is available)
+    stages = []
+    prose_json_path = os.path.join(results_dir, "prose.json")
+    raw = {}
+    if os.path.exists(prose_json_path):
+        with open(prose_json_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        stages = raw.get("stages", [])
+    if not stages:
+        stages_path = os.path.join(results_dir, "stages.tsv")
+        if os.path.exists(stages_path):
+            with open(stages_path) as fh:
+                for row in csv.reader(fh, delimiter="\t"):
+                    if not row:
+                        continue
+                    name, required, rc, wall, cpu, peak, status, reason = (row + [""] * 8)[:8]
+
+                    def _num(v, cast, default):
+                        try:
+                            return cast(v)
+                        except (ValueError, TypeError):
+                            return default
+
+                    stages.append({
+                        "name": name,
+                        "required": required == "true",
+                        "exit_code": _num(rc, int, 0),
+                        "wall_time_s": _num(wall, float, 0.0),
+                        "cpu_time_s": _num(cpu, float, 0.0),
+                        "peak_rss_kb": _num(peak, int, 0),
+                        "status": status,
+                        "reason": reason,
+                    })
+
+    arms = raw.get("arms", {})
+    metrics = {
+        "verdict": raw.get("verdict", "fail" if not stages else "unknown"),
+    }
+    for arm in ("baseline", "peptdeep"):
+        counts = arms.get(arm)
+        if not counts:
+            continue
+        for key in ("target_psms_at_1pct_fdr", "target_peptides_at_1pct_fdr",
+                    "entrapment_psms_at_1pct_fdr", "entrapment_peptides_at_1pct_fdr"):
+            metrics[f"{key}_{arm}"] = counts.get(key)
+        metrics[f"wall_time_s_{arm}"] = counts.get("wall_time_s")
+        metrics[f"peak_rss_mb_{arm}"] = counts.get("peak_rss_mb")
+    metrics = {k: v for k, v in metrics.items() if v is not None}
+
+    # Empty/missing stages are never a pass — a benchmark with no stages did
+    # not run successfully (same rule as normalize_openswath).
+    if not stages:
+        verdict = "fail"
+    else:
+        required_ok = all(s.get("status") == "pass" for s in stages if s.get("required"))
+        verdict = "pass" if required_ok else "fail"
+
+    out = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": "prose_peptdeep",
+            "dataset": args.dataset or meta.get("prose_input", ""),
+            "software": {
+                "name": "OpenMS",
+                "version": meta.get("openms_sha", raw.get("openms_sha", "")),
+            },
+            "configuration": {
+                "entrapment_prefix": meta.get("entrapment_prefix", ""),
+                "peptdeep_instrument": meta.get("peptdeep_instrument", ""),
+            },
+        },
+        "run": {
+            "run_id": args.run_id,
+            "run_at": args.run_at or raw.get("run_at", ""),
+            "cache": args.cache or "unknown",
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
+            "build": {},
+            "stages": stages,
+        },
+        "metrics": metrics,
+    }
+
+    # default output path — inside --results-dir so CI artifact upload captures it
+    out_path = args.out or os.path.join(
+        args.results_dir, "prose_peptdeep", "openms",
+        f"prose_peptdeep-{args.run_id}.json"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"normalized ProSE+PeptDeep run result -> {out_path}")
+
+
 def render_cmd(args):
     results_dir = args.results_dir
     openms_runs, tool_results = load_results(results_dir)
@@ -1053,6 +1175,17 @@ def main():
                     help="raw results directory from run_openswath_benchmark.sh")
     po.add_argument("--out")
     po.set_defaults(fn=normalize_openswath)
+
+    pr = pn.add_parser("prose-peptdeep", help="normalize raw ProSE+PeptDeep benchmark output into v2")
+    pr.add_argument("--run-id", required=True)
+    pr.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="unknown")
+    pr.add_argument("--run-at", default="")
+    pr.add_argument("--dataset", default="",
+                    help="what was benchmarked (default: the runner's input mzML)")
+    pr.add_argument("--results-dir", required=True,
+                    help="raw results directory from run_prose_benchmark.sh")
+    pr.add_argument("--out")
+    pr.set_defaults(fn=normalize_prose_peptdeep)
 
     r = sub.add_parser("render", help="discover results and render report.html")
     r.add_argument("--results-dir", default="benchmark/results")

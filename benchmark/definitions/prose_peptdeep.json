@@ -1,0 +1,12 @@
+{
+  "id": "prose_peptdeep",
+  "name": "ProSE + PeptDeep Entrapment Benchmark",
+  "description": "Two arms over the same fixture: baseline (ProSE -> Percolator) vs ProSE with PeptDeep MS2+RT prediction rescoring features. Headline metrics: target PSMs and unique target peptides at 1% FDR, wall time, peak RSS. Entrapment PSMs (protein accessions with the configured prefix) are the false-discovery proxy.",
+  "runner": "benchmark/run_prose_benchmark.sh",
+  "fixtures": [],
+  "normalization": {
+    "script": "benchmark/report/report_generate.py",
+    "function": "normalize_prose_peptdeep"
+  },
+  "note": "Fixture-driven: the mzML and target+entrapment FASTA are supplied via environment variables (PROSE_INPUT, PROSE_FASTA); no dataset is vendored yet (pending the minimal entrapment dataset)."
+}
