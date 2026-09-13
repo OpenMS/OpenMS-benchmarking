@@ -480,6 +480,12 @@ jobs:
 
       - name: Generate entrapment FASTA + merged mzML
         shell: bash
+        env:
+          # The artifact ships libOpenMS.so in build/lib, but the binaries'
+          # baked RUNPATH points at the build job's layout (<ws>/build/lib),
+          # not this job's (<ws>/openms/build/lib) - so point the dynamic
+          # linker there for FileMerger, exactly like the run step below.
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
         run: |
           bash benchmark/prepare_prose_inputs.sh \
             "$GITHUB_WORKSPACE/openms-src" \
