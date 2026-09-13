@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       openms_sha:
-        description: "OpenMS commit SHA to build and benchmark"
+        description: "OpenMS commit SHA to build and benchmark (must contain the PR #9975 ONNX support: cmake/Modules/FindONNXRuntime.cmake was added after f1768367)"
         required: false
-        default: "f1768367fa66f7901b4fa78a9ebece64b2ce9024"
+        default: "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
       use_ms2rescore:
         description: "Request the extended (MS2Rescore) benchmark mode"
         required: false
