@@ -177,6 +177,7 @@ log "fasta:           ${PROSE_FASTA}"
 log "entrapment:      accessions starting with '${PROSE_ENTRAPMENT_PREFIX}'"
 log "peptdeep models: ${PEPTDEEP_MS2_MODEL} / ${PEPTDEEP_RT_MODEL} (${PEPTDEEP_INSTRUMENT})"
 log "threads:         ${PROSE_THREADS}"
+log "search args:     ${PROSE_EXTRA_SEARCH_ARGS:-<none>}"
 log "results:         ${RESULTS_DIR}"
 
 if [[ ! -x "${PROSE_EXE}" ]]; then
@@ -197,6 +198,7 @@ log "  [OK] Percolator: ${PERCOLATOR_EXE}"
   echo "peptdeep_rt_model=${PEPTDEEP_RT_MODEL}"
   echo "peptdeep_instrument=${PEPTDEEP_INSTRUMENT}"
   echo "threads=${PROSE_THREADS}"
+  echo "prose_extra_search_args=${PROSE_EXTRA_SEARCH_ARGS:-}"
   echo "prose_version=$("${PROSE_EXE}" --version 2>&1 | head -1 || true)"
 } > "${RESULTS_DIR}/meta.txt"
 log "versions recorded in meta.txt"
@@ -218,12 +220,13 @@ COMMON_ARGS=(
 )
 
 # Arm 1: baseline (Percolator only). peptdeep:enable is false by default;
-# pass it explicitly so the recorded configuration is unambiguous.
+# simply omit the flag (its presence on the command line would mean "true":
+# OpenMS maps a string param defaulting to "false" with valid_strings
+# {true,false} to a no-value CLI flag, see TOPPBase::paramEntryToParameterInformation_).
 run_stage "prose_baseline" true \
   "${PROSE_EXE}" "${COMMON_ARGS[@]}" \
   -out_idxml "${RESULTS_DIR}/baseline.idXML" \
-  -summary_out "${RESULTS_DIR}/baseline_summary.yaml" \
-  -Search:peptdeep:enable false
+  -summary_out "${RESULTS_DIR}/baseline_summary.yaml"
 
 # Arm 2: same search + PeptDeep MS2/RT prediction features. A relative model
 # name is resolved by ProSE against <exe>/../share/OpenMS (see design 2).
@@ -231,7 +234,7 @@ run_stage "prose_peptdeep" true \
   "${PROSE_EXE}" "${COMMON_ARGS[@]}" \
   -out_idxml "${RESULTS_DIR}/peptdeep.idXML" \
   -summary_out "${RESULTS_DIR}/peptdeep_summary.yaml" \
-  -Search:peptdeep:enable true \
+  -Search:peptdeep:enable \
   -Search:peptdeep:ms2_model "${PEPTDEEP_MS2_MODEL}" \
   -Search:peptdeep:rt_model "${PEPTDEEP_RT_MODEL}" \
   -Search:peptdeep:instrument "${PEPTDEEP_INSTRUMENT}"
@@ -276,8 +279,22 @@ with open(os.path.join(results_dir, "stages.tsv")) as fh:
 prefix = os.environ["PROSE_ENTRAPMENT_PREFIX"]
 
 def arm_metrics(name, idxml):
-    parsed = pm.parse_idxml(idxml, prefix)
-    counts = pm.count_psms(parsed)
+    try:
+        parsed = pm.parse_idxml(idxml, prefix)
+        counts = pm.count_psms(parsed)
+    except pm.ProseMetricsError as e:
+        # An empty/structurally unusable idXML (e.g. the search found no PSMs
+        # at all) is a benchmark failure, not a crash: record it, fail the
+        # verdict below, and keep the runner's outputs complete.
+        counts = {
+            "error": str(e),
+            "q_threshold": pm.Q_THRESHOLD,
+            "psms_total": 0,
+            "target_psms_at_1pct_fdr": 0,
+            "target_peptides_at_1pct_fdr": 0,
+            "entrapment_psms_at_1pct_fdr": 0,
+            "entrapment_peptides_at_1pct_fdr": 0,
+        }
     counts["wall_time_s"] = 0.0   # filled from the arm's stage below
     counts["peak_rss_mb"] = 0.0
     return counts
@@ -300,7 +317,9 @@ for name, idxml, stage in (
     arms[name] = counts
 
 required_ok = all(s["status"] == "pass" for s in stages if s["required"])
-verdict = "pass" if required_ok and not arms["peptdeep"]["peptdeep_features_missing"] else "fail"
+arms_usable = all("error" not in arms[a] for a in ("baseline", "peptdeep"))
+peptdeep_ran = not arms["peptdeep"].get("peptdeep_features_missing")
+verdict = "pass" if required_ok and arms_usable and peptdeep_ran else "fail"
 
 report = {
     "schema": "openms-benchmarking/report/v2",
@@ -317,6 +336,7 @@ report = {
         "peptdeep_rt_model": meta.get("peptdeep_rt_model", ""),
         "peptdeep_instrument": meta.get("peptdeep_instrument", ""),
         "threads": meta.get("threads", ""),
+        "prose_extra_search_args": meta.get("prose_extra_search_args", ""),
     },
     "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
     "run_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -345,4 +365,9 @@ fi
 log ""
 log "Verdict: ${verdict}"
 log "Machine-readable results: ${RESULTS_DIR}/prose.json"
-log "Done."
+if [[ "${verdict}" == "pass" ]]; then
+  log "Done."
+else
+  log "Done with failures - see logs/ and prose.json."
+  exit 1
+fi

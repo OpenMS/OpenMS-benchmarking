@@ -12,6 +12,7 @@ Run:  python3 benchmark/test_prose_metrics.py
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -175,41 +176,91 @@ def test_missing_peptdeep_features_fail():
 
 
 def test_runner_verdict_fails_on_missing_features():
-    """End-to-end runner logic on synthetic fixtures: a peptdeep arm without
-    the five features must produce verdict=fail in prose.json."""
+    """End-to-end runner test: the stub ProSE really produces valid
+    baseline-style idXML outputs for BOTH arms (so the two required stages
+    pass), but the peptdeep arm carries none of the five PeptDeep features.
+    The feature guard must then yield prose.json verdict=fail and a
+    non-zero runner exit - not an incidental crash on missing files."""
     with tempfile.TemporaryDirectory() as tmp:
-        results = os.path.join(tmp, "results")
-        os.makedirs(results)
-        # baseline-style idXML for BOTH arms -> peptdeep guard must fail
-        for arm in ("baseline", "peptdeep"):
-            make_idxml(os.path.join(results, arm + ".idXML"),
-                       [pid("PEPTIDEA", 0.001, "PH_0", "target")])
-        with open(os.path.join(results, "stages.tsv"), "w") as fh:
-            fh.write("prose_baseline\ttrue\t0\t1.0\t0.8\t1000\tpass\t\n")
-            fh.write("prose_peptdeep\ttrue\t0\t2.0\t1.6\t2000\tpass\t\n")
-        script = os.path.join(HERE, "run_prose_benchmark.sh")
-        env = dict(os.environ, RESULTS_DIR=results, PROSE_ENTRAPMENT_PREFIX="ENTRAPMENT_",
-                   SCRIPT_DIR_EXPORT=HERE)
-        # Run only the machine-readable-results block of the runner by
-        # invoking the runner with a stub ProSE: it must fail fast on the
-        # missing peptdeep features (prose.json verdict=fail, exit 1).
-        stub = os.path.join(tmp, "ProSE")
-        with open(stub, "w") as fh:
-            fh.write("#!/usr/bin/env bash\nexit 0\n")
+        def fwd(p):
+            # forward slashes: unambiguous for bash and for Python on Windows
+            return p.replace("\\", "/")
+
+        # Inputs required by the runner's existence checks (content is
+        # irrelevant: the stub ProSE ignores them).
+        input_mzml = fwd(os.path.join(tmp, "run.mzML"))
+        input_fasta = fwd(os.path.join(tmp, "entrapment.fasta"))
+        for path in (input_mzml, input_fasta):
+            with open(path, "w") as fh:
+                fh.write("stub\n")
+
+        # What the stub writes for both arms: valid ProSE-style output with
+        # baseline extra_features and no PeptDeep features anywhere.
+        stub_idxml = fwd(os.path.join(tmp, "stub_output.idXML"))
+        make_idxml(stub_idxml, [pid("PEPTIDEA", 0.001, "PH_0", "target")])
+
+        # Stub ProSE: copies the prepared idXML to -out_idxml, writes a
+        # minimal summary YAML to -summary_out, always exits 0. (LF endings:
+        # a shebang script with CRLF breaks on strict-bash platforms.)
+        stub = fwd(os.path.join(tmp, "ProSE"))
+        with open(stub, "w", newline="\n") as fh:
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                "out=''\nsummary=''\nprev=''\n"
+                "for arg in \"$@\"; do\n"
+                "  if [[ \"${prev}\" == '-out_idxml' ]]; then out=\"${arg}\"; fi\n"
+                "  if [[ \"${prev}\" == '-summary_out' ]]; then summary=\"${arg}\"; fi\n"
+                "  prev=\"${arg}\"\n"
+                "done\n"
+                "if [[ -n \"${out}\" ]]; then cp \"${STUB_IDXML}\" \"${out}\"; fi\n"
+                "if [[ -n \"${summary}\" ]]; then"
+                " echo 'shared: {seconds_total: 1.0}' > \"${summary}\"; fi\n"
+                "exit 0\n"
+            )
         os.chmod(stub, 0o755)
+
+        results = fwd(os.path.join(tmp, "results"))
+        script = fwd(os.path.join(HERE, "run_prose_benchmark.sh"))
+
+        # Hermetic `python3` for the runner's inline Python blocks: on Windows
+        # Git Bash, python3 often resolves to the Microsoft Store alias stub,
+        # so shim it to the interpreter running this test (on Linux this is a
+        # no-op passthrough).
+        shim_dir = fwd(os.path.join(tmp, "bin"))
+        os.makedirs(shim_dir)
+        shim = os.path.join(shim_dir, "python3")
+        with open(shim, "w", newline="\n") as fh:
+            fh.write("#!/usr/bin/env bash\nexec '%s' \"$@\"\n"
+                     % sys.executable.replace("\\", "/"))
+        os.chmod(shim, 0o755)
+        path_env = shim_dir + os.pathsep + os.environ.get("PATH", "")
+
+        # Resolve bash explicitly: on Windows, CreateProcess searching bare
+        # "bash" hits System32's WSL launcher before Git Bash's PATH entries,
+        # and WSL bash cannot open C:/... script paths. shutil.which() only
+        # walks PATH directories, so it lands on the Git Bash / POSIX bash.
+        bash_exe = shutil.which("bash") or "bash"
         proc = subprocess.run(
-            ["bash", script],
-            env=dict(env, OPENMS_BIN=tmp, PROSE_INPUT="x.mzML", PROSE_FASTA="x.fasta",
-                     PROSE_EXE=stub, PERCOLATOR_EXE=stub),
+            [bash_exe, script],
+            env=dict(os.environ, PATH=path_env, OPENMS_BIN=tmp, PROSE_INPUT=input_mzml,
+                     PROSE_FASTA=input_fasta, PROSE_EXE=stub, PERCOLATOR_EXE=stub,
+                     RESULTS_DIR=results, PROSE_ENTRAPMENT_PREFIX="ENTRAPMENT_",
+                     STUB_IDXML=stub_idxml),
             capture_output=True, text=True)
-        # The stub run's idXMLs get overwritten by the stub (no output), so
-        # the metrics stage fails: either way the verdict must not be "pass".
+
+        # The runner must have completed the whole pipeline (both stages
+        # pass, prose.json written) and failed ONLY on the feature guard.
         prose_json = os.path.join(results, "prose.json")
-        if os.path.exists(prose_json):
-            with open(prose_json) as fh:
-                data = json.load(fh)
-            assert data["verdict"] != "pass", data["verdict"]
-        assert proc.returncode != 0, "runner must fail when peptdeep features are absent"
+        assert os.path.exists(prose_json), proc.stdout + proc.stderr
+        with open(prose_json) as fh:
+            data = json.load(fh)
+        assert all(s["status"] == "pass" for s in data["stages"]), data["stages"]
+        assert data["arms"]["baseline"].get("peptdeep_features_missing") is None
+        assert data["arms"]["peptdeep"]["peptdeep_features_missing"] == \
+            list(pm.PEPTDEEP_FEATURES), data["arms"]["peptdeep"]
+        assert data["verdict"] == "fail", data["verdict"]
+        assert proc.returncode != 0, \
+            "runner must exit non-zero when the peptdeep arm lacks its features"
     print("PASS: runner verdict fails when PeptDeep features are missing")
 
 
