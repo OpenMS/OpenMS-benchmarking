@@ -15,6 +15,11 @@ benchmark/results/decoy.fasta
 benchmark/results/comet.idXML
 benchmark/results/rescored.idXML
 
+# Generated benchmark inputs (prepare_prose_inputs.sh: entrapment FASTA +
+# merged mzML). Temporary artifacts, deterministically reproducible - never
+# vendored or committed.
+benchmark/generated/
+
 # OS noise
 .DS_Store
 Thumbs.db

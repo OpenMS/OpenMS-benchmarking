@@ -1084,6 +1084,7 @@ def normalize_prose_peptdeep(args):
             "configuration": {
                 "entrapment_prefix": meta.get("entrapment_prefix", ""),
                 "peptdeep_instrument": meta.get("peptdeep_instrument", ""),
+                "prose_extra_search_args": meta.get("prose_extra_search_args", ""),
             },
         },
         "run": {
