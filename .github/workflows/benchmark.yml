@@ -251,3 +251,295 @@ jobs:
           name: benchmark-openswath-${{ needs.build-openms.outputs.openms_sha }}
           path: results-openswath
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # ProSE + PeptDeep ONNX pipeline validation (Day-33 design, GSOC_Notebook/
+  # Day-33/ProSE_ONNX_CI_Design.md).
+  #
+  # Separate ONNX-enabled build job so the existing build-openms artifact
+  # (consumed by smoke + OpenSwath) stays byte-identical: different configure
+  # flags, two extra downloads, separate ccache key prefix.
+  #
+  # The fixture is pipeline-validation-only (Day-32 recommendation C): the job
+  # asserts that ProSE executes, Percolator really runs (q-values), the
+  # PeptDeep arm really runs ONNX inference (five features), entrapment
+  # accessions survive, and prose.json + normalization are produced. It does
+  # NOT require q <= 0.01 survivors (0 on this CID fixture; documented).
+  # ---------------------------------------------------------------------------
+  build-openms-onnx:
+    name: "Build OpenMS with ONNX (ProSE + PeptDeep, fixed SHA)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      openms_sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Checkout OpenMS at pinned SHA
+        uses: actions/checkout@v6
+        with:
+          repository: OpenMS/OpenMS
+          ref: ${{ inputs.openms_sha }}
+
+      - name: Resolve pinned SHA
+        id: sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        shell: bash
+        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+
+      # Same ccache strategy as build-openms but a SEPARATE key prefix: the
+      # ONNX configure adds include paths, so object files differ from the
+      # non-ONNX build flavor. CCACHE_BASEDIR keeps paths comparable across
+      # checkouts.
+      - name: Restore compiler cache (ONNX flavor)
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: openms-onnx-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.sha.outputs.sha }}
+          restore-keys: |
+            openms-onnx-ccache-${{ runner.os }}-${{ runner.arch }}-${{ steps.sha.outputs.sha }}
+            openms-onnx-ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ccache"
+          {
+            echo "CCACHE_COMPRESS=true"
+            echo "CCACHE_COMPRESSLEVEL=6"
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_MAXSIZE=1G"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+          } >> "$GITHUB_ENV"
+
+      - name: Stage search engines
+        shell: bash
+        run: |
+          git submodule update --init THIRDPARTY
+          mkdir -p _thirdparty
+          cp -R THIRDPARTY/Linux/$(uname -m)/* _thirdparty/
+          cp -R THIRDPARTY/All/* _thirdparty/
+
+      # Prebuilt onnxruntime 1.23.2 (the PR-pinned version) from the official
+      # GitHub release; checksum pinned to the byte-identical tarball used for
+      # the locally validated build (Day-30 WSL recipe).
+      - name: Download onnxruntime 1.23.2 (pinned)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ort"
+          curl -fsSL -o "$RUNNER_TEMP/ort.tgz" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
+          echo "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b  $RUNNER_TEMP/ort.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP/ort" --strip-components=1
+
+      # Arrow >= 23 is a hard requirement of the PR and Ubuntu 24.04 apt ships
+      # Arrow 5. OpenMS CI itself gets Arrow from vcpkg (hours of source
+      # builds); the locally validated fast path is prebuilt conda-forge
+      # libarrow via micromamba (Day-30). Versions pinned to the exact set
+      # that produced the validated binaries.
+      - name: Install prebuilt Arrow 25 (micromamba)
+        shell: bash
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/mm.tar.bz2" \
+            https://anaconda.org/conda-forge/micromamba/2.9.0/download/linux-64/micromamba-2.9.0-0.tar.bz2
+          mkdir -p "$RUNNER_TEMP/mm"
+          tar -xjf "$RUNNER_TEMP/mm.tar.bz2" -C "$RUNNER_TEMP/mm" bin/micromamba
+          MM="$RUNNER_TEMP/mm/bin/micromamba"
+          "$MM" create -y -p "$RUNNER_TEMP/arrow-pref" -c conda-forge \
+            libarrow=25.0.0 libparquet=25.0.0 xz zstd
+          # conda-forge ships the runtime liblzma; Arrow's static link wants
+          # the dev-style -llzma symlink (seen in the local build).
+          if [ ! -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so" ] \
+             && [ -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so.5" ]; then
+            ln -s liblzma.so.5 "$RUNNER_TEMP/arrow-pref/lib/liblzma.so"
+          fi
+
+      # WITH_THERMO_RAW=OFF: vendor .raw reading needs the .NET SDK and is
+      # irrelevant for mzML inputs. WITH_ONNX=ON makes configure download the
+      # three PeptDeep models from archive.openms.de and verify their pinned
+      # SHA256s (configure fails hard on mismatch).
+      - name: Configure (Release, Ninja, ONNX)
+        shell: bash
+        env:
+          SEARCH_ENGINES_DIRECTORY: ${{ github.workspace }}/_thirdparty
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DWITH_GUI=OFF \
+            -DENABLE_DOCS=OFF \
+            -DWITH_THERMO_RAW=OFF \
+            -DWITH_ONNX=ON \
+            -DOPENMS_USE_VCPKG=OFF \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/arrow-pref" \
+            -DONNXRuntime_INCLUDE_DIR="$RUNNER_TEMP/ort/include" \
+            -DONNXRuntime_LIBRARY="$RUNNER_TEMP/ort/lib/libonnxruntime.so" \
+            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
+
+      # Only what the benchmark needs (the full TOPP set is built by the
+      # non-ONNX job; this flavor exists for ProSE).
+      - name: Build ProSE + PercolatorAdapter + FileMerger
+        shell: bash
+        run: cmake --build build --target ProSE PercolatorAdapter FileMerger
+
+      # Lay out the build-tree share the way ProSE resolves relative model
+      # paths (<exe>/../share/OpenMS): CMake downloads the models into the
+      # src/openms build subtree, so copy them next to the binaries.
+      - name: Place PeptDeep models in build-tree share
+        shell: bash
+        run: |
+          MODEL_SRC=$(find build -path "*/share/OpenMS/models/peptdeep_ms2_dynamic.onnx" -printf "%h\n" | head -n1)
+          if [ -z "$MODEL_SRC" ]; then
+            echo "ERROR: PeptDeep models not found in build tree" >&2
+            exit 1
+          fi
+          mkdir -p build/share/OpenMS/models
+          cp "$MODEL_SRC"/*.onnx build/share/OpenMS/models/
+          sha256sum build/share/OpenMS/models/*.onnx
+
+      # Ship the onnxruntime shared object(s) with build/lib so the run job's
+      # single LD_LIBRARY_PATH covers them (cp -a keeps the .so.1 symlinks).
+      - name: Bundle onnxruntime runtime libs
+        shell: bash
+        run: cp -a "$RUNNER_TEMP/ort/lib/libonnxruntime.so"* build/lib/
+
+      - name: Upload OpenMS ONNX binaries, models, engines
+        uses: actions/upload-artifact@v7
+        with:
+          name: openms-onnx-bin-${{ steps.sha.outputs.sha }}
+          path: |
+            build/bin
+            build/lib
+            build/share/OpenMS/models
+            share/OpenMS
+            _thirdparty
+          if-no-files-found: error
+
+  run-prose-peptdeep-benchmark:
+    name: "ProSE + PeptDeep ONNX benchmark (pipeline validation)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: build-openms-onnx
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms-onnx.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
+
+      - name: Download OpenMS ONNX binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: openms-onnx-bin-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: openms
+
+      - name: Make downloaded binaries executable
+        shell: bash
+        run: chmod -R +x openms/build/bin openms/_thirdparty
+
+      # Source tree (pinned SHA, sparse: only the files the preparation script
+      # reads) provides P02769.fasta, the E. coli target_decoy FASTA and the
+      # three BSA mzML acquisitions. Generated inputs land in the git-ignored
+      # benchmark/generated/prose/ and are never committed.
+      - name: Checkout OpenMS sources (pinned, sparse)
+        uses: actions/checkout@v6
+        with:
+          repository: OpenMS/OpenMS
+          ref: ${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: openms-src
+          fetch-depth: 1
+          sparse-checkout: |
+            doc/pyopenms/src/data/P02769.fasta
+            share/OpenMS/examples/BSA
+            share/OpenMS/examples/TOPPAS/data/Identification/target_decoy_Ecoli_K12_TaxID_83333.proteomes.fasta
+
+      - name: Generate entrapment FASTA + merged mzML
+        shell: bash
+        run: |
+          bash benchmark/prepare_prose_inputs.sh \
+            "$GITHUB_WORKSPACE/openms-src" \
+            "$GITHUB_WORKSPACE/openms/build/bin" \
+            "$GITHUB_WORKSPACE/benchmark/generated/prose"
+          cat "$GITHUB_WORKSPACE/benchmark/generated/prose/PROVENANCE.txt"
+
+      # PROSE_EXTRA_SEARCH_ARGS: the fixture is LTQ-Orbitrap ion-trap CID, so
+      # the 20 ppm fragment default yields zero IDs (verified Day-32 control);
+      # 0.5 Da is the instrument-matched tolerance validated on Day-30/31. The
+      # runner applies this env var IDENTICALLY to both arms, so arms differ
+      # only in PeptDeep enablement (benchmark semantics unchanged).
+      - name: Run ProSE + PeptDeep benchmark (both arms)
+        shell: bash
+        env:
+          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
+          PROSE_INPUT: ${{ github.workspace }}/benchmark/generated/prose/bsa_merged.mzML
+          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose/entrapment_target.fasta
+          ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
+          PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.5 -Search:fragment:mass_tolerance_unit Da"
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
+          OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
+          RESULTS_DIR: ${{ github.workspace }}/results-prose
+        run: bash benchmark/run_prose_benchmark.sh
+
+      # Guard step (unchanged runner semantics, new consumer): fails the job
+      # unless ProSE executed, both arms carry q-values (Percolator really
+      # ran), the peptdeep arm carries all five ONNX features, entrapment
+      # accessions survive into the idXML, and the verdict is pass.
+      - name: Validate pipeline guards
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, sys, xml.etree.ElementTree as ET
+          sys.path.insert(0, "benchmark")
+          import prose_metrics as pm
+
+          prefix = ""
+          with open("results-prose/meta.txt") as fh:
+              for line in fh:
+                  if line.startswith("entrapment_prefix="):
+                      prefix = line.split("=", 1)[1].strip()
+
+          raw = json.load(open("results-prose/prose.json"))
+          assert raw.get("verdict") == "pass", "verdict: %r" % raw.get("verdict")
+          stages = {s["name"]: s for s in raw["stages"]}
+          for name in ("prose_baseline", "prose_peptdeep"):
+              assert stages[name]["status"] == "pass", stages[name]
+
+          for arm in ("baseline", "peptdeep"):
+              a = raw["arms"][arm]
+              assert "error" not in a, "%s arm error: %s" % (arm, a.get("error"))
+              assert a["psms_total"] > 0, "%s arm: no PSMs" % arm
+              parsed = pm.parse_idxml("results-prose/%s.idXML" % arm, prefix)
+              assert parsed["score_type"] == "q-value", \
+                  "%s arm score_type %r (Percolator did not run?)" % (arm, parsed["score_type"])
+              assert parsed["psms"], "%s arm: no parseable PSMs" % arm
+              root = ET.parse("results-prose/%s.idXML" % arm).getroot()
+              accs = {ph.get("accession") for ph in root.iter("ProteinHit")}
+              assert any(x and x.startswith(prefix) for x in accs), \
+                  "%s arm: no %s ProteinHits" % (arm, prefix)
+
+          missing = raw["arms"]["peptdeep"].get("peptdeep_features_missing")
+          assert missing == [], "PeptDeep features missing: %s" % missing
+          print("prose-peptdeep CI validation: all pipeline guards passed")
+          PY
+
+      - name: Normalize ProSE+PeptDeep results to v2
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize prose-peptdeep \
+            --run-id "${{ github.run_id }}" \
+            --cache none \
+            --results-dir results-prose
+
+      - name: Upload ProSE+PeptDeep benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-prose-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: results-prose
+          if-no-files-found: error
