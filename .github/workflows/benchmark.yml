@@ -24,6 +24,15 @@ on:
         default: false
         type: boolean
 
+# Dependency-script pin: tools/ci/deps-ubuntu.sh at the pinned build SHA no
+# longer installs any libraries (upstream stripped the apt list when its
+# Linux CI moved to vcpkg), which made find_package(XercesC REQUIRED) fail
+# in both build jobs. This is the PR-branch commit whose deps-ubuntu.sh
+# still carries the full library list (Xerces-C, libsvm, hdf5, libzip, ...);
+# the OpenMS sources themselves still build at inputs.openms_sha.
+env:
+  DEPS_UBUNTU_SHA: f1768367fa66f7901b4fa78a9ebece64b2ce9024
+
 jobs:
   build-openms:
     name: "Build OpenMS (Linux, fixed SHA)"
@@ -45,12 +54,16 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Reuse OpenMS' own dependency script (the same one its CI uses) instead
-      # of duplicating the package list here. --skip-gui-deps keeps the build
-      # lean: TOPP tools do not need Qt, so WITH_GUI is disabled below.
+      # Reuse OpenMS' own dependency script instead of duplicating the package
+      # list here, fetched from DEPS_UBUNTU_SHA (see workflow env: the pinned
+      # build SHA's copy no longer installs libraries). --skip-gui-deps keeps
+      # the build lean: TOPP tools do not need Qt, so WITH_GUI is disabled
+      # below.
       - name: Install dependencies
         shell: bash
-        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
 
       # ccache: the same compiler-cache strategy OpenMS CI uses (see
       # .github/actions/build/action.yml in OpenMS), transplanted here. The
@@ -145,12 +158,13 @@ jobs:
       # The smoke job runs on a fresh runner, but the downloaded binaries
       # need OpenMS' runtime libraries (xerces, hdf5, libzip, boost, ...).
       # Install the same non-GUI deps the build job uses. The deps script
-      # lives in the OpenMS repo (not this one), so fetch it at the exact
-      # pinned SHA rather than duplicating the package list here.
+      # lives in the OpenMS repo (not this one); fetch it from DEPS_UBUNTU_SHA
+      # (workflow env) because the pinned build SHA's copy no longer installs
+      # the libraries.
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
@@ -214,7 +228,7 @@ jobs:
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
@@ -284,9 +298,14 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Deps from DEPS_UBUNTU_SHA (workflow env): the pinned build SHA's own
+      # deps-ubuntu.sh no longer installs libraries (upstream moved the Linux
+      # CI to vcpkg), which made find_package(XercesC REQUIRED) fail here.
       - name: Install dependencies
         shell: bash
-        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
 
       # Same ccache strategy as build-openms but a SEPARATE key prefix: the
       # ONNX configure adds include paths, so object files differ from the
@@ -430,7 +449,7 @@ jobs:
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms-onnx.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS ONNX binaries
