@@ -486,6 +486,10 @@ jobs:
           # not this job's (<ws>/openms/build/lib) - so point the dynamic
           # linker there for FileMerger, exactly like the run step below.
           LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          # OpenMS tools abort without the shared data (schemas, CHEMISTRY);
+          # the artifact's share/OpenMS mirrors the source tree the smoke and
+          # OpenSwath jobs already point OPENMS_DATA_PATH at.
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
         run: |
           bash benchmark/prepare_prose_inputs.sh \
             "$GITHUB_WORKSPACE/openms-src" \
