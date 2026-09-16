@@ -572,3 +572,214 @@ jobs:
           name: benchmark-prose-${{ needs.build-openms-onnx.outputs.openms_sha }}
           path: results-prose
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # PXD028735 scientific-dataset benchmark (Phase-2c; GSOC_Notebook/Day-34/
+  # ProSE_Phase2_Dataset_Investigation.md addendum). Same pipeline-validation
+  # scope as run-prose-peptdeep-benchmark above: the guards assert execution
+  # integrity (verdict, stages, q-values, entrapment survival, five PeptDeep
+  # features), NOT a q <= 0.01 result. Dataset: ProteoBench QE HF-X HYE (CC0,
+  # doi:10.1038/s41597-022-01216-6); inputs are downloaded byte-pinned by
+  # benchmark/prepare_pxd028735_inputs.sh (nothing is vendored or committed).
+  #
+  # The runner is single-input and wipes its RESULTS_DIR at startup, so the
+  # two validated Alpha_01 runs execute as fully isolated invocations: each
+  # gets its own mzML, RESULTS_DIR, guard execution and normalization.
+  # ---------------------------------------------------------------------------
+  run-prose-pxd028735-benchmark:
+    name: "ProSE + PeptDeep ONNX benchmark (PXD028735, pipeline validation)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: build-openms-onnx
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          bash deps-ubuntu.sh --skip-gui-deps
+
+      - name: Download OpenMS ONNX binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: openms-onnx-bin-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: openms
+
+      - name: Make downloaded binaries executable
+        shell: bash
+        run: chmod -R +x openms/build/bin openms/_thirdparty
+
+      # Source tree (pinned SHA, sparse): only the targets-only S. cellulosum
+      # FASTA the PXD preparation script reads. The HYE target FASTA and the
+      # two mzML runs are downloaded from archive.openms.de by the script
+      # itself (pinned byte size + sha256, fail-closed on mismatch).
+      - name: Checkout OpenMS sources (pinned, sparse)
+        uses: actions/checkout@v6
+        with:
+          repository: OpenMS/OpenMS
+          ref: ${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: openms-src
+          fetch-depth: 1
+          sparse-checkout: |
+            doc/pyopenms/src/data/18Protein_SoCe_Tr_detergents_trace.fasta
+
+      # No OPENMS_DATA_PATH / LD_LIBRARY_PATH needed here: unlike the BSA
+      # preparation this script invokes no OpenMS binary (pinned downloads +
+      # deterministic FASTA assembly only). Generated inputs land in the
+      # git-ignored benchmark/generated/prose-pxd028735/ and are never
+      # committed.
+      - name: Prepare PXD028735 inputs (runs A and B)
+        shell: bash
+        run: |
+          bash benchmark/prepare_pxd028735_inputs.sh \
+            "$GITHUB_WORKSPACE/openms-src" \
+            "$GITHUB_WORKSPACE/benchmark/generated/prose-pxd028735" \
+            "A B"
+          cat "$GITHUB_WORKSPACE/benchmark/generated/prose-pxd028735/PROVENANCE.txt"
+
+      # Run A. The 0.02 Da fragment tolerance is the published PXD028735/
+      # ProteoBench parameter (validated through this runner in Phase-2b);
+      # precursor 10 ppm is the ProSE default. Search configuration is
+      # identical for A and B and both arms (the runner applies
+      # PROSE_EXTRA_SEARCH_ARGS to baseline and peptdeep alike).
+      - name: Run ProSE + PeptDeep benchmark (PXD028735 run A)
+        shell: bash
+        env:
+          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
+          PROSE_INPUT: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/LFQ_Orbitrap_DDA_Condition_A_Sample_Alpha_01.mzML
+          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
+          ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
+          PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
+          OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
+          RESULTS_DIR: ${{ github.workspace }}/results-prose-pxd028735-A
+        run: bash benchmark/run_prose_benchmark.sh
+
+      # Same pipeline guards as the BSA job, parameterized by RESULTS_DIR so
+      # the run A and run B guard steps are identical apart from the value.
+      - name: Validate pipeline guards (run A)
+        shell: bash
+        env:
+          RESULTS_DIR: results-prose-pxd028735-A
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, xml.etree.ElementTree as ET
+          sys.path.insert(0, "benchmark")
+          import prose_metrics as pm
+
+          r = os.environ["RESULTS_DIR"]
+          prefix = ""
+          with open(os.path.join(r, "meta.txt")) as fh:
+              for line in fh:
+                  if line.startswith("entrapment_prefix="):
+                      prefix = line.split("=", 1)[1].strip()
+
+          raw = json.load(open(os.path.join(r, "prose.json")))
+          assert raw.get("verdict") == "pass", "verdict: %r" % raw.get("verdict")
+          stages = {s["name"]: s for s in raw["stages"]}
+          for name in ("prose_baseline", "prose_peptdeep"):
+              assert stages[name]["status"] == "pass", stages[name]
+
+          for arm in ("baseline", "peptdeep"):
+              a = raw["arms"][arm]
+              assert "error" not in a, "%s arm error: %s" % (arm, a.get("error"))
+              assert a["psms_total"] > 0, "%s arm: no PSMs" % arm
+              parsed = pm.parse_idxml(os.path.join(r, "%s.idXML" % arm), prefix)
+              assert parsed["score_type"] == "q-value", \
+                  "%s arm score_type %r (Percolator did not run?)" % (arm, parsed["score_type"])
+              assert parsed["psms"], "%s arm: no parseable PSMs" % arm
+              root = ET.parse(os.path.join(r, "%s.idXML" % arm)).getroot()
+              accs = {ph.get("accession") for ph in root.iter("ProteinHit")}
+              assert any(x and x.startswith(prefix) for x in accs), \
+                  "%s arm: no %s ProteinHits" % (arm, prefix)
+
+          missing = raw["arms"]["peptdeep"].get("peptdeep_features_missing")
+          assert missing == [], "PeptDeep features missing: %s" % missing
+          print("%s: all pipeline guards passed" % r)
+          PY
+
+      - name: Normalize PXD028735 run A results to v2
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize prose-peptdeep \
+            --run-id "${{ github.run_id }}-A" \
+            --cache none \
+            --results-dir results-prose-pxd028735-A
+
+      # Run B: identical configuration; only the input mzML and RESULTS_DIR
+      # differ from run A (the runner wipes its RESULTS_DIR at startup, so
+      # A and B must not share one).
+      - name: Run ProSE + PeptDeep benchmark (PXD028735 run B)
+        shell: bash
+        env:
+          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
+          PROSE_INPUT: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/LFQ_Orbitrap_DDA_Condition_B_Sample_Alpha_01.mzML
+          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
+          ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
+          PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
+          OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
+          RESULTS_DIR: ${{ github.workspace }}/results-prose-pxd028735-B
+        run: bash benchmark/run_prose_benchmark.sh
+
+      - name: Validate pipeline guards (run B)
+        shell: bash
+        env:
+          RESULTS_DIR: results-prose-pxd028735-B
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, xml.etree.ElementTree as ET
+          sys.path.insert(0, "benchmark")
+          import prose_metrics as pm
+
+          r = os.environ["RESULTS_DIR"]
+          prefix = ""
+          with open(os.path.join(r, "meta.txt")) as fh:
+              for line in fh:
+                  if line.startswith("entrapment_prefix="):
+                      prefix = line.split("=", 1)[1].strip()
+
+          raw = json.load(open(os.path.join(r, "prose.json")))
+          assert raw.get("verdict") == "pass", "verdict: %r" % raw.get("verdict")
+          stages = {s["name"]: s for s in raw["stages"]}
+          for name in ("prose_baseline", "prose_peptdeep"):
+              assert stages[name]["status"] == "pass", stages[name]
+
+          for arm in ("baseline", "peptdeep"):
+              a = raw["arms"][arm]
+              assert "error" not in a, "%s arm error: %s" % (arm, a.get("error"))
+              assert a["psms_total"] > 0, "%s arm: no PSMs" % arm
+              parsed = pm.parse_idxml(os.path.join(r, "%s.idXML" % arm), prefix)
+              assert parsed["score_type"] == "q-value", \
+                  "%s arm score_type %r (Percolator did not run?)" % (arm, parsed["score_type"])
+              assert parsed["psms"], "%s arm: no parseable PSMs" % arm
+              root = ET.parse(os.path.join(r, "%s.idXML" % arm)).getroot()
+              accs = {ph.get("accession") for ph in root.iter("ProteinHit")}
+              assert any(x and x.startswith(prefix) for x in accs), \
+                  "%s arm: no %s ProteinHits" % (arm, prefix)
+
+          missing = raw["arms"]["peptdeep"].get("peptdeep_features_missing")
+          assert missing == [], "PeptDeep features missing: %s" % missing
+          print("%s: all pipeline guards passed" % r)
+          PY
+
+      - name: Normalize PXD028735 run B results to v2
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize prose-peptdeep \
+            --run-id "${{ github.run_id }}-B" \
+            --cache none \
+            --results-dir results-prose-pxd028735-B
+
+      - name: Upload PXD028735 benchmark results (runs A and B)
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-prose-pxd028735-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: |
+            results-prose-pxd028735-A
+            results-prose-pxd028735-B
+          if-no-files-found: error
