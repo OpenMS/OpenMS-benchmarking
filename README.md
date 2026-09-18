@@ -316,4 +316,3 @@ Resources
 - [OpenMS](https://github.com/OpenMS/OpenMS) - the main repository
 - [OpenMS Issue #8788](https://github.com/OpenMS/OpenMS/issues/8788) - the benchmarking effort this repository serves
 - [`benchmark/fixtures/PROVENANCE.md`](benchmark/fixtures/PROVENANCE.md) - sources, sizes and selection rationale for every vendored fixture
-- [Project documentation (GSoC notebook)](https://github.com/nej1gotnochill/OpenMS-GSoC-Notes-3) - dataset investigations, ProteoBench comparisons and measurement records
