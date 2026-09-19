@@ -12,9 +12,12 @@ Tests:
 7. Dynamic stage discovery (no hard-coded names)
 8. Dynamic metric comparison
 9. Missing/optional sections
+10. OpenSwath normalization (raw v1 -> v2)
+11. OpenSwath baseline selection + comparison end-to-end
 """
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -26,7 +29,8 @@ from report_generate import (
     _promote_v1, load_results, render, _identity, _run, _performance,
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
-    _flat_compare, fmt_seconds, fmt_bytes, fmt_delta
+    _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
+    normalize_openswath
 )
 
 
@@ -662,6 +666,143 @@ def test_formatter_helpers():
     print("  PASS: formatter helpers")
 
 
+def _write_raw_openswath(path, run_id, run_at, wall=2.76, verdict="pass"):
+    """Write a raw CI-style openswath.json (mirrors run_openswath_benchmark.sh output)."""
+    raw = {
+        "schema": "openms-benchmarking/report/v1",
+        "source": "openms",
+        "benchmark": "openswath_dia",
+        "milestone": 2,
+        "run_id": run_id,
+        "run_at": run_at,
+        "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024",
+        "cache": "none",
+        "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+        "stages": [
+            {"name": "openswath_workflow", "required": True, "exit_code": 0,
+             "wall_time_s": wall, "cpu_time_s": 0.21, "peak_rss_kb": 65656,
+             "status": "pass", "reason": ""}
+        ],
+        "verdict": verdict,
+        "correctness": {
+            "expected_features": 6, "actual_features": 6, "features_match": True,
+            "overall_quality_sum": 14.088245, "total_intensity": 149891.59,
+            "qc_charge_distribution": [[1, 19], [2, 19], [3, 19]],
+        },
+        "tool_versions": {"openswath_version": "n/a"},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh)
+    return raw
+
+
+def _normalize_args(raw_path, run_id, results_dir, **overrides):
+    import argparse
+    kw = dict(cache="", build_time=3412.0, artifact_bytes=149265164,
+              run_at="", dataset="", out=None)
+    kw.update(overrides)
+    return argparse.Namespace(openswath_json=raw_path, run_id=run_id,
+                              results_dir=results_dir, **kw)
+
+
+def test_normalize_openswath_to_v2():
+    """normalize openswath maps a raw v1 result into valid v2, preserving identity,
+    stage metrics, correctness and verdict."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        _write_raw_openswath(raw_path, "32995654115", "2026-08-26T18:40:29Z")
+        normalize_openswath(_normalize_args(raw_path, "32995654115", tmpdir))
+
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-32995654115.json")
+        assert os.path.exists(out_path), "default output path not created"
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
+
+        assert out["schema"] == "openms-benchmarking/report/v2"
+        assert out["identity"]["benchmark"] == "openswath_dia"
+        assert out["identity"]["software"]["version"] == \
+            "f1768367fa66f7901b4fa78a9ebece64b2ce9024"
+        assert out["identity"]["dataset"].startswith("OpenSwathWorkflow_1")
+        assert out["run"]["run_id"] == "32995654115"
+        assert out["run"]["run_at"] == "2026-08-26T18:40:29Z"  # taken from raw
+        assert out["run"]["cache"] == "none"                    # taken from raw
+        st = out["performance"]["stages"][0]
+        assert st["name"] == "openswath_workflow" and st["wall_time_s"] == 2.76
+        assert st["peak_rss_kb"] == 65656 and st["status"] == "pass"
+        assert out["performance"]["wall_time_s"] == 2.76
+        assert out["performance"]["build"] == {"wall_time_s": 3412.0,
+                                                "artifact_bytes": 149265164}
+        assert out["metrics"]["verdict"] == "pass"
+        assert out["correctness"]["actual_features"] == 6
+        assert out["correctness"]["features_match"] is True
+
+        # the stored file must round-trip through the generic loader
+        runs, _ = load_results(tmpdir)
+        assert len(runs) == 1 and _benchmark_name(runs[0]) == "openswath_dia"
+        print("  PASS: normalize openswath -> v2")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_rejects_nonfinite():
+    """NaN/Infinity stage metrics must fail loudly, not silently enter the schema."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "X", "2026-08-26T18:40:29Z")
+        raw["stages"][0]["wall_time_s"] = float("nan")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)  # emits a bare NaN token
+        try:
+            normalize_openswath(_normalize_args(raw_path, "X", tmpdir))
+        except SystemExit:
+            print("  PASS: normalize openswath rejects non-finite metrics")
+        else:
+            raise AssertionError("NaN wall_time_s was accepted")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_baseline_comparison():
+    """Two normalized OpenSwath runs get baseline selection and a comparison
+    table from the existing generic machinery - no OpenSwath-specific code."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        for rid, at, wall in (("100", "2026-08-26T18:40:29Z", 2.76),
+                              ("200", "2026-08-27T18:40:29Z", 3.10)):
+            raw_path = os.path.join(tmpdir, f"raw-{rid}.json")
+            _write_raw_openswath(raw_path, rid, at, wall=wall)
+            normalize_openswath(_normalize_args(raw_path, rid, tmpdir))
+
+        runs, tools = load_results(tmpdir)
+        assert len(runs) == 2 and not tools
+        current = runs[-1]                     # newest by run_at
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "100" and _run_id(current) == "200"
+
+        shared = _discover_shared_metrics(current, baseline)
+        assert "stage.openswath_workflow.wall_time_s" in shared
+        assert "correctness.actual_features" in shared
+        assert "build.wall_time_s" in shared
+
+        out_path = os.path.join(tmpdir, "report.html")
+        import datetime as _dt
+        render(current, baseline, runs, tools, out_path,
+               _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as fh:
+            html = fh.read()
+        assert "openswath_dia" in html
+        assert "openswath_workflow" in html
+        assert "Correctness" in html and "features_match" in html
+        assert "current vs previous run" in html
+        assert "32995654115" not in html  # synthetic ids only
+        print("  PASS: normalize openswath baseline comparison end-to-end")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -681,6 +822,9 @@ def main():
         test_smoke_comparison_shows_stage_data,
         test_stage_regression_detection,
         test_proteobench_no_spurious_stage_keys,
+        test_normalize_openswath_to_v2,
+        test_normalize_openswath_rejects_nonfinite,
+        test_normalize_openswath_baseline_comparison,
     ]
     passed = 0
     failed = 0

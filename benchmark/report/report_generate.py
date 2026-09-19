@@ -37,6 +37,13 @@ Subcommands:
                     [--run-at ISO8601] [--out PATH]
         Convert a raw CI smoke.json into a normalized OpenMS run result.
 
+    normalize openswath <openswath.json> --run-id ID
+                    --build-time SECONDS --artifact-bytes N
+                    [--cache cold|warm|none] [--run-at ISO8601] [--out PATH]
+        Convert a raw CI openswath.json (OpenSwath DIA benchmark) into a
+        normalized OpenMS run result.  Correctness metrics from the raw result
+        are carried into the v2 correctness section unchanged.
+
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
         Convert a local ProteoBench scoring result into a tool result.
 
@@ -50,6 +57,7 @@ import datetime as _dt
 import glob
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -650,6 +658,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             build_s = _build(r).get("wall_time_s")
             hist += (
                 f"<tr><td class='mono'>{esc(_run_id(r))}</td>"
+                f"<td>{esc(_benchmark_name(r))}</td>"
                 f"<td>{esc(_run_at(r))}</td>"
                 f"<td class='mono'>{esc(short_sha(_software_version(r)))}</td>"
                 f"<td>{_chip(r_cache, {'cold': 'warn', 'warm': 'ok', 'none': 'neutral'}.get(r_cache, 'neutral'))}</td>"
@@ -659,7 +668,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
         history_section = f"""
         <div class="card"><h2>Run history</h2><div class="inner">
           <table>
-            <thead><tr><th>Run</th><th>Run at</th><th>SHA</th><th>Cache</th>
+            <thead><tr><th>Run</th><th>Benchmark</th><th>Run at</th><th>SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
             <tbody>{hist}</tbody>
           </table>
@@ -783,6 +792,75 @@ def normalize_smoke(args):
     print(f"normalized OpenMS run result -> {out_path}")
 
 
+def normalize_openswath(args):
+    """Convert a raw CI openswath.json into a normalized v2 OpenMS run result."""
+    with open(args.openswath_json, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    if not args.build_time or not args.artifact_bytes or not args.run_id:
+        sys.exit("normalize openswath needs --run-id, --build-time and --artifact-bytes")
+    stages = []
+    for st in raw.get("stages", []):
+        for key in ("wall_time_s", "cpu_time_s"):
+            val = st.get(key)
+            if val is not None and not math.isfinite(float(val)):
+                sys.exit(f"stage {st.get('name', '?')!r}: non-finite {key}; refusing to normalize")
+        peak = st.get("peak_rss_kb")
+        if peak is not None and not math.isfinite(float(peak)):
+            sys.exit(f"stage {st.get('name', '?')!r}: non-finite peak_rss_kb; refusing to normalize")
+        stages.append({
+            "name": st.get("name"),
+            "required": bool(st.get("required")),
+            "exit_code": st.get("exit_code"),
+            "wall_time_s": st.get("wall_time_s"),
+            "cpu_time_s": st.get("cpu_time_s"),
+            "peak_rss_kb": st.get("peak_rss_kb"),
+            "status": st.get("status"),
+            "reason": st.get("reason", ""),
+        })
+    benchmark = raw.get("benchmark", "openswath")
+    out = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": benchmark,
+            "benchmark_version": raw.get("milestone", 1),
+            "dataset": args.dataset or raw.get("dataset", "OpenSwath DIA fixture"),
+            "software": {
+                "name": "OpenMS",
+                "version": raw.get("openms_sha", ""),
+            },
+            "configuration": {},
+        },
+        "run": {
+            "run_id": args.run_id,
+            "run_at": args.run_at or raw.get("run_at", ""),
+            "cache": args.cache or raw.get("cache", "unknown"),
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
+            "build": {
+                "wall_time_s": float(args.build_time),
+                "artifact_bytes": int(args.artifact_bytes),
+            },
+            "stages": stages,
+        },
+        "metrics": {
+            "verdict": raw.get("verdict", "unknown"),
+        },
+        "correctness": raw.get("correctness", {}),
+        "tool_versions": raw.get("tool_versions", {}),
+    }
+    out_path = args.out or os.path.join(
+        args.results_dir, benchmark, "openms",
+        f"{benchmark}-{args.run_id}.json"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"normalized OpenMS run result -> {out_path}")
+
+
 def normalize_proteobench(args):
     """Convert a local ProteoBench scoring JSON into a normalized v2 tool result."""
     with open(args.pb_json, encoding="utf-8") as fh:
@@ -885,6 +963,21 @@ def main():
     ps.add_argument("--results-dir", default="benchmark/results")
     ps.add_argument("--out")
     ps.set_defaults(fn=normalize_smoke)
+
+    po = pn.add_parser("openswath", help="normalize a CI openswath.json (OpenSwath DIA benchmark)")
+    po.add_argument("openswath_json")
+    po.add_argument("--run-id", required=True)
+    po.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="",
+                    help="override the cache state (default: value recorded in the raw result)")
+    po.add_argument("--build-time", type=float, required=True)
+    po.add_argument("--artifact-bytes", type=int, required=True)
+    po.add_argument("--run-at", default="",
+                    help="override the run timestamp (default: value recorded in the raw result)")
+    po.add_argument("--dataset", default="",
+                    help="override the dataset label (default: value recorded in the raw result)")
+    po.add_argument("--results-dir", default="benchmark/results")
+    po.add_argument("--out")
+    po.set_defaults(fn=normalize_openswath)
 
     pp = pn.add_parser("proteobench", help="normalize a local ProteoBench scoring JSON")
     pp.add_argument("pb_json")
