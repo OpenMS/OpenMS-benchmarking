@@ -1,0 +1,66 @@
+{
+  "schema": "openms-benchmarking/report/v2",
+  "identity": {
+    "benchmark": "openswath_dia",
+    "benchmark_version": 2,
+    "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+    "software": {
+      "name": "OpenMS",
+      "version": "f1768367fa66f7901b4fa78a9ebece64b2ce9024"
+    },
+    "configuration": {}
+  },
+  "run": {
+    "run_id": "32995654115",
+    "run_at": "2026-08-26T18:40:29Z",
+    "cache": "none"
+  },
+  "performance": {
+    "wall_time_s": 2.76,
+    "cpu_time_s": 0.21,
+    "peak_rss_kb": 65656,
+    "build": {
+      "wall_time_s": 3412.0,
+      "artifact_bytes": 149265164
+    },
+    "stages": [
+      {
+        "name": "openswath_workflow",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 2.76,
+        "cpu_time_s": 0.21,
+        "peak_rss_kb": 65656,
+        "status": "pass",
+        "reason": ""
+      }
+    ]
+  },
+  "metrics": {
+    "verdict": "pass"
+  },
+  "correctness": {
+    "expected_features": 6,
+    "actual_features": 6,
+    "features_match": true,
+    "overall_quality_sum": 14.088245,
+    "total_intensity": 149891.59,
+    "qc_charge_distribution": [
+      [
+        1,
+        19
+      ],
+      [
+        2,
+        19
+      ],
+      [
+        3,
+        19
+      ]
+    ]
+  },
+  "tool_versions": {
+    "openswath_version": "Unknown option(s) '[--version]' given. Aborting!"
+  }
+}

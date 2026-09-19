@@ -72,7 +72,10 @@ own test data (mzML spectra, TraML transition library, RT transformation and
 SWATH window list). The vendored fixtures include OpenMS' reference outputs,
 which the benchmark uses to validate correctness alongside the performance
 measurements. It runs in CI as a separate job after the OpenMS build. Runner:
-`benchmark/run_openswath_benchmark.sh` (definition: `openswath.json`).
+`benchmark/run_openswath_benchmark.sh` (definition: `openswath.json`). Raw
+results are normalized with `normalize openswath` and stored under
+`benchmark/results/openswath_dia/openms/`, giving OpenSwath the same
+baseline/history/comparison lifecycle as the smoke benchmark.
 
 ### ProteoBench reference results
 
@@ -157,6 +160,7 @@ automatically):
 ```
 benchmark/results/
   openms/   smoke-<run-id>.json     # OpenMS benchmark runs (the comparison history)
+  openswath_dia/openms/             # stored OpenSwath DIA runs (comparison history)
   tools/    proteobench-*.json      # reference results from other tools/sources
 ```
 
@@ -184,6 +188,15 @@ Add a ProteoBench result as a reference:
 python3 benchmark/report/report_generate.py normalize proteobench \
     proteobench_local_exp2.json --label "Exp 2 (Comet->MS2Rescore->Percolator)" \
     --out benchmark/results/tools/proteobench-exp2.json
+```
+
+Normalize a raw CI `openswath.json` (the build time and artifact size come
+from the same CI run that produced the raw result):
+
+```bash
+python3 benchmark/report/report_generate.py normalize openswath openswath.json \
+    --run-id 32995654115 --build-time 3412 --artifact-bytes 149265164 \
+    --out benchmark/results/openswath_dia/openms/openswath_dia-32995654115.json
 ```
 
 Render the report:
@@ -271,9 +284,10 @@ Testing
 ```bash
 python3 benchmark/report/test_v2_schema.py         # currently 5 tests:
                                                    # v1 -> v2 promotion, result layout loading
-python3 benchmark/report/test_generic_renderer.py  # currently 16 tests: rendering all
+python3 benchmark/report/test_generic_renderer.py  # currently 19 tests: rendering all
                                                    # benchmark types, dynamic stage/metric
-                                                   # discovery, regression detection
+                                                   # discovery, regression detection,
+                                                   # OpenSwath normalization end-to-end
 ```
 
 Repository structure

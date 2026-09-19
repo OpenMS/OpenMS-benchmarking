@@ -62,32 +62,35 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 
 
     <div class="card"><div class="inner">
       <h1>OpenMS Benchmark Report</h1>
-      <div class="dim">smoke benchmark —
-      generated 2026-08-28 09:29 UTC</div>
+      <div class="dim">openswath_dia benchmark —
+      generated 2026-09-19 15:43 UTC</div>
       <dl class="meta">
         <div><dt>Software SHA</dt><dd>f1768367fa… <span class="mono" title="f1768367fa66f7901b4fa78a9ebece64b2ce9024">(f17683)</span></dd></div>
-        <div><dt>Run</dt><dd>31881021123 <span class="dim">()</span></dd></div>
-        <div><dt>Run at</dt><dd>2026-08-15T11:01:59Z</dd></div>
-        <div><dt>Cache</dt><dd><span class="chip ok">warm</span></dd></div>
-        <div><dt>Dataset</dt><dd>smoke fixture (CometAdapter_3)</dd></div>
+        <div><dt>Run</dt><dd>32995654115 <span class="dim">(openswath_dia/openms/openswath_dia-32995654115.json)</span></dd></div>
+        <div><dt>Run at</dt><dd>2026-08-26T18:40:29Z</dd></div>
+        <div><dt>Cache</dt><dd><span class="chip neutral">none</span></dd></div>
+        <div><dt>Dataset</dt><dd>OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)</dd></div>
         <div><dt>Verdict</dt><dd><span class="chip ok">pass</span></dd></div>
       </dl>
     </div></div>
 
         <div class="card"><h2>Build</h2><div class="inner">
-          <table><tbody><tr><td>Build wall time</td><td class='num'>6m 03s</td></tr><tr><td>Artifact size</td><td class='num'>142.4 MiB</td></tr><tr><td>Cache state</td><td class='num'>warm</td></tr></tbody></table>
+          <table><tbody><tr><td>Build wall time</td><td class='num'>56m 52s</td></tr><tr><td>Artifact size</td><td class='num'>142.4 MiB</td></tr><tr><td>Cache state</td><td class='num'>none</td></tr></tbody></table>
           <div class="note">Build metrics come from the run metadata recorded at
           <code>normalize</code> time (CI knows them; the benchmark script itself does not).</div>
         </div></div>
 
-        <div class="card"><h2>Pipeline stages <span class="sub">— decoy_database, comet, percolator</span></h2><div class="inner">
+        <div class="card"><h2>Pipeline stages <span class="sub">— openswath_workflow</span></h2><div class="inner">
           <table>
             <thead><tr><th>Stage</th><th>Result</th><th class="num">Wall</th>
             <th class="num">CPU</th><th class="num">Peak RSS</th></tr></thead>
-            <tbody><tr><td class='mono'>decoy_database</td><td><span class="chip ok">pass</span> <span class='dim'>(required)</span></td><td class='num'>5.0s</td><td class='num'>0.01 s</td><td class='num'>40.4 MiB</td></tr><tr><td class='mono'>comet</td><td><span class="chip ok">pass</span> <span class='dim'>(required)</span></td><td class='num'>5.2s</td><td class='num'>0.22 s</td><td class='num'>60.6 MiB</td></tr><tr><td class='mono'>percolator</td><td><span class="chip ok">pass</span> <span class='dim'>(optional)</span></td><td class='num'>5.1s</td><td class='num'>0.06 s</td><td class='num'>48.8 MiB</td></tr></tbody>
+            <tbody><tr><td class='mono'>openswath_workflow</td><td><span class="chip ok">pass</span> <span class='dim'>(required)</span></td><td class='num'>2.8s</td><td class='num'>0.21 s</td><td class='num'>64.1 MiB</td></tr></tbody>
           </table>
         </div></div>
 
+        <div class="card"><h2>Correctness</h2><div class="inner">
+          <table><tbody><tr><td class='mono'>actual_features</td><td class='num'>6.000</td></tr><tr><td class='mono'>expected_features</td><td class='num'>6.000</td></tr><tr><td class='mono'>features_match</td><td class='num'>yes</td></tr><tr><td class='mono'>overall_quality_sum</td><td class='num'>14</td></tr><tr><td class='mono'>qc_charge_distribution</td><td class='num'>[[1, 19], [2, 19], [3, 19]]</td></tr><tr><td class='mono'>total_intensity</td><td class='num'>149,892</td></tr></tbody></table>
+        </div></div>
 
 
         <div class="card"><h2>Reference results <span class="sub">— PXD028735 (HYE mixed-species)</span></h2><div class="inner">
@@ -102,24 +105,12 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 
           </table>
         </div></div>
 
-        <div class="card"><h2>Comparison <span class="sub">— current vs previous run</span></h2><div class="inner">
-          <table>
-            <thead><tr><th>Metric</th><th class="num">Baseline<br><span class="dim">31875286910</span></th>
-            <th class="num">Current<br><span class="dim">31881021123</span></th>
-            <th class="num">Δ</th></tr></thead>
-            <tbody><tr><td class='mono'>verdict</td><td class='num'>pass</td><td class='num'>pass</td><td class='num'>same</td></tr></tbody>
-          </table>
-          <div class="note">⚠ Cache state differs between the two runs (current = <b>warm</b>, baseline = <b>cold</b>), so the build-time Δ reflects the ccache state, not a code change.</div>
-          <div class="note">Baseline = previous OpenMS run of the same benchmark
-          (). Only metrics present in both runs are
-          compared.</div>
-        </div></div>
 
         <div class="card"><h2>Run history</h2><div class="inner">
           <table>
-            <thead><tr><th>Run</th><th>Run at</th><th>SHA</th><th>Cache</th>
+            <thead><tr><th>Run</th><th>Benchmark</th><th>Run at</th><th>SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
-            <tbody><tr><td class='mono'>31881021123</td><td>2026-08-15T11:01:59Z</td><td class='mono'>f1768367fa…</td><td><span class="chip ok">warm</span></td><td><span class="chip ok">pass</span></td><td class='num'>6m 03s</td></tr><tr><td class='mono'>31875286910</td><td>2026-08-15T08:45:47Z</td><td class='mono'>f1768367fa…</td><td><span class="chip warn">cold</span></td><td><span class="chip ok">pass</span></td><td class='num'>1h 23m 08s</td></tr><tr><td class='mono'>31791246692</td><td>2026-08-14T10:12:02Z</td><td class='mono'>f1768367fa…</td><td><span class="chip neutral">none</span></td><td><span class="chip ok">pass</span></td><td class='num'>1h 16m 21s</td></tr></tbody>
+            <tbody><tr><td class='mono'>32995654115</td><td>openswath_dia</td><td>2026-08-26T18:40:29Z</td><td class='mono'>f1768367fa…</td><td><span class="chip neutral">none</span></td><td><span class="chip ok">pass</span></td><td class='num'>56m 52s</td></tr><tr><td class='mono'>31881021123</td><td>smoke</td><td>2026-08-15T11:01:59Z</td><td class='mono'>f1768367fa…</td><td><span class="chip ok">warm</span></td><td><span class="chip ok">pass</span></td><td class='num'>6m 03s</td></tr><tr><td class='mono'>31875286910</td><td>smoke</td><td>2026-08-15T08:45:47Z</td><td class='mono'>f1768367fa…</td><td><span class="chip warn">cold</span></td><td><span class="chip ok">pass</span></td><td class='num'>1h 23m 08s</td></tr><tr><td class='mono'>31791246692</td><td>smoke</td><td>2026-08-14T10:12:02Z</td><td class='mono'>f1768367fa…</td><td><span class="chip neutral">none</span></td><td><span class="chip ok">pass</span></td><td class='num'>1h 16m 21s</td></tr></tbody>
           </table>
         </div></div>
 
@@ -130,6 +121,6 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 
       are reported but not treated as regressions.</div>
     </div></div>
 <footer>Generated by <code>benchmark/report/report_generate.py</code>
-(2026-08-28 09:29 UTC) · results schema openms-benchmarking/report/v2 ·
+(2026-09-19 15:43 UTC) · results schema openms-benchmarking/report/v2 ·
 regenerate with <code>python3 benchmark/report/report_generate.py render</code></footer>
 </div></body></html>
