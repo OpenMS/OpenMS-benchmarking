@@ -641,7 +641,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             <th class="num">Δ</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
-          {cache_note}
+{'          ' + cache_note if cache_note else ''}
           <div class="note">Baseline = previous OpenMS run of the same benchmark
           ({esc(baseline.get('_file', ''))}). Only metrics present in both runs are
           compared.</div>
