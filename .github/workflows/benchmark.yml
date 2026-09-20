@@ -45,6 +45,52 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # OpenMS changed its CI dependency model ("Only use dependencies from
+      # vcpkg", upstream e7e2297241): newer SHAs no longer install libraries
+      # (xerces, boost, ...) via tools/ci/deps-ubuntu.sh — they come from the
+      # vcpkg manifest during CMake configure instead. Detect which model
+      # applies from the checked-out SHA itself; never hardcode a date or SHA
+      # boundary here.
+      - name: Detect dependency model
+        id: depmodel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Capability: does this SHA ship the complete vcpkg mechanism
+          # (manifest + CMake opt-in + vcpkg submodule declaration)?
+          capable=false
+          if [[ -f vcpkg.json ]] \
+             && grep -q "OPENMS_USE_VCPKG" CMakeLists.txt \
+             && grep -Eq '^[[:space:]]*path[[:space:]]*=[[:space:]]*vcpkg[[:space:]]*$' .gitmodules; then
+            capable=true
+          fi
+
+          # Does the SHA's own dependency script still install libraries via
+          # apt? While that holds, the legacy path is exactly the recipe that
+          # produced our stored baselines, so keep it untouched.
+          legacy_libs=false
+          if grep -Eqi 'libxerces|boost|libsvm|libzip|hdf5|eigen|seqan|coinor|glpk|wildmagic' tools/ci/deps-ubuntu.sh; then
+            legacy_libs=true
+          fi
+
+          if [[ "$legacy_libs" == true ]]; then
+            echo "model=legacy" >> "$GITHUB_OUTPUT"
+            echo "OPENMS_CMAKE_VCPKG_ARGS=" >> "$GITHUB_ENV"
+            echo "Dependency model: legacy (deps script installs libraries via apt)"
+          elif [[ "$capable" == true ]]; then
+            echo "model=vcpkg" >> "$GITHUB_OUTPUT"
+            # Flags mirror OpenMS' own linux presets: the vcpkg community
+            # triplet is dynamic (the builtin x64-linux triplet is static,
+            # which cannot link libOpenMS as a shared library), and upstream
+            # sets BOOST_USE_STATIC=OFF with it.
+            echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF" >> "$GITHUB_ENV"
+            echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
+          else
+            echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
+            exit 1
+          fi
+
       # Reuse OpenMS' own dependency script (the same one its CI uses) instead
       # of duplicating the package list here. --skip-gui-deps keeps the build
       # lean: TOPP tools do not need Qt, so WITH_GUI is disabled below.
@@ -78,6 +124,41 @@ jobs:
             echo "CCACHE_MAXSIZE=1G"
           } >> "$GITHUB_ENV"
 
+      # ---- vcpkg dependency model (newer OpenMS SHAs) ----------------------
+      # Mirrors OpenMS' own dependency setup (.github/actions/dependencies):
+      # vcpkg is a submodule of OpenMS and is bootstrapped with the same
+      # upstream-supported action; the manifest install itself runs during
+      # CMake configure through the toolchain file that OPENMS_USE_VCPKG=ON
+      # selects. Port/triplet overlays come from vcpkg-configuration.json.
+      # Binary artifacts are cached locally, keyed by the manifest content so
+      # a dependency change in any benchmarked SHA gets its own entry; the
+      # restore-key fallback is safe because vcpkg binary caches are
+      # content-addressed per port (stale entries are simply unused).
+      - name: Restore vcpkg binary cache
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: actions/cache@v5
+        with:
+          path: .vcpkg-cache
+          key: openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        shell: bash
+        run: |
+          git submodule update --init vcpkg
+          mkdir -p "$GITHUB_WORKSPACE/.vcpkg-cache"
+          {
+            echo "VCPKG_BINARY_SOURCES=clear;files,$GITHUB_WORKSPACE/.vcpkg-cache,readwrite"
+          } >> "$GITHUB_ENV"
+
+      - name: Bootstrap vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: lukka/run-vcpkg@v11
+        with:
+          doNotCache: true
+
       # Search engines (Comet, Percolator, ...) ship as the THIRDPARTY
       # submodule of OpenMS; stage them exactly like OpenMS' CI does so the
       # adapters can find them at runtime.
@@ -105,7 +186,8 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DWITH_GUI=OFF \
             -DENABLE_DOCS=OFF \
-            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
+            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY" \
+            $OPENMS_CMAKE_VCPKG_ARGS
 
       - name: Build
         id: build
