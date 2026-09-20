@@ -210,6 +210,7 @@ jobs:
           path: |
             build/bin
             build/lib
+            build/vcpkg_installed/x64-linux-dynamic/lib
             share/OpenMS
             _thirdparty
           if-no-files-found: error
@@ -252,7 +253,7 @@ jobs:
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
@@ -293,7 +294,7 @@ jobs:
         shell: bash
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-openswath
