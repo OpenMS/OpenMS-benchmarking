@@ -1,0 +1,79 @@
+name: Pages
+
+# Static benchmark-results site (ProteoBench external-context comparison).
+#
+# Two views:
+#   pinned.html  - the DEFAULT/reference view, generated from the vendored
+#                  snapshot in benchmark/results/proteobench/external/
+#                  (reproducible from the checkout alone, no network).
+#   latest.html  - the OPTIONAL latest view, generated from a fresh shallow
+#                  clone of the upstream results repository at its HEAD.
+#                  Clearly labeled "not the reference" on the page itself.
+#
+# Deployment uses the official Actions/Deploy pattern with an artifact
+# (not a gh-pages branch) so no force-pushes or extra branches are needed.
+# Runs on manual dispatch or pushes to main; the Pages site itself must be
+# enabled once in repository settings (Source: GitHub Actions).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # The upstream results repository is a flat set of submission JSONs;
+      # a shallow clone of HEAD is all the latest view needs. If upstream is
+      # temporarily unreachable the pinned view is still published.
+      - name: Shallow-clone upstream for the latest view
+        id: upstream
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --quiet \
+            https://github.com/Proteobench/Results_quant_ion_DDA upstream
+          echo "available=${{ success() }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate site (pinned reference view + optional latest view)
+        run: |
+          ARGS=(--site-dir site)
+          if [ -d upstream ]; then
+            ARGS+=(--latest-from upstream)
+          else
+            echo "::warning::upstream clone unavailable; publishing pinned reference view only"
+          fi
+          python benchmark/pages_generate.py "${ARGS[@]}"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

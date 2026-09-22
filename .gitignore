@@ -24,3 +24,6 @@ benchmark/generated/
 .DS_Store
 Thumbs.db
 __pycache__/
+
+# Generated GitHub Pages site (built by .github/workflows/pages.yml)
+site/
