@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       openms_sha:
-        description: "OpenMS commit SHA to build and benchmark (must contain the PR #9975 ONNX support: cmake/Modules/FindONNXRuntime.cmake was added after f1768367)"
+        description: "OpenMS commit SHA to build and benchmark. ONNX/ProSE jobs additionally require a SHA carrying PR #9975 ONNX support (cmake/Modules/FindONNXRuntime.cmake, added after f1768367); the default satisfies both."
         required: false
         default: "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
       use_ms2rescore:
@@ -23,15 +23,6 @@ on:
         required: false
         default: false
         type: boolean
-
-# Dependency-script pin: tools/ci/deps-ubuntu.sh at the pinned build SHA no
-# longer installs any libraries (upstream stripped the apt list when its
-# Linux CI moved to vcpkg), which made find_package(XercesC REQUIRED) fail
-# in both build jobs. This is the PR-branch commit whose deps-ubuntu.sh
-# still carries the full library list (Xerces-C, libsvm, hdf5, libzip, ...);
-# the OpenMS sources themselves still build at inputs.openms_sha.
-env:
-  DEPS_UBUNTU_SHA: f1768367fa66f7901b4fa78a9ebece64b2ce9024
 
 jobs:
   build-openms:
@@ -54,16 +45,58 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Reuse OpenMS' own dependency script instead of duplicating the package
-      # list here, fetched from DEPS_UBUNTU_SHA (see workflow env: the pinned
-      # build SHA's copy no longer installs libraries). --skip-gui-deps keeps
-      # the build lean: TOPP tools do not need Qt, so WITH_GUI is disabled
-      # below.
-      - name: Install dependencies
+      # OpenMS changed its CI dependency model ("Only use dependencies from
+      # vcpkg", upstream e7e2297241): newer SHAs no longer install libraries
+      # (xerces, boost, ...) via tools/ci/deps-ubuntu.sh — they come from the
+      # vcpkg manifest during CMake configure instead. Detect which model
+      # applies from the checked-out SHA itself; never hardcode a date or SHA
+      # boundary here.
+      - name: Detect dependency model
+        id: depmodel
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
-          bash deps-ubuntu.sh --skip-gui-deps
+          set -euo pipefail
+
+          # Capability: does this SHA ship the complete vcpkg mechanism
+          # (manifest + CMake opt-in + vcpkg submodule declaration)?
+          capable=false
+          if [[ -f vcpkg.json ]] \
+             && grep -q "OPENMS_USE_VCPKG" CMakeLists.txt \
+             && grep -Eq '^[[:space:]]*path[[:space:]]*=[[:space:]]*vcpkg[[:space:]]*$' .gitmodules; then
+            capable=true
+          fi
+
+          # Does the SHA's own dependency script still install libraries via
+          # apt? While that holds, the legacy path is exactly the recipe that
+          # produced our stored baselines, so keep it untouched.
+          legacy_libs=false
+          if grep -Eqi 'libxerces|boost|libsvm|libzip|hdf5|eigen|seqan|coinor|glpk|wildmagic' tools/ci/deps-ubuntu.sh; then
+            legacy_libs=true
+          fi
+
+          if [[ "$legacy_libs" == true ]]; then
+            echo "model=legacy" >> "$GITHUB_OUTPUT"
+            echo "OPENMS_CMAKE_VCPKG_ARGS=" >> "$GITHUB_ENV"
+            echo "Dependency model: legacy (deps script installs libraries via apt)"
+          elif [[ "$capable" == true ]]; then
+            echo "model=vcpkg" >> "$GITHUB_OUTPUT"
+            # Flags mirror OpenMS' own linux presets: the vcpkg community
+            # triplet is dynamic (the builtin x64-linux triplet is static,
+            # which cannot link libOpenMS as a shared library), and upstream
+            # sets BOOST_USE_STATIC=OFF with it.
+            echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF" >> "$GITHUB_ENV"
+            echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
+          else
+            echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
+            exit 1
+          fi
+
+      # Reuse OpenMS' own dependency script (the same one its CI uses) instead
+      # of duplicating the package list here. --skip-gui-deps keeps the build
+      # lean: TOPP tools do not need Qt, so WITH_GUI is disabled below.
+      - name: Install dependencies
+        shell: bash
+        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
 
       # ccache: the same compiler-cache strategy OpenMS CI uses (see
       # .github/actions/build/action.yml in OpenMS), transplanted here. The
@@ -90,6 +123,41 @@ jobs:
             echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
             echo "CCACHE_MAXSIZE=1G"
           } >> "$GITHUB_ENV"
+
+      # ---- vcpkg dependency model (newer OpenMS SHAs) ----------------------
+      # Mirrors OpenMS' own dependency setup (.github/actions/dependencies):
+      # vcpkg is a submodule of OpenMS and is bootstrapped with the same
+      # upstream-supported action; the manifest install itself runs during
+      # CMake configure through the toolchain file that OPENMS_USE_VCPKG=ON
+      # selects. Port/triplet overlays come from vcpkg-configuration.json.
+      # Binary artifacts are cached locally, keyed by the manifest content so
+      # a dependency change in any benchmarked SHA gets its own entry; the
+      # restore-key fallback is safe because vcpkg binary caches are
+      # content-addressed per port (stale entries are simply unused).
+      - name: Restore vcpkg binary cache
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: actions/cache@v5
+        with:
+          path: .vcpkg-cache
+          key: openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        shell: bash
+        run: |
+          git submodule update --init vcpkg
+          mkdir -p "$GITHUB_WORKSPACE/.vcpkg-cache"
+          {
+            echo "VCPKG_BINARY_SOURCES=clear;files,$GITHUB_WORKSPACE/.vcpkg-cache,readwrite"
+          } >> "$GITHUB_ENV"
+
+      - name: Bootstrap vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: lukka/run-vcpkg@v11
+        with:
+          doNotCache: true
 
       # Search engines (Comet, Percolator, ...) ship as the THIRDPARTY
       # submodule of OpenMS; stage them exactly like OpenMS' CI does so the
@@ -118,7 +186,8 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DWITH_GUI=OFF \
             -DENABLE_DOCS=OFF \
-            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
+            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY" \
+            $OPENMS_CMAKE_VCPKG_ARGS
 
       - name: Build
         id: build
@@ -141,6 +210,7 @@ jobs:
           path: |
             build/bin
             build/lib
+            build/vcpkg_installed/x64-linux-dynamic/lib
             share/OpenMS
             _thirdparty
           if-no-files-found: error
@@ -158,13 +228,12 @@ jobs:
       # The smoke job runs on a fresh runner, but the downloaded binaries
       # need OpenMS' runtime libraries (xerces, hdf5, libzip, boost, ...).
       # Install the same non-GUI deps the build job uses. The deps script
-      # lives in the OpenMS repo (not this one); fetch it from DEPS_UBUNTU_SHA
-      # (workflow env) because the pinned build SHA's copy no longer installs
-      # the libraries.
+      # lives in the OpenMS repo (not this one), so fetch it at the exact
+      # pinned SHA rather than duplicating the package list here.
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
@@ -184,19 +253,20 @@ jobs:
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh
 
       # Compute artifact size for the normalization step (build job does not
-      # expose this directly).
+      # expose this directly). The vcpkg runtime lib dir contributes nothing
+      # on legacy-model builds (du skips missing dirs).
       - name: Compute artifact size
         id: artifact-size
         shell: bash
         run: |
-          bytes=$(du -sb openms/build/bin openms/build/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
+          bytes=$(du -sb openms/build/bin openms/build/lib openms/build/vcpkg_installed/x64-linux-dynamic/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
 
       - name: Normalize smoke results to v2
@@ -228,7 +298,7 @@ jobs:
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
@@ -245,18 +315,31 @@ jobs:
         shell: bash
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-openswath
         run: bash benchmark/run_openswath_benchmark.sh
 
+      - name: Compute artifact size
+        id: artifact-size
+        shell: bash
+        run: |
+          bytes=$(du -sb openms/build/bin openms/build/lib openms/build/vcpkg_installed/x64-linux-dynamic/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
+          echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
+
+      # Main's normalize contract: raw CI openswath.json (v1) + required
+      # build-time/artifact-bytes provenance, normalized output written into
+      # the results dir and shipped in the artifact.
       - name: Normalize OpenSwath results to v2
         shell: bash
         run: |
           python benchmark/report/report_generate.py normalize openswath \
+            results-openswath/openswath.json \
             --run-id "${{ github.run_id }}" \
             --cache none \
+            --build-time "$(echo '${{ needs.build-openms.outputs.build_minutes }} * 60' | bc)" \
+            --artifact-bytes "${{ steps.artifact-size.outputs.bytes }}" \
             --results-dir results-openswath
 
       - name: Upload OpenSwath benchmark results
@@ -265,20 +348,23 @@ jobs:
           name: benchmark-openswath-${{ needs.build-openms.outputs.openms_sha }}
           path: results-openswath
           if-no-files-found: error
-
   # ---------------------------------------------------------------------------
-  # ProSE + PeptDeep ONNX pipeline validation (Day-33 design, GSOC_Notebook/
-  # Day-33/ProSE_ONNX_CI_Design.md).
+  # ProSE + PeptDeep ONNX pipeline validation.
   #
   # Separate ONNX-enabled build job so the existing build-openms artifact
   # (consumed by smoke + OpenSwath) stays byte-identical: different configure
   # flags, two extra downloads, separate ccache key prefix.
   #
-  # The fixture is pipeline-validation-only (Day-32 recommendation C): the job
-  # asserts that ProSE executes, Percolator really runs (q-values), the
-  # PeptDeep arm really runs ONNX inference (five features), entrapment
-  # accessions survive, and prose.json + normalization are produced. It does
-  # NOT require q <= 0.01 survivors (0 on this CID fixture; documented).
+  # The fixture is pipeline-validation-only: the downstream job asserts that
+  # ProSE executes, Percolator really runs (q-values), the PeptDeep arm really
+  # runs ONNX inference (five features), entrapment accessions survive, and
+  # prose.json + normalization are produced. It does NOT require q <= 0.01
+  # survivors (0 on this CID fixture; documented).
+  #
+  # Dependency model: identical detection to build-openms. Post-vcpkg SHAs
+  # receive the libraries (including Arrow) from the vcpkg manifest; legacy
+  # SHAs receive the apt libraries plus prebuilt conda-forge Arrow (>= 23 is a
+  # hard requirement of the ONNX support and Ubuntu 24.04 apt ships Arrow 5).
   # ---------------------------------------------------------------------------
   build-openms-onnx:
     name: "Build OpenMS with ONNX (ProSE + PeptDeep, fixed SHA)"
@@ -298,14 +384,73 @@ jobs:
         shell: bash
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Deps from DEPS_UBUNTU_SHA (workflow env): the pinned build SHA's own
-      # deps-ubuntu.sh no longer installs libraries (upstream moved the Linux
-      # CI to vcpkg), which made find_package(XercesC REQUIRED) fail here.
-      - name: Install dependencies
+      - name: Detect dependency model
+        id: depmodel
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
-          bash deps-ubuntu.sh --skip-gui-deps
+          set -euo pipefail
+
+          capable=false
+          if [[ -f vcpkg.json ]] \
+             && grep -q "OPENMS_USE_VCPKG" CMakeLists.txt \
+             && grep -Eq '^[[:space:]]*path[[:space:]]*=[[:space:]]*vcpkg[[:space:]]*$' .gitmodules; then
+            capable=true
+          fi
+
+          legacy_libs=false
+          if grep -Eqi 'libxerces|boost|libsvm|libzip|hdf5|eigen|seqan|coinor|glpk|wildmagic' tools/ci/deps-ubuntu.sh; then
+            legacy_libs=true
+          fi
+
+          if [[ "$legacy_libs" == true ]]; then
+            echo "model=legacy" >> "$GITHUB_OUTPUT"
+            echo "OPENMS_CMAKE_VCPKG_ARGS=" >> "$GITHUB_ENV"
+            echo "Dependency model: legacy (deps script installs libraries via apt)"
+          elif [[ "$capable" == true ]]; then
+            echo "model=vcpkg" >> "$GITHUB_OUTPUT"
+            echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF" >> "$GITHUB_ENV"
+            echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
+          else
+            echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: bash tools/ci/deps-ubuntu.sh --skip-gui-deps
+
+      # Arrow >= 23 is a hard requirement of the ONNX support and Ubuntu 24.04
+      # apt ships Arrow 5. Legacy-model builds get prebuilt conda-forge
+      # libarrow via micromamba; post-vcpkg SHAs receive Arrow from the vcpkg
+      # manifest instead. Versions pinned to the exact set that produced the
+      # locally validated binaries.
+      - name: Install prebuilt Arrow 25 (micromamba, legacy model only)
+        if: steps.depmodel.outputs.model == 'legacy'
+        shell: bash
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/mm.tar.bz2" \
+            https://anaconda.org/conda-forge/micromamba/2.9.0/download/linux-64/micromamba-2.9.0-0.tar.bz2
+          mkdir -p "$RUNNER_TEMP/mm"
+          tar -xjf "$RUNNER_TEMP/mm.tar.bz2" -C "$RUNNER_TEMP/mm" bin/micromamba
+          MM="$RUNNER_TEMP/mm/bin/micromamba"
+          "$MM" create -y -p "$RUNNER_TEMP/arrow-pref" -c conda-forge \
+            libarrow=25.0.0 libparquet=25.0.0 xz zstd
+          # conda-forge ships the runtime liblzma; Arrow's static link wants
+          # the dev-style -llzma symlink (seen in the local build).
+          if [ ! -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so" ] \
+             && [ -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so.5" ]; then
+            ln -s liblzma.so.5 "$RUNNER_TEMP/arrow-pref/lib/liblzma.so"
+          fi
+
+      - name: Set legacy-model CMake extras
+        if: steps.depmodel.outputs.model == 'legacy'
+        shell: bash
+        run: echo "OPENMS_ONNX_MODEL_FLAGS=-DOPENMS_USE_VCPKG=OFF -DCMAKE_PREFIX_PATH=$RUNNER_TEMP/arrow-pref" >> "$GITHUB_ENV"
+
+      - name: Set vcpkg-model CMake extras
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        shell: bash
+        run: echo "OPENMS_ONNX_MODEL_FLAGS=" >> "$GITHUB_ENV"
 
       # Same ccache strategy as build-openms but a SEPARATE key prefix: the
       # ONNX configure adds include paths, so object files differ from the
@@ -332,6 +477,32 @@ jobs:
             echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
           } >> "$GITHUB_ENV"
 
+      # ---- vcpkg dependency model (same mechanism as build-openms) ----------
+      - name: Restore vcpkg binary cache (ONNX flavor)
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: actions/cache@v5
+        with:
+          path: .vcpkg-cache
+          key: openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        shell: bash
+        run: |
+          git submodule update --init vcpkg
+          mkdir -p "$GITHUB_WORKSPACE/.vcpkg-cache"
+          {
+            echo "VCPKG_BINARY_SOURCES=clear;files,$GITHUB_WORKSPACE/.vcpkg-cache,readwrite"
+          } >> "$GITHUB_ENV"
+
+      - name: Bootstrap vcpkg
+        if: steps.depmodel.outputs.model == 'vcpkg'
+        uses: lukka/run-vcpkg@v11
+        with:
+          doNotCache: true
+
       - name: Stage search engines
         shell: bash
         run: |
@@ -340,9 +511,9 @@ jobs:
           cp -R THIRDPARTY/Linux/$(uname -m)/* _thirdparty/
           cp -R THIRDPARTY/All/* _thirdparty/
 
-      # Prebuilt onnxruntime 1.23.2 (the PR-pinned version) from the official
-      # GitHub release; checksum pinned to the byte-identical tarball used for
-      # the locally validated build (Day-30 WSL recipe).
+      # Prebuilt onnxruntime 1.23.2 from the official GitHub release; checksum
+      # pinned to the byte-identical tarball used for the locally validated
+      # build.
       - name: Download onnxruntime 1.23.2 (pinned)
         shell: bash
         run: |
@@ -352,32 +523,12 @@ jobs:
           echo "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b  $RUNNER_TEMP/ort.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP/ort" --strip-components=1
 
-      # Arrow >= 23 is a hard requirement of the PR and Ubuntu 24.04 apt ships
-      # Arrow 5. OpenMS CI itself gets Arrow from vcpkg (hours of source
-      # builds); the locally validated fast path is prebuilt conda-forge
-      # libarrow via micromamba (Day-30). Versions pinned to the exact set
-      # that produced the validated binaries.
-      - name: Install prebuilt Arrow 25 (micromamba)
-        shell: bash
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/mm.tar.bz2" \
-            https://anaconda.org/conda-forge/micromamba/2.9.0/download/linux-64/micromamba-2.9.0-0.tar.bz2
-          mkdir -p "$RUNNER_TEMP/mm"
-          tar -xjf "$RUNNER_TEMP/mm.tar.bz2" -C "$RUNNER_TEMP/mm" bin/micromamba
-          MM="$RUNNER_TEMP/mm/bin/micromamba"
-          "$MM" create -y -p "$RUNNER_TEMP/arrow-pref" -c conda-forge \
-            libarrow=25.0.0 libparquet=25.0.0 xz zstd
-          # conda-forge ships the runtime liblzma; Arrow's static link wants
-          # the dev-style -llzma symlink (seen in the local build).
-          if [ ! -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so" ] \
-             && [ -e "$RUNNER_TEMP/arrow-pref/lib/liblzma.so.5" ]; then
-            ln -s liblzma.so.5 "$RUNNER_TEMP/arrow-pref/lib/liblzma.so"
-          fi
-
       # WITH_THERMO_RAW=OFF: vendor .raw reading needs the .NET SDK and is
       # irrelevant for mzML inputs. WITH_ONNX=ON makes configure download the
       # three PeptDeep models from archive.openms.de and verify their pinned
-      # SHA256s (configure fails hard on mismatch).
+      # SHA256s (configure fails hard on mismatch). Legacy model links Arrow
+      # from the micromamba prefix via OPENMS_ONNX_MODEL_FLAGS; vcpkg model
+      # links it from the manifest via OPENMS_CMAKE_VCPKG_ARGS.
       - name: Configure (Release, Ninja, ONNX)
         shell: bash
         env:
@@ -392,11 +543,11 @@ jobs:
             -DENABLE_DOCS=OFF \
             -DWITH_THERMO_RAW=OFF \
             -DWITH_ONNX=ON \
-            -DOPENMS_USE_VCPKG=OFF \
-            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/arrow-pref" \
             -DONNXRuntime_INCLUDE_DIR="$RUNNER_TEMP/ort/include" \
             -DONNXRuntime_LIBRARY="$RUNNER_TEMP/ort/lib/libonnxruntime.so" \
-            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY"
+            -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY" \
+            $OPENMS_CMAKE_VCPKG_ARGS \
+            $OPENMS_ONNX_MODEL_FLAGS
 
       # Only what the benchmark needs (the full TOPP set is built by the
       # non-ONNX job; this flavor exists for ProSE).
@@ -419,7 +570,7 @@ jobs:
           cp "$MODEL_SRC"/*.onnx build/share/OpenMS/models/
           sha256sum build/share/OpenMS/models/*.onnx
 
-      # Ship the onnxruntime shared object(s) with build/lib so the run job's
+      # Ship the onnxruntime shared object(s) with build/lib so the run jobs'
       # single LD_LIBRARY_PATH covers them (cp -a keeps the .so.1 symlinks).
       - name: Bundle onnxruntime runtime libs
         shell: bash
@@ -432,6 +583,7 @@ jobs:
           path: |
             build/bin
             build/lib
+            build/vcpkg_installed/x64-linux-dynamic/lib
             build/share/OpenMS/models
             share/OpenMS
             _thirdparty
@@ -446,10 +598,14 @@ jobs:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
 
+      # The downloaded binaries need OpenMS' runtime libraries; install the
+      # same non-GUI deps the build job uses. The deps script lives in the
+      # OpenMS repo (not this one), so fetch it at the exact built SHA — the
+      # same adaptive pattern the smoke and OpenSwath jobs use.
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms-onnx.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS ONNX binaries
@@ -481,11 +637,12 @@ jobs:
       - name: Generate entrapment FASTA + merged mzML
         shell: bash
         env:
-          # The artifact ships libOpenMS.so in build/lib, but the binaries'
-          # baked RUNPATH points at the build job's layout (<ws>/build/lib),
-          # not this job's (<ws>/openms/build/lib) - so point the dynamic
-          # linker there for FileMerger, exactly like the run step below.
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          # The artifact ships libOpenMS.so in build/lib (plus vcpkg runtime
+          # libs on post-vcpkg builds), but the binaries' baked RUNPATH points
+          # at the build job's layout (<ws>/build/lib), not this job's
+          # (<ws>/openms/build/lib) - so point the dynamic linker there for
+          # FileMerger, exactly like the run step below.
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           # OpenMS tools abort without the shared data (schemas, CHEMISTRY);
           # the artifact's share/OpenMS mirrors the source tree the smoke and
           # OpenSwath jobs already point OPENMS_DATA_PATH at.
@@ -498,8 +655,8 @@ jobs:
           cat "$GITHUB_WORKSPACE/benchmark/generated/prose/PROVENANCE.txt"
 
       # PROSE_EXTRA_SEARCH_ARGS: the fixture is LTQ-Orbitrap ion-trap CID, so
-      # the 20 ppm fragment default yields zero IDs (verified Day-32 control);
-      # 0.5 Da is the instrument-matched tolerance validated on Day-30/31. The
+      # the 20 ppm fragment default yields zero IDs (verified control);
+      # 0.5 Da is the instrument-matched tolerance validated locally. The
       # runner applies this env var IDENTICALLY to both arms, so arms differ
       # only in PeptDeep enablement (benchmark semantics unchanged).
       - name: Run ProSE + PeptDeep benchmark (both arms)
@@ -510,7 +667,7 @@ jobs:
           PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose/entrapment_target.fasta
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.5 -Search:fragment:mass_tolerance_unit Da"
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-prose
@@ -574,8 +731,7 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # PXD028735 scientific-dataset benchmark (Phase-2c; GSOC_Notebook/Day-34/
-  # ProSE_Phase2_Dataset_Investigation.md addendum). Same pipeline-validation
+  # PXD028735 scientific-dataset benchmark (Phase-2c). Same pipeline-validation
   # scope as run-prose-peptdeep-benchmark above: the guards assert execution
   # integrity (verdict, stages, q-values, entrapment survival, five PeptDeep
   # features), NOT a q <= 0.01 result. Dataset: ProteoBench QE HF-X HYE (CC0,
@@ -598,7 +754,7 @@ jobs:
       - name: Install runtime dependencies
         shell: bash
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${DEPS_UBUNTU_SHA}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
+          curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms-onnx.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS ONNX binaries
@@ -640,7 +796,7 @@ jobs:
           cat "$GITHUB_WORKSPACE/benchmark/generated/prose-pxd028735/PROVENANCE.txt"
 
       # Run A. The 0.02 Da fragment tolerance is the published PXD028735/
-      # ProteoBench parameter (validated through this runner in Phase-2b);
+      # ProteoBench parameter (validated through this runner locally);
       # precursor 10 ppm is the ProSE default. Search configuration is
       # identical for A and B and both arms (the runner applies
       # PROSE_EXTRA_SEARCH_ARGS to baseline and peptdeep alike).
@@ -652,7 +808,7 @@ jobs:
           PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-prose-pxd028735-A
@@ -720,7 +876,7 @@ jobs:
           PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
           OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
           OPENMS_SHA: ${{ needs.build-openms-onnx.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-prose-pxd028735-B

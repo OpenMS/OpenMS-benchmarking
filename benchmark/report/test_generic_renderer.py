@@ -12,9 +12,12 @@ Tests:
 7. Dynamic stage discovery (no hard-coded names)
 8. Dynamic metric comparison
 9. Missing/optional sections
+10. OpenSwath normalization (raw v1 -> v2)
+11. OpenSwath baseline selection + comparison end-to-end
 """
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -26,7 +29,8 @@ from report_generate import (
     _promote_v1, load_results, render, _identity, _run, _performance,
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
-    _flat_compare, fmt_seconds, fmt_bytes, fmt_delta
+    _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
+    normalize_openswath
 )
 
 
@@ -662,342 +666,233 @@ def test_formatter_helpers():
     print("  PASS: formatter helpers")
 
 
-def test_normalize_openswath_basic():
-    """normalize_openswath should produce valid v2 output from raw results."""
-    from report_generate import normalize_openswath, SCHEMA_V2
+def _write_raw_openswath(path, run_id, run_at, wall=2.76, verdict="pass"):
+    """Write a raw CI-style openswath.json (mirrors run_openswath_benchmark.sh output)."""
+    raw = {
+        "schema": "openms-benchmarking/report/v1",
+        "source": "openms",
+        "benchmark": "openswath_dia",
+        "milestone": 2,
+        "run_id": run_id,
+        "run_at": run_at,
+        "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024",
+        "cache": "none",
+        "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+        "stages": [
+            {"name": "openswath_workflow", "required": True, "exit_code": 0,
+             "wall_time_s": wall, "cpu_time_s": 0.21, "peak_rss_kb": 65656,
+             "status": "pass", "reason": ""}
+        ],
+        "verdict": verdict,
+        "correctness": {
+            "expected_features": 6, "actual_features": 6, "features_match": True,
+            "overall_quality_sum": 14.088245, "total_intensity": 149891.59,
+            "qc_charge_distribution": [[1, 19], [2, 19], [3, 19]],
+        },
+        "tool_versions": {"openswath_version": "n/a"},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh)
+    return raw
+
+
+def _normalize_args(raw_path, run_id, results_dir, **overrides):
     import argparse
+    kw = dict(cache="", build_time=3412.0, artifact_bytes=149265164,
+              run_at="", dataset="", out=None)
+    kw.update(overrides)
+    return argparse.Namespace(openswath_json=raw_path, run_id=run_id,
+                              results_dir=results_dir, **kw)
+
+
+def test_normalize_openswath_to_v2():
+    """normalize openswath maps a raw v1 result into valid v2, preserving identity,
+    stage metrics, correctness and verdict."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        _write_raw_openswath(raw_path, "32995654115", "2026-08-26T18:40:29Z")
+        normalize_openswath(_normalize_args(raw_path, "32995654115", tmpdir))
 
-        # Write meta.txt
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=abc123def456\n")
-            f.write("openswath_version=OpenMS 3.1.0\n")
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-32995654115.json")
+        assert os.path.exists(out_path), "default output path not created"
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
 
-        # Write stages.tsv
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\t0\t12.50\t45.20\t280000\tpass\t\n")
+        assert out["schema"] == "openms-benchmarking/report/v2"
+        assert out["identity"]["benchmark"] == "openswath_dia"
+        assert out["identity"]["software"]["version"] == \
+            "f1768367fa66f7901b4fa78a9ebece64b2ce9024"
+        assert out["identity"]["dataset"].startswith("OpenSwathWorkflow_1")
+        assert out["run"]["run_id"] == "32995654115"
+        assert out["run"]["run_at"] == "2026-08-26T18:40:29Z"  # taken from raw
+        assert out["run"]["cache"] == "none"                    # taken from raw
+        st = out["performance"]["stages"][0]
+        assert st["name"] == "openswath_workflow" and st["wall_time_s"] == 2.76
+        assert st["peak_rss_kb"] == 65656 and st["status"] == "pass"
+        assert out["performance"]["wall_time_s"] == 2.76
+        assert out["performance"]["build"] == {"wall_time_s": 3412.0,
+                                                "artifact_bytes": 149265164}
+        assert out["metrics"]["verdict"] == "pass"
+        assert out["correctness"]["actual_features"] == 6
+        assert out["correctness"]["features_match"] is True
 
-        # Write a minimal featureXML
-        featurexml = os.path.join(raw_dir, "output.featureXML")
-        with open(featurexml, "w") as f:
-            f.write('<?xml version="1.0"?>\n')
-            f.write('<featureList>\n')
-            for i in range(6):
-                f.write(f'  <feature><overallquality>{0.8 + i * 0.02}</overallquality><intensity>{1000 + i * 100}</intensity></feature>\n')
-            f.write('</featureList>\n')
-
-        # Write QC JSON
-        with open(os.path.join(raw_dir, "output.json"), "w") as f:
-            json.dump({"ChargeDistributionMS1": [1, 2, 3]}, f)
-
-        # Build args
-        args = argparse.Namespace(
-            run_id="test-run-1",
-            cache="cold",
-            run_at="2026-09-01T10:00:00Z",
-            dataset="",
-            results_dir=raw_dir,
-            out=os.path.join(tmpdir, "openswath", "openms", "openswath-test-run-1.json"),
-        )
-        normalize_openswath(args)
-
-        # Read and verify output
-        out_path = args.out
-        assert os.path.exists(out_path), f"Output not written: {out_path}"
-        with open(out_path) as f:
-            result = json.load(f)
-
-        assert result["schema"] == SCHEMA_V2
-        assert result["identity"]["benchmark"] == "openswath_dia"
-        assert result["identity"]["software"]["version"] == "abc123def456"
-        assert result["run"]["run_id"] == "test-run-1"
-        assert result["run"]["cache"] == "cold"
-        assert result["performance"]["wall_time_s"] == 12.5
-        assert result["performance"]["stages"][0]["name"] == "openswath_workflow"
-        assert result["performance"]["stages"][0]["status"] == "pass"
-        assert result["metrics"]["verdict"] == "pass"
-        assert result["correctness"]["actual_features"] == 6
-        assert result["correctness"]["features_match"] is True
-        assert result["correctness"]["expected_features"] == 6
-        assert len(result["correctness"]["qc_charge_distribution"]) == 3
-        assert "tool_versions" not in result
-        print("  PASS: normalize_openswath basic")
+        # the stored file must round-trip through the generic loader
+        runs, _ = load_results(tmpdir)
+        assert len(runs) == 1 and _benchmark_name(runs[0]) == "openswath_dia"
+        print("  PASS: normalize openswath -> v2")
     finally:
         shutil.rmtree(tmpdir)
 
 
-def test_normalize_openswath_loads_via_load_results():
-    """Normalized OpenSwath output should load directly without v1 promotion."""
-    from report_generate import normalize_openswath, load_results, SCHEMA_V2
-    import argparse
+def test_normalize_openswath_rejects_nonfinite():
+    """NaN/Infinity stage metrics must fail loudly, not silently enter the schema."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
-
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=test123\n")
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\t0\t5.00\t10.00\t100000\tpass\t\n")
-
-        out_dir = os.path.join(tmpdir, "openswath", "openms")
-        os.makedirs(out_dir)
-        out_path = os.path.join(out_dir, "openswath-ci-42.json")
-
-        args = argparse.Namespace(
-            run_id="ci-42",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        # Load via load_results (the renderer's entry point)
-        # Need to use the parent of the openswath dir as results_dir
-        results_base = os.path.join(tmpdir, "results")
-        # Move the normalized output into the expected v2 layout
-        v2_dir = os.path.join(results_base, "openswath", "openms")
-        os.makedirs(v2_dir)
-        shutil.copy(out_path, v2_dir)
-
-        openms_runs, tool_results = load_results(results_base)
-        assert len(openms_runs) == 1
-        assert openms_runs[0]["schema"] == SCHEMA_V2  # no promotion needed
-        assert openms_runs[0]["identity"]["benchmark"] == "openswath_dia"
-        assert openms_runs[0]["run"]["run_id"] == "ci-42"
-        print("  PASS: normalize_openswath loads via load_results")
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "X", "2026-08-26T18:40:29Z")
+        raw["stages"][0]["wall_time_s"] = float("nan")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)  # emits a bare NaN token
+        try:
+            normalize_openswath(_normalize_args(raw_path, "X", tmpdir))
+        except SystemExit:
+            print("  PASS: normalize openswath rejects non-finite metrics")
+        else:
+            raise AssertionError("NaN wall_time_s was accepted")
     finally:
         shutil.rmtree(tmpdir)
 
 
-def test_normalize_openswath_missing_files():
-    """normalize_openswath should handle missing featureXML and QC JSON gracefully."""
-    from report_generate import normalize_openswath, SCHEMA_V2
-    import argparse
+def test_normalize_openswath_baseline_comparison():
+    """Two normalized OpenSwath runs get baseline selection and a comparison
+    table from the existing generic machinery - no OpenSwath-specific code."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
+        for rid, at, wall in (("100", "2026-08-26T18:40:29Z", 2.76),
+                              ("200", "2026-08-27T18:40:29Z", 3.10)):
+            raw_path = os.path.join(tmpdir, f"raw-{rid}.json")
+            _write_raw_openswath(raw_path, rid, at, wall=wall)
+            normalize_openswath(_normalize_args(raw_path, rid, tmpdir))
 
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=sha123\n")
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\t0\t3.00\t5.00\t50000\tpass\t\n")
-        # No featureXML, no output.json
+        runs, tools = load_results(tmpdir)
+        assert len(runs) == 2 and not tools
+        current = runs[-1]                     # newest by run_at
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "100" and _run_id(current) == "200"
 
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="minimal",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
+        shared = _discover_shared_metrics(current, baseline)
+        assert "stage.openswath_workflow.wall_time_s" in shared
+        assert "correctness.actual_features" in shared
+        assert "build.wall_time_s" in shared
 
-        with open(out_path) as f:
-            result = json.load(f)
-
-        assert result["schema"] == SCHEMA_V2
-        assert result["correctness"]["actual_features"] == 0
-        assert result["correctness"]["features_match"] is False
-        assert result["correctness"]["overall_quality_sum"] == 0
-        assert result["correctness"]["total_intensity"] == 0
-        assert result["correctness"]["qc_charge_distribution"] == []
-        print("  PASS: normalize_openswath missing files")
+        out_path = os.path.join(tmpdir, "report.html")
+        import datetime as _dt
+        render(current, baseline, runs, tools, out_path,
+               _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as fh:
+            html = fh.read()
+        assert "openswath_dia" in html
+        assert "openswath_workflow" in html
+        assert "Correctness" in html and "features_match" in html
+        assert "current vs previous run" in html
+        assert "32995654115" not in html  # synthetic ids only
+        print("  PASS: normalize openswath baseline comparison end-to-end")
     finally:
         shutil.rmtree(tmpdir)
 
 
-def test_normalize_openswath_required_stage_fail():
-    """normalize_openswath should set verdict=fail when a required stage fails."""
-    from report_generate import normalize_openswath
-    import argparse
+def test_normalize_openswath_missing_correctness_defaults():
+    """Adapted from PR #1's test_normalize_openswath_missing_files: a raw result
+    without correctness/tool_versions blocks normalizes with empty defaults
+    instead of crashing (promised by the current raw-JSON implementation)."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "MIN", "2026-08-26T18:40:29Z")
+        raw.pop("correctness")
+        raw.pop("tool_versions")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "MIN", tmpdir))
 
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=sha456\n")
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\t1\t1.00\t0.50\t1000\tfail\tcrashed\n")
-
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="fail-case",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        with open(out_path) as f:
-            result = json.load(f)
-        assert result["metrics"]["verdict"] == "fail"
-        assert result["performance"]["stages"][0]["status"] == "fail"
-        print("  PASS: normalize_openswath required stage fail")
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-MIN.json")
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["schema"] == "openms-benchmarking/report/v2"
+        assert out["correctness"] == {}
+        assert out["tool_versions"] == {}
+        assert out["metrics"]["verdict"] == "pass"
+        print("  PASS: normalize openswath missing correctness/tool_versions -> empty defaults")
     finally:
         shutil.rmtree(tmpdir)
 
 
-def test_normalize_openswath_missing_stages():
-    """Missing stages.tsv must produce verdict=fail, not pass."""
-    from report_generate import normalize_openswath
-    import argparse
+def test_normalize_openswath_missing_or_empty_stages():
+    """Adapted from PR #1's test_normalize_openswath_missing_stages/_empty_stages:
+    missing or empty stage lists must not crash and must aggregate to zero,
+    with verdict taken from the raw payload (default 'unknown')."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
-        # No stages.tsv at all
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=sha789\n")
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "NOSTAGE", "2026-08-26T18:40:29Z")
+        raw.pop("stages")
+        raw.pop("verdict")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "NOSTAGE", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-NOSTAGE.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["performance"]["stages"] == []
+        assert out["performance"]["wall_time_s"] == 0
+        assert out["performance"]["cpu_time_s"] == 0
+        assert out["performance"]["peak_rss_kb"] == 0
+        assert out["metrics"]["verdict"] == "unknown"
 
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="no-stages",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        with open(out_path) as f:
-            result = json.load(f)
-        assert result["metrics"]["verdict"] == "fail", (
-            f"verdict should be 'fail' for missing stages, got '{result['metrics']['verdict']}'"
-        )
-        assert result["performance"]["stages"] == []
-        assert result["performance"]["wall_time_s"] == 0
-        assert result["performance"]["peak_rss_kb"] == 0
-        print("  PASS: normalize_openswath missing stages")
+        raw2_path = os.path.join(tmpdir, "openswath-empty.json")
+        raw2 = _write_raw_openswath(raw2_path, "EMPTYSTAGE", "2026-08-26T18:40:29Z")
+        raw2["stages"] = []
+        with open(raw2_path, "w", encoding="utf-8") as fh:
+            json.dump(raw2, fh)
+        normalize_openswath(_normalize_args(raw2_path, "EMPTYSTAGE", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-EMPTYSTAGE.json"), encoding="utf-8") as fh:
+            out2 = json.load(fh)
+        assert out2["performance"]["stages"] == []
+        assert out2["performance"]["wall_time_s"] == 0
+        print("  PASS: normalize openswath missing/empty stages -> zero aggregates")
     finally:
         shutil.rmtree(tmpdir)
 
 
-def test_normalize_openswath_empty_stages():
-    """Empty stages.tsv (header only or blank) must produce verdict=fail."""
-    from report_generate import normalize_openswath
-    import argparse
+def test_normalize_openswath_failure_propagation():
+    """Adapted from PR #1's test_normalize_openswath_required_stage_fail: a failing
+    required stage and a fail verdict must survive normalization unchanged."""
     tmpdir = tempfile.mkdtemp()
     try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
-        # stages.tsv exists but is empty
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("")
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=sha000\n")
-
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="empty-stages",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        with open(out_path) as f:
-            result = json.load(f)
-        assert result["metrics"]["verdict"] == "fail", (
-            f"verdict should be 'fail' for empty stages, got '{result['metrics']['verdict']}'"
-        )
-        assert result["performance"]["stages"] == []
-        print("  PASS: normalize_openswath empty stages")
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "FAILRUN", "2026-08-26T18:40:29Z",
+                                   wall=0.5, verdict="fail")
+        raw["stages"][0]["status"] = "fail"
+        raw["stages"][0]["exit_code"] = 1
+        raw["stages"][0]["reason"] = "crashed"
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "FAILRUN", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-FAILRUN.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["metrics"]["verdict"] == "fail"
+        st = out["performance"]["stages"][0]
+        assert st["status"] == "fail" and st["exit_code"] == 1
+        assert st["reason"] == "crashed"
+        assert out["performance"]["wall_time_s"] == 0.5
+        print("  PASS: normalize openswath failure propagation")
     finally:
         shutil.rmtree(tmpdir)
-
-
-def test_normalize_openswath_partial_tsv_rows():
-    """Partial TSV rows with empty numeric fields should not crash."""
-    from report_generate import normalize_openswath
-    import argparse
-    tmpdir = tempfile.mkdtemp()
-    try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=shaPartial\n")
-        # Stage with empty exit_code, wall_time, cpu_time, peak_rss
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\t\t\t\t\tpass\t\n")
-
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="partial-tsv",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        with open(out_path) as f:
-            result = json.load(f)
-        stage = result["performance"]["stages"][0]
-        assert stage["exit_code"] == 0, f"expected exit_code=0, got {stage['exit_code']}"
-        assert stage["wall_time_s"] == 0.0, f"expected wall_time_s=0.0, got {stage['wall_time_s']}"
-        assert stage["cpu_time_s"] == 0.0, f"expected cpu_time_s=0.0, got {stage['cpu_time_s']}"
-        assert stage["peak_rss_kb"] == 0, f"expected peak_rss_kb=0, got {stage['peak_rss_kb']}"
-        assert stage["status"] == "pass"
-        assert result["metrics"]["verdict"] == "pass"
-        assert result["performance"]["wall_time_s"] == 0.0
-        print("  PASS: normalize_openswath partial TSV rows")
-    finally:
-        shutil.rmtree(tmpdir)
-
-
-def test_normalize_openswath_malformed_numeric():
-    """Non-numeric values in numeric TSV columns should default to 0, not crash."""
-    from report_generate import normalize_openswath
-    import argparse
-    tmpdir = tempfile.mkdtemp()
-    try:
-        raw_dir = os.path.join(tmpdir, "raw")
-        os.makedirs(raw_dir)
-        with open(os.path.join(raw_dir, "meta.txt"), "w") as f:
-            f.write("openms_sha=shaBad\n")
-        # Malformed numeric fields
-        with open(os.path.join(raw_dir, "stages.tsv"), "w") as f:
-            f.write("openswath_workflow\ttrue\tN/A\tnot-a-number\t\tabc\tpass\t\n")
-
-        out_path = os.path.join(tmpdir, "result.json")
-        args = argparse.Namespace(
-            run_id="malformed",
-            cache="none",
-            run_at="",
-            dataset="",
-            results_dir=raw_dir,
-            out=out_path,
-        )
-        normalize_openswath(args)
-
-        with open(out_path) as f:
-            result = json.load(f)
-        stage = result["performance"]["stages"][0]
-        assert stage["exit_code"] == 0, f"expected exit_code=0 for 'N/A', got {stage['exit_code']}"
-        assert stage["wall_time_s"] == 0.0, f"expected wall_time_s=0.0 for 'not-a-number', got {stage['wall_time_s']}"
-        assert stage["peak_rss_kb"] == 0, f"expected peak_rss_kb=0 for 'abc', got {stage['peak_rss_kb']}"
-        assert stage["status"] == "pass"
-        assert result["metrics"]["verdict"] == "pass"
-        print("  PASS: normalize_openswath malformed numeric")
-    finally:
-        shutil.rmtree(tmpdir)
-
 
 def main():
     print("Running generic renderer tests...\n")
@@ -1018,14 +913,12 @@ def main():
         test_smoke_comparison_shows_stage_data,
         test_stage_regression_detection,
         test_proteobench_no_spurious_stage_keys,
-        test_normalize_openswath_basic,
-        test_normalize_openswath_loads_via_load_results,
-        test_normalize_openswath_missing_files,
-        test_normalize_openswath_required_stage_fail,
-        test_normalize_openswath_missing_stages,
-        test_normalize_openswath_empty_stages,
-        test_normalize_openswath_partial_tsv_rows,
-        test_normalize_openswath_malformed_numeric,
+        test_normalize_openswath_to_v2,
+        test_normalize_openswath_rejects_nonfinite,
+        test_normalize_openswath_baseline_comparison,
+        test_normalize_openswath_missing_correctness_defaults,
+        test_normalize_openswath_missing_or_empty_stages,
+        test_normalize_openswath_failure_propagation,
     ]
     passed = 0
     failed = 0

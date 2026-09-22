@@ -9,7 +9,7 @@
     "benchmark/fixtures/OpenSwathWorkflow_1_input.trafoXML"
   ],
   "normalization": {
-    "script": "benchmark/run_openswath_benchmark.sh",
-    "note": "inline Python in runner script (lines 100-160)"
+    "script": "benchmark/report/report_generate.py",
+    "function": "normalize_openswath"
   }
 }

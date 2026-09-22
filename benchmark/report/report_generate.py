@@ -37,13 +37,15 @@ Subcommands:
                     [--run-at ISO8601] [--out PATH]
         Convert a raw CI smoke.json into a normalized OpenMS run result.
 
+    normalize openswath <openswath.json> --run-id ID
+                    --build-time SECONDS --artifact-bytes N
+                    [--cache cold|warm|none] [--run-at ISO8601] [--out PATH]
+        Convert a raw CI openswath.json (OpenSwath DIA benchmark) into a
+        normalized OpenMS run result.  Correctness metrics from the raw result
+        are carried into the v2 correctness section unchanged.
+
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
         Convert a local ProteoBench scoring result into a tool result.
-
-    normalize openswath --run-id ID [--cache cold|warm|none] [--results-dir DIR] [--out PATH]
-        Convert raw OpenSwath benchmark output into a normalized v2 OpenMS run result.
-        Reads stages.tsv, meta.txt, output.featureXML, and output.json from the
-        raw results directory.
 
     render [--results-dir DIR] [--current PATH] [--out report.html]
         Discover all results, compare the current run against the stored
@@ -56,10 +58,10 @@ import datetime as _dt
 import glob
 import html
 import json
+import math
 import os
 import re
 import sys
-import xml.etree.ElementTree as ET
 
 SCHEMA_V1 = "openms-benchmarking/report/v1"
 SCHEMA_V2 = "openms-benchmarking/report/v2"
@@ -275,6 +277,9 @@ def _promote_v1(data):
     # Carry over correctness for OpenSwath-like results
     if data.get("correctness"):
         promoted["correctness"] = data["correctness"]
+    # Carry over tool_versions for pipeline results
+    if data.get("tool_versions"):
+        promoted["tool_versions"] = data["tool_versions"]
     # Carry over openms metrics that aren't verdict
     if data.get("metrics"):
         promoted["metrics"].update(data["metrics"])
@@ -637,7 +642,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             <th class="num">Δ</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
-          {cache_note}
+{'          ' + cache_note if cache_note else ''}
           <div class="note">Baseline = previous OpenMS run of the same benchmark
           ({esc(baseline.get('_file', ''))}). Only metrics present in both runs are
           compared.</div>
@@ -654,6 +659,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             build_s = _build(r).get("wall_time_s")
             hist += (
                 f"<tr><td class='mono'>{esc(_run_id(r))}</td>"
+                f"<td>{esc(_benchmark_name(r))}</td>"
                 f"<td>{esc(_run_at(r))}</td>"
                 f"<td class='mono'>{esc(short_sha(_software_version(r)))}</td>"
                 f"<td>{_chip(r_cache, {'cold': 'warn', 'warm': 'ok', 'none': 'neutral'}.get(r_cache, 'neutral'))}</td>"
@@ -663,7 +669,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
         history_section = f"""
         <div class="card"><h2>Run history</h2><div class="inner">
           <table>
-            <thead><tr><th>Run</th><th>Run at</th><th>SHA</th><th>Cache</th>
+            <thead><tr><th>Run</th><th>Benchmark</th><th>Run at</th><th>SHA</th><th>Cache</th>
             <th>Verdict</th><th class="num">Build time</th></tr></thead>
             <tbody>{hist}</tbody>
           </table>
@@ -774,6 +780,7 @@ def normalize_smoke(args):
         "metrics": {
             "verdict": raw.get("verdict", "unknown"),
         },
+        "tool_versions": raw.get("tool_versions", {}),
     }
     # default output path
     out_path = args.out or os.path.join(
@@ -786,208 +793,73 @@ def normalize_smoke(args):
     print(f"normalized OpenMS run result -> {out_path}")
 
 
-def normalize_proteobench(args):
-    """Convert a local ProteoBench scoring JSON into a normalized v2 tool result."""
-    with open(args.pb_json, encoding="utf-8") as fh:
-        raw = json.load(fh)
-    hm = raw.get("headline_metrics") or {}
-    metrics = {
-        "quantified_precursors": hm.get("nr_feature"),
-        "median_abs_epsilon": hm.get("median_abs_epsilon_global"),
-        "mean_abs_epsilon": hm.get("mean_abs_epsilon_global"),
-        "cv_median": hm.get("CV_median"),
-        "roc_auc": hm.get("roc_auc"),
-    }
-    metrics = {k: v for k, v in metrics.items() if v is not None}
-    ui = raw.get("user_input") or {}
-    dataset = args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown"
-    # v2 schema only — no duplicate v1 fields
-    out = {
-        "schema": SCHEMA_V2,
-        "identity": {
-            "benchmark": "proteobench",
-            "benchmark_version": 1,
-            "dataset": dataset,
-            "software": {
-                "name": ui.get("software_name", "?"),
-                "version": ui.get("software_version", "?"),
-            },
-            "configuration": {
-                "search_engine": ui.get("search_engine", "?"),
-                "search_engine_version": ui.get("search_engine_version", "?"),
-            },
-        },
-        "run": {
-            "run_id": args.label or raw.get("module_id", "proteobench"),
-            "run_at": raw.get("scored_at", ""),
-        },
-        "metrics": metrics,
-        "tool": {
-            "name": ui.get("software_name", "?"),
-            "version": ui.get("software_version", "?"),
-            "search_engine": ui.get("search_engine", "?"),
-            "search_engine_version": ui.get("search_engine_version", "?"),
-        },
-        "proteobench": {
-            "version": raw.get("proteobench_version", "?"),
-            "module": raw.get("module_id", "?"),
-            "input_format": raw.get("input_format", "?"),
-            "intermediate_hash": raw.get("intermediate_hash", ""),
-        },
-    }
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", args.label or "result").strip("-")
-    out_path = args.out or os.path.join(
-        args.results_dir, "proteobench", "reference", f"proteobench-{safe}.json"
-    )
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(out, fh, indent=2)
-    print(f"normalized tool result -> {out_path}")
-
-
 def normalize_openswath(args):
-    """Convert raw OpenSwath benchmark output into a normalized v2 OpenMS run result.
-
-    Reads stages.tsv, meta.txt, output.featureXML, and output.json from the
-    results directory produced by run_openswath_benchmark.sh and writes a v2
-    canonical result JSON.
-    """
-    results_dir = args.results_dir
-
-    # Read meta
-    meta = {}
-    meta_path = os.path.join(results_dir, "meta.txt")
-    if os.path.exists(meta_path):
-        with open(meta_path) as fh:
-            for line in fh:
-                if "=" in line:
-                    k, _, v = line.partition("=")
-                    meta[k.strip()] = v.strip()
-
-    # Read stages
+    """Convert a raw CI openswath.json into a normalized v2 OpenMS run result."""
+    with open(args.openswath_json, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    if not args.build_time or not args.artifact_bytes or not args.run_id:
+        sys.exit("normalize openswath needs --run-id, --build-time and --artifact-bytes")
     stages = []
-    stages_path = os.path.join(results_dir, "stages.tsv")
-    if os.path.exists(stages_path):
-        with open(stages_path) as fh:
-            for row in csv.reader(fh, delimiter="\t"):
-                if not row:
-                    continue
-                name, required, rc, wall, cpu, peak, status, reason = (row + [""] * 8)[:8]
-                try:
-                    exit_code = int(rc)
-                except (ValueError, TypeError):
-                    exit_code = 0
-                try:
-                    wall_time = float(wall)
-                except (ValueError, TypeError):
-                    wall_time = 0.0
-                try:
-                    cpu_time = float(cpu)
-                except (ValueError, TypeError):
-                    cpu_time = 0.0
-                try:
-                    peak_rss = int(peak)
-                except (ValueError, TypeError):
-                    peak_rss = 0
-                stages.append({
-                    "name": name,
-                    "required": required == "true",
-                    "exit_code": exit_code,
-                    "wall_time_s": wall_time,
-                    "cpu_time_s": cpu_time,
-                    "peak_rss_kb": peak_rss,
-                    "status": status,
-                    "reason": reason,
-                })
-
-    # Parse featureXML for correctness metrics
-    feature_count = 0
-    overall_qualities = []
-    intensities = []
-    featurexml_path = os.path.join(results_dir, "output.featureXML")
-    if os.path.exists(featurexml_path):
-        tree = ET.parse(featurexml_path)
-        root = tree.getroot()
-        # featureList may be the root element or a child of featureMap
-        feature_list = root if root.tag == "featureList" else root.find("featureList")
-        if feature_list is not None:
-            features = feature_list.findall("feature")
-            feature_count = len(features)
-            for feat in features:
-                oq = feat.find("overallquality")
-                if oq is not None and oq.text:
-                    try:
-                        overall_qualities.append(float(oq.text))
-                    except ValueError:
-                        pass
-                intensity = feat.find("intensity")
-                if intensity is not None and intensity.text:
-                    try:
-                        intensities.append(float(intensity.text))
-                    except ValueError:
-                        pass
-
-    # Parse QC JSON
-    qc_metrics = {}
-    qc_path = os.path.join(results_dir, "output.json")
-    if os.path.exists(qc_path):
-        with open(qc_path) as fh:
-            qc_metrics = json.load(fh)
-
-    # Empty/missing stages are never a pass — all([]) is True, but a
-    # benchmark with no stages did not run successfully.
-    if not stages:
-        verdict = "fail"
-    else:
-        required_ok = all(s["status"] == "pass" for s in stages if s["required"])
-        verdict = "pass" if required_ok else "fail"
-
-    # v2 schema — no duplicate v1 fields
+    for st in raw.get("stages", []):
+        for key in ("wall_time_s", "cpu_time_s"):
+            val = st.get(key)
+            if val is not None and not math.isfinite(float(val)):
+                sys.exit(f"stage {st.get('name', '?')!r}: non-finite {key}; refusing to normalize")
+        peak = st.get("peak_rss_kb")
+        if peak is not None and not math.isfinite(float(peak)):
+            sys.exit(f"stage {st.get('name', '?')!r}: non-finite peak_rss_kb; refusing to normalize")
+        stages.append({
+            "name": st.get("name"),
+            "required": bool(st.get("required")),
+            "exit_code": st.get("exit_code"),
+            "wall_time_s": st.get("wall_time_s"),
+            "cpu_time_s": st.get("cpu_time_s"),
+            "peak_rss_kb": st.get("peak_rss_kb"),
+            "status": st.get("status"),
+            "reason": st.get("reason", ""),
+        })
+    benchmark = raw.get("benchmark", "openswath")
     out = {
         "schema": SCHEMA_V2,
         "identity": {
-            "benchmark": "openswath_dia",
-            "dataset": args.dataset or "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+            "benchmark": benchmark,
+            "benchmark_version": raw.get("milestone", 1),
+            "dataset": args.dataset or raw.get("dataset", "OpenSwath DIA fixture"),
             "software": {
                 "name": "OpenMS",
-                "version": meta.get("openms_sha", ""),
+                "version": raw.get("openms_sha", ""),
             },
             "configuration": {},
         },
         "run": {
             "run_id": args.run_id,
-            "run_at": args.run_at or "",
-            "cache": args.cache or "unknown",
+            "run_at": args.run_at or raw.get("run_at", ""),
+            "cache": args.cache or raw.get("cache", "unknown"),
         },
         "performance": {
             "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
             "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
             "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
-            "build": {},
+            "build": {
+                "wall_time_s": float(args.build_time),
+                "artifact_bytes": int(args.artifact_bytes),
+            },
             "stages": stages,
         },
         "metrics": {
-            "verdict": verdict,
+            "verdict": raw.get("verdict", "unknown"),
         },
-        "correctness": {
-            "expected_features": 6,
-            "actual_features": feature_count,
-            "features_match": feature_count == 6,
-            "overall_quality_sum": round(sum(overall_qualities), 6) if overall_qualities else 0,
-            "total_intensity": round(sum(intensities), 2) if intensities else 0,
-            "qc_charge_distribution": qc_metrics.get("ChargeDistributionMS1", []),
-        },
+        "correctness": raw.get("correctness", {}),
+        "tool_versions": raw.get("tool_versions", {}),
     }
-
-    # default output path — inside --results-dir so CI artifact upload captures it
     out_path = args.out or os.path.join(
-        args.results_dir, "openswath", "openms",
-        f"openswath-{args.run_id}.json"
+        args.results_dir, benchmark, "openms",
+        f"{benchmark}-{args.run_id}.json"
     )
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(out, fh, indent=2)
-    print(f"normalized OpenSwath run result -> {out_path}")
+    print(f"normalized OpenMS run result -> {out_path}")
 
 
 def normalize_prose_peptdeep(args):
@@ -1113,6 +985,65 @@ def normalize_prose_peptdeep(args):
     print(f"normalized ProSE+PeptDeep run result -> {out_path}")
 
 
+def normalize_proteobench(args):
+    """Convert a local ProteoBench scoring JSON into a normalized v2 tool result."""
+    with open(args.pb_json, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    hm = raw.get("headline_metrics") or {}
+    metrics = {
+        "quantified_precursors": hm.get("nr_feature"),
+        "median_abs_epsilon": hm.get("median_abs_epsilon_global"),
+        "mean_abs_epsilon": hm.get("mean_abs_epsilon_global"),
+        "cv_median": hm.get("CV_median"),
+        "roc_auc": hm.get("roc_auc"),
+    }
+    metrics = {k: v for k, v in metrics.items() if v is not None}
+    ui = raw.get("user_input") or {}
+    dataset = args.dataset or (raw.get("input_file") or "").split(".")[0] or "unknown"
+    # v2 schema only — no duplicate v1 fields
+    out = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": "proteobench",
+            "benchmark_version": 1,
+            "dataset": dataset,
+            "software": {
+                "name": ui.get("software_name", "?"),
+                "version": ui.get("software_version", "?"),
+            },
+            "configuration": {
+                "search_engine": ui.get("search_engine", "?"),
+                "search_engine_version": ui.get("search_engine_version", "?"),
+            },
+        },
+        "run": {
+            "run_id": args.label or raw.get("module_id", "proteobench"),
+            "run_at": raw.get("scored_at", ""),
+        },
+        "metrics": metrics,
+        "tool": {
+            "name": ui.get("software_name", "?"),
+            "version": ui.get("software_version", "?"),
+            "search_engine": ui.get("search_engine", "?"),
+            "search_engine_version": ui.get("search_engine_version", "?"),
+        },
+        "proteobench": {
+            "version": raw.get("proteobench_version", "?"),
+            "module": raw.get("module_id", "?"),
+            "input_format": raw.get("input_format", "?"),
+            "intermediate_hash": raw.get("intermediate_hash", ""),
+        },
+    }
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", args.label or "result").strip("-")
+    out_path = args.out or os.path.join(
+        args.results_dir, "proteobench", "reference", f"proteobench-{safe}.json"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"normalized tool result -> {out_path}")
+
+
 def render_cmd(args):
     results_dir = args.results_dir
     openms_runs, tool_results = load_results(results_dir)
@@ -1157,6 +1088,21 @@ def main():
     ps.add_argument("--out")
     ps.set_defaults(fn=normalize_smoke)
 
+    po = pn.add_parser("openswath", help="normalize a CI openswath.json (OpenSwath DIA benchmark)")
+    po.add_argument("openswath_json")
+    po.add_argument("--run-id", required=True)
+    po.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="",
+                    help="override the cache state (default: value recorded in the raw result)")
+    po.add_argument("--build-time", type=float, required=True)
+    po.add_argument("--artifact-bytes", type=int, required=True)
+    po.add_argument("--run-at", default="",
+                    help="override the run timestamp (default: value recorded in the raw result)")
+    po.add_argument("--dataset", default="",
+                    help="override the dataset label (default: value recorded in the raw result)")
+    po.add_argument("--results-dir", default="benchmark/results")
+    po.add_argument("--out")
+    po.set_defaults(fn=normalize_openswath)
+
     pp = pn.add_parser("proteobench", help="normalize a local ProteoBench scoring JSON")
     pp.add_argument("pb_json")
     pp.add_argument("--label", required=True)
@@ -1165,17 +1111,6 @@ def main():
     pp.add_argument("--results-dir", default="benchmark/results")
     pp.add_argument("--out")
     pp.set_defaults(fn=normalize_proteobench)
-
-    po = pn.add_parser("openswath", help="normalize raw OpenSwath benchmark output into v2")
-    po.add_argument("--run-id", required=True)
-    po.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="unknown")
-    po.add_argument("--run-at", default="")
-    po.add_argument("--dataset", default="",
-                    help="what was benchmarked (default: OpenSwathWorkflow_1 fixture)")
-    po.add_argument("--results-dir", required=True,
-                    help="raw results directory from run_openswath_benchmark.sh")
-    po.add_argument("--out")
-    po.set_defaults(fn=normalize_openswath)
 
     pr = pn.add_parser("prose-peptdeep", help="normalize raw ProSE+PeptDeep benchmark output into v2")
     pr.add_argument("--run-id", required=True)
