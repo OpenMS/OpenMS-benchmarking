@@ -84,7 +84,9 @@ jobs:
             # triplet is dynamic (the builtin x64-linux triplet is static,
             # which cannot link libOpenMS as a shared library), and upstream
             # sets BOOST_USE_STATIC=OFF with it.
-            echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF" >> "$GITHUB_ENV"
+          # wnetalign: WITH_WNETALIGN defaults ON upstream; its vcpkg branch find_path()s headers
+          # provided only by the wnetalign manifest feature (same feature upstream CI presets set).
+          echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF -DVCPKG_MANIFEST_FEATURES=wnetalign" >> "$GITHUB_ENV"
             echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
           else
             echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
@@ -408,7 +410,9 @@ jobs:
             echo "Dependency model: legacy (deps script installs libraries via apt)"
           elif [[ "$capable" == true ]]; then
             echo "model=vcpkg" >> "$GITHUB_OUTPUT"
-            echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF" >> "$GITHUB_ENV"
+          # onnxruntime: the vcpkg branch of CMakeLists uses find_package(onnxruntime CONFIG REQUIRED),
+          # satisfied by the onnxruntime overlay port via its manifest feature (tarball flags are unused).
+          echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF -DVCPKG_MANIFEST_FEATURES=wnetalign;onnxruntime" >> "$GITHUB_ENV"
             echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
           else
             echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
