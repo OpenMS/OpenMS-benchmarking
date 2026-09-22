@@ -266,7 +266,7 @@ jobs:
         id: artifact-size
         shell: bash
         run: |
-          bytes=$(du -sb openms/build/bin openms/build/lib openms/build/vcpkg_installed/x64-linux-dynamic/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
+          bytes=$(du -sb openms/build/bin openms/build/lib $( [ -d openms/build/vcpkg_installed/x64-linux-dynamic/lib ] && printf '%s ' openms/build/vcpkg_installed/x64-linux-dynamic/lib ) openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
 
       - name: Normalize smoke results to v2
@@ -325,7 +325,7 @@ jobs:
         id: artifact-size
         shell: bash
         run: |
-          bytes=$(du -sb openms/build/bin openms/build/lib openms/build/vcpkg_installed/x64-linux-dynamic/lib openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
+          bytes=$(du -sb openms/build/bin openms/build/lib $( [ -d openms/build/vcpkg_installed/x64-linux-dynamic/lib ] && printf '%s ' openms/build/vcpkg_installed/x64-linux-dynamic/lib ) openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
 
       # Main's normalize contract: raw CI openswath.json (v1) + required
