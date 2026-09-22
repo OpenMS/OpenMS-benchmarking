@@ -410,9 +410,13 @@ jobs:
             echo "Dependency model: legacy (deps script installs libraries via apt)"
           elif [[ "$capable" == true ]]; then
             echo "model=vcpkg" >> "$GITHUB_OUTPUT"
-          # onnxruntime: the vcpkg branch of CMakeLists uses find_package(onnxruntime CONFIG REQUIRED),
-          # satisfied by the onnxruntime overlay port via its manifest feature (tarball flags are unused).
-          echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF -DVCPKG_MANIFEST_FEATURES=wnetalign;onnxruntime" >> "$GITHUB_ENV"
+          # onnxruntime: deliberately NOT a vcpkg feature - the overlay port builds ORT
+          # from source (dbg+rel), which exhausted the runner disk and the 90-minute
+          # budget (runs 35700644257, 35713031426, 35736568407). find_package(onnxruntime
+          # CONFIG REQUIRED) instead resolves the pinned prebuilt release archive via
+          # -Donnxruntime_DIR (staged in the download step for the config package's
+          # lib64 / include-onnxruntime layout). wnetalign stays: WITH_WNETALIGN defaults ON.
+          echo "OPENMS_CMAKE_VCPKG_ARGS=-DOPENMS_USE_VCPKG=ON -DVCPKG_TARGET_TRIPLET=x64-linux-dynamic -DBOOST_USE_STATIC=OFF -DVCPKG_MANIFEST_FEATURES=wnetalign" >> "$GITHUB_ENV"
             echo "Dependency model: vcpkg manifest (deps script installs no libraries)"
           else
             echo "::error::OpenMS at ${{ steps.sha.outputs.sha }} neither installs libraries via tools/ci/deps-ubuntu.sh nor ships the vcpkg mechanism (vcpkg.json / OPENMS_USE_VCPKG in CMakeLists.txt / vcpkg submodule in .gitmodules). No workable dependency model for this SHA." >&2
@@ -526,13 +530,24 @@ jobs:
             https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
           echo "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b  $RUNNER_TEMP/ort.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP/ort" --strip-components=1
+          # Stage a config-package-compatible prefix: the release archive ships lib/ and
+          # include/, but its generated onnxruntimeConfig.cmake references lib64/ and
+          # include/onnxruntime/ (vcpkg-style layout) - re-layout so the CONFIG search
+          # resolves real paths. The raw extraction stays in ort/ for the legacy-model
+          # flags and the runtime-lib bundling step.
+          O="$RUNNER_TEMP/ort-prefix"
+          mkdir -p "$O/lib64" "$O/lib/cmake/onnxruntime" "$O/include/onnxruntime"
+          cp -a "$RUNNER_TEMP/ort/lib/libonnxruntime"* "$O/lib64/"
+          cp -a "$RUNNER_TEMP/ort/lib/cmake/onnxruntime/." "$O/lib/cmake/onnxruntime/"
+          cp -a "$RUNNER_TEMP/ort/include/." "$O/include/onnxruntime/"
 
       # WITH_THERMO_RAW=OFF: vendor .raw reading needs the .NET SDK and is
       # irrelevant for mzML inputs. WITH_ONNX=ON makes configure download the
       # three PeptDeep models from archive.openms.de and verify their pinned
       # SHA256s (configure fails hard on mismatch). Legacy model links Arrow
       # from the micromamba prefix via OPENMS_ONNX_MODEL_FLAGS; vcpkg model
-      # links it from the manifest via OPENMS_CMAKE_VCPKG_ARGS.
+      # links it from the manifest via OPENMS_CMAKE_VCPKG_ARGS, and ORT from the
+      # staged prebuilt release archive via -Donnxruntime_DIR (CONFIG mode).
       - name: Configure (Release, Ninja, ONNX)
         shell: bash
         env:
@@ -549,6 +564,7 @@ jobs:
             -DWITH_ONNX=ON \
             -DONNXRuntime_INCLUDE_DIR="$RUNNER_TEMP/ort/include" \
             -DONNXRuntime_LIBRARY="$RUNNER_TEMP/ort/lib/libonnxruntime.so" \
+            -Donnxruntime_DIR="$RUNNER_TEMP/ort-prefix/lib/cmake/onnxruntime" \
             -DSEARCH_ENGINES_DIRECTORY="$SEARCH_ENGINES_DIRECTORY" \
             $OPENMS_CMAKE_VCPKG_ARGS \
             $OPENMS_ONNX_MODEL_FLAGS
