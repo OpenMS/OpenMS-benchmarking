@@ -31,6 +31,7 @@ jobs:
     outputs:
       openms_sha: ${{ steps.sha.outputs.sha }}
       build_minutes: ${{ steps.build.outputs.minutes }}
+      vcpkg_cache_restored: ${{ steps.vcpkg-cache.outputs.cache-hit != '' && steps.vcpkg-cache.outputs.cache-hit == 'true' }}
     steps:
       - name: Checkout OpenMS at pinned SHA
         uses: actions/checkout@v6
@@ -137,6 +138,7 @@ jobs:
       # restore-key fallback is safe because vcpkg binary caches are
       # content-addressed per port (stale entries are simply unused).
       - name: Restore vcpkg binary cache
+        id: vcpkg-cache
         if: steps.depmodel.outputs.model == 'vcpkg'
         uses: actions/cache@v5
         with:
@@ -144,6 +146,41 @@ jobs:
           key: openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
             openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      # Cold-cache fallback: OpenMS publishes its own vcpkg binary cache at
+      # archive.openms.de under the SAME manifest hash our cache key computes
+      # (hashFiles over the OpenMS checkout = sha256 of the concatenated
+      # per-file sha256 digests). Seeding the files-cache dir from it turns a
+      # ~90 min from-source provisioning into minutes. Sharded zips are
+      # content-addressed, so seeding is safe; misses simply build from source.
+      - name: Seed vcpkg cache from upstream archive (on miss)
+        if: steps.depmodel.outputs.model == 'vcpkg' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_hash="${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}"
+          base="https://archive.openms.de/openms/vcpkg-cache/Linux-X64-g++-vcpkg-${manifest_hash}"
+          if ! curl -fsSL --max-time 30 "${base}/" -o /tmp/upstream-index.html 2>/dev/null; then
+            echo "upstream vcpkg cache not reachable (continuing without seed)"
+            exit 0
+          fi
+          shards=$(grep -oE 'href="[0-9a-f]{2}/"' /tmp/upstream-index.html | sed 's/href="\(.*\)"/\1/' | tr -d '/' | sort -u)
+          if [ -z "$shards" ]; then
+            echo "upstream cache layout unexpected (no shards found); continuing without seed"
+            exit 0
+          fi
+          for shard in $shards; do
+            curl -fsSL --max-time 30 "${base}/${shard}/" -o "/tmp/shard-${shard}.html" || continue
+            zips=$(grep -oE 'href="[0-9a-f]{64}\.zip"' "/tmp/shard-${shard}.html" | sed 's/href="\(.*\)"/\1/')
+            for zip_name in $zips; do
+              dest="$GITHUB_WORKSPACE/.vcpkg-cache/${shard}"
+              mkdir -p "$dest"
+              curl -fsSL --retry 2 -o "${dest}/${zip_name}" "${base}/${shard}/${zip_name}" || rm -f "${dest}/${zip_name}"
+            done
+            rm -f "/tmp/shard-${shard}.html"
+          done
+          seeded=$(find "$GITHUB_WORKSPACE/.vcpkg-cache" -name '*.zip' 2>/dev/null | wc -l)
+          echo "seeded ${seeded} vcpkg binary-cache zips from upstream archive"
 
       - name: Set up vcpkg
         if: steps.depmodel.outputs.model == 'vcpkg'
@@ -271,13 +308,27 @@ jobs:
           bytes=$(du -sb openms/build/bin openms/build/lib $( [ -d openms/build/vcpkg_installed/x64-linux-dynamic/lib ] && printf '%s ' openms/build/vcpkg_installed/x64-linux-dynamic/lib ) openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
 
+      # Real cache state: report "warm" only when the vcpkg binary cache was
+      # actually restored in the build job (legacy builds have no vcpkg cache
+      # and are recorded as "none", matching the previous hardcoding).
+      - name: Derive cache state
+        id: cache-state
+        shell: bash
+        run: |
+          cache="none"
+          if [ "${{ needs.build-openms.outputs.vcpkg_cache_restored }}" = "true" ]; then
+            cache="warm"
+          fi
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
+
       - name: Normalize smoke results to v2
         shell: bash
         run: |
           python benchmark/report/report_generate.py normalize smoke \
             results/smoke.json \
             --run-id "${{ github.run_id }}" \
-            --cache none \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache "${{ steps.cache-state.outputs.cache }}" \
             --build-time "$(echo '${{ needs.build-openms.outputs.build_minutes }} * 60' | bc)" \
             --artifact-bytes "${{ steps.artifact-size.outputs.bytes }}" \
             --results-dir results
@@ -333,13 +384,24 @@ jobs:
       # Main's normalize contract: raw CI openswath.json (v1) + required
       # build-time/artifact-bytes provenance, normalized output written into
       # the results dir and shipped in the artifact.
+      - name: Derive cache state
+        id: cache-state
+        shell: bash
+        run: |
+          cache="none"
+          if [ "${{ needs.build-openms.outputs.vcpkg_cache_restored }}" = "true" ]; then
+            cache="warm"
+          fi
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
+
       - name: Normalize OpenSwath results to v2
         shell: bash
         run: |
           python benchmark/report/report_generate.py normalize openswath \
             results-openswath/openswath.json \
             --run-id "${{ github.run_id }}" \
-            --cache none \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache "${{ steps.cache-state.outputs.cache }}" \
             --build-time "$(echo '${{ needs.build-openms.outputs.build_minutes }} * 60' | bc)" \
             --artifact-bytes "${{ steps.artifact-size.outputs.bytes }}" \
             --results-dir results-openswath
@@ -487,6 +549,7 @@ jobs:
 
       # ---- vcpkg dependency model (same mechanism as build-openms) ----------
       - name: Restore vcpkg binary cache (ONNX flavor)
+        id: vcpkg-cache
         if: steps.depmodel.outputs.model == 'vcpkg'
         uses: actions/cache@v5
         with:
@@ -494,6 +557,36 @@ jobs:
           key: openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
             openms-vcpkg-${{ runner.os }}-${{ runner.arch }}-
+
+      # Cold-cache fallback, identical to build-openms (see comment there).
+      - name: Seed vcpkg cache from upstream archive (on miss)
+        if: steps.depmodel.outputs.model == 'vcpkg' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_hash="${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}"
+          base="https://archive.openms.de/openms/vcpkg-cache/Linux-X64-g++-vcpkg-${manifest_hash}"
+          if ! curl -fsSL --max-time 30 "${base}/" -o /tmp/upstream-index.html 2>/dev/null; then
+            echo "upstream vcpkg cache not reachable (continuing without seed)"
+            exit 0
+          fi
+          shards=$(grep -oE 'href="[0-9a-f]{2}/"' /tmp/upstream-index.html | sed 's/href="\(.*\)"/\1/' | tr -d '/' | sort -u)
+          if [ -z "$shards" ]; then
+            echo "upstream cache layout unexpected (no shards found); continuing without seed"
+            exit 0
+          fi
+          for shard in $shards; do
+            curl -fsSL --max-time 30 "${base}/${shard}/" -o "/tmp/shard-${shard}.html" || continue
+            zips=$(grep -oE 'href="[0-9a-f]{64}\.zip"' "/tmp/shard-${shard}.html" | sed 's/href="\(.*\)"/\1/')
+            for zip_name in $zips; do
+              dest="$GITHUB_WORKSPACE/.vcpkg-cache/${shard}"
+              mkdir -p "$dest"
+              curl -fsSL --retry 2 -o "${dest}/${zip_name}" "${base}/${shard}/${zip_name}" || rm -f "${dest}/${zip_name}"
+            done
+            rm -f "/tmp/shard-${shard}.html"
+          done
+          seeded=$(find "$GITHUB_WORKSPACE/.vcpkg-cache" -name '*.zip' 2>/dev/null | wc -l)
+          echo "seeded ${seeded} vcpkg binary-cache zips from upstream archive"
 
       - name: Set up vcpkg
         if: steps.depmodel.outputs.model == 'vcpkg'
@@ -740,6 +833,7 @@ jobs:
         run: |
           python benchmark/report/report_generate.py normalize prose-peptdeep \
             --run-id "${{ github.run_id }}" \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --cache none \
             --results-dir results-prose
 
@@ -882,6 +976,7 @@ jobs:
         run: |
           python benchmark/report/report_generate.py normalize prose-peptdeep \
             --run-id "${{ github.run_id }}-A" \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --cache none \
             --results-dir results-prose-pxd028735-A
 
@@ -948,6 +1043,7 @@ jobs:
         run: |
           python benchmark/report/report_generate.py normalize prose-peptdeep \
             --run-id "${{ github.run_id }}-B" \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --cache none \
             --results-dir results-prose-pxd028735-B
 
@@ -959,3 +1055,71 @@ jobs:
             results-prose-pxd028735-A
             results-prose-pxd028735-B
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Render the combined report from every benchmark result of this run.
+  # Downloads the per-benchmark result artifacts, merges them into one results
+  # tree, renders report.html, uploads it as an artifact and writes the
+  # current-run verdict into the job summary.
+  # ---------------------------------------------------------------------------
+  render-report:
+    name: "Render combined report"
+    runs-on: ubuntu-24.04
+    needs:
+      - build-openms
+      - run-smoke-benchmark
+      - run-openswath-benchmark
+      - run-prose-peptdeep-benchmark
+      - run-prose-pxd028735-benchmark
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      - name: Download benchmark result artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: benchmark-*-${{ needs.build-openms.outputs.openms_sha }}
+          merge-multiple: true
+          path: results
+
+      - name: Render combined report
+        id: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          python benchmark/report/report_generate.py render \
+            --results-dir results \
+            --out benchmark/reports/report.html
+          # Current-run verdict: the newest run in the merged results tree.
+          verdict=$(python - <<'PY'
+          import sys
+          sys.path.insert(0, "benchmark/report")
+          from report_generate import load_results, _verdict
+          runs, _ = load_results("results")
+          if not runs:
+              sys.exit("no runs found after artifact merge")
+          print(_verdict(runs[-1]))
+          PY
+          )
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report-${{ needs.build-openms.outputs.openms_sha }}
+          path: benchmark/reports/report.html
+          if-no-files-found: error
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Benchmark report (${{ needs.build-openms.outputs.openms_sha }})"
+            echo ""
+            echo "Current-run verdict: **${{ steps.render.outputs.verdict }}**"
+            echo ""
+            echo "report.html is attached to this run as artifact"
+            echo "benchmark-report-${{ needs.build-openms.outputs.openms_sha }}."
+          } >> "$GITHUB_STEP_SUMMARY"

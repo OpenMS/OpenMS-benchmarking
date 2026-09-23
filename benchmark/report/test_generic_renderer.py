@@ -30,7 +30,7 @@ from report_generate import (
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
     _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
-    normalize_openswath
+    normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED
 )
 
 
@@ -705,6 +705,208 @@ def _normalize_args(raw_path, run_id, results_dir, **overrides):
                               results_dir=results_dir, **kw)
 
 
+def _mk_run(bench, run_id, sha, run_at, cache="none"):
+    """Minimal stored v2 OpenMS run for baseline-selection tests."""
+    return {
+        "schema": "openms-benchmarking/report/v2",
+        "_file": f"{bench}/openms/{bench}-{run_id}.json",
+        "identity": {
+            "benchmark": bench,
+            "benchmark_version": 1,
+            "dataset": "synthetic",
+            "software": {"name": "OpenMS", "version": sha},
+            "configuration": {"use_ms2rescore": False},
+        },
+        "run": {"run_id": run_id, "run_at": run_at, "cache": cache},
+        "performance": {
+            "wall_time_s": 1.0, "cpu_time_s": 1.0, "peak_rss_kb": 1,
+            "build": {"wall_time_s": 60.0, "artifact_bytes": 1000},
+            "stages": [],
+        },
+        "metrics": {"verdict": "pass"},
+    }
+
+
+def test_sha_is_ancestor_offline_safe(monkeypatch=None):
+    """_sha_is_ancestor treats unknown/failed lookups as None (never raises)
+    and short-form prefixes of the same commit are not ancestors."""
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    try:
+        # short-form prefix of itself -> same commit -> not an ancestor
+        full = "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+        assert _sha_is_ancestor(full, full) is False
+        assert _sha_is_ancestor(full[:10], full) is False
+        assert _sha_is_ancestor(full, full[:10]) is False
+        # empty inputs are unknown
+        assert _sha_is_ancestor("", full) is None
+        # unreachable API -> None, not an exception (bogus host + no network
+        # path is not a GitHub error class we can rely on, so assert only on
+        # the non-raising contract for empty/disabled cases)
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        import report_generate
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_sha_is_ancestor_uses_compare_api(monkeypatch=None):
+    """The compare-API path returns True for ancestors and False for
+    non-ancestors, using an injected urllib handler (no real network)."""
+    import report_generate
+    import urllib.request as _ur
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def make_urlopen(compare_status):
+        def urlopen(req, timeout=None):
+            url = req.full_url
+            assert "api.github.com/repos/OpenMS/OpenMS/compare/" in url
+            # report_generate reads via json.load(resp): feed a tiny file obj
+            import io
+
+            resp_read = io.BytesIO(
+                ('{"status": "%s"}' % compare_status).encode("ascii")
+            )
+            resp_read.__enter__ = lambda s: s
+            resp_read.__exit__ = lambda s, *a: False
+            return resp_read
+        return urlopen
+
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    real_urlopen = _ur.urlopen
+    try:
+        base = "5f0f5de7b5019a9114a8231670534b1621250556"
+        head = "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+        _ur.urlopen = make_urlopen("ahead")  # base is ancestor of head
+        assert _sha_is_ancestor(base, head) is True
+        assert (base, head) in _GH_COMPARE_CACHE  # cached
+
+        other = "ffffffffffffffffffffffffffffffffffffffff"
+        _ur.urlopen = make_urlopen("diverged")  # not an ancestor
+        assert _sha_is_ancestor(other, head) is False
+    finally:
+        _ur.urlopen = real_urlopen
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_sha_is_ancestor_rate_limit_disables(monkeypatch=None):
+    """A 403/429 response disables further API use for the process instead of
+    hammering a rate-limited endpoint; already-cached pairs stay cached."""
+    import report_generate
+    import urllib.error
+    import urllib.request as _ur
+
+    calls = []
+
+    def urlopen_403(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 403, "rate limited", {}, None)
+
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    real_urlopen = _ur.urlopen
+    try:
+        _ur.urlopen = urlopen_403
+        assert _sha_is_ancestor("aaaa", "bbbb") is None
+        assert _sha_is_ancestor("cccc", "dddd") is None
+        assert len(calls) == 1  # second lookup served from the disabled flag
+        assert report_generate._GH_API_DISABLED is True
+    finally:
+        _ur.urlopen = real_urlopen
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_pick_baseline_prefers_ancestor_sha():
+    """With SHA ancestry available, the baseline is the newest ancestor run,
+    even when a newer non-ancestor run exists by timestamp."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache = _GH_COMPARE_CACHE.copy()
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = True   # run A is an ancestor
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = False  # run B is NOT (diverged)
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "A", _run_id(baseline)
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+
+
+def test_pick_baseline_falls_back_to_timestamp_when_no_ancestor():
+    """No ancestor (or ancestry unresolvable) -> timestamp rule, unchanged."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache = _GH_COMPARE_CACHE.copy()
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = False  # A is not an ancestor
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = False  # B is not an ancestor
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "B"  # latest by run_at
+        # same result when ancestry explicitly disabled
+        baseline = pick_baseline(current, runs, use_sha_ancestry=False)
+        assert _run_id(baseline) == "B"
+        # and when the current run's SHA is unusable
+        current2 = _mk_run("smoke", "C", "unknown", "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current2, runs)
+        assert _run_id(baseline) == "B"
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+
+
+def test_pick_baseline_unknown_ancestry_falls_back():
+    """Unresolvable ancestry (API unavailable -> None) falls back to the
+    timestamp rule rather than crashing or selecting nothing."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = None  # ancestry unresolvable
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = None
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "B"
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        import report_generate
+        report_generate._GH_API_DISABLED = old_disabled
+
+
 def test_normalize_openswath_to_v2():
     """normalize openswath maps a raw v1 result into valid v2, preserving identity,
     stage metrics, correctness and verdict."""
@@ -915,6 +1117,12 @@ def main():
         test_proteobench_no_spurious_stage_keys,
         test_normalize_openswath_to_v2,
         test_normalize_openswath_rejects_nonfinite,
+        test_sha_is_ancestor_offline_safe,
+        test_sha_is_ancestor_uses_compare_api,
+        test_sha_is_ancestor_rate_limit_disables,
+        test_pick_baseline_prefers_ancestor_sha,
+        test_pick_baseline_falls_back_to_timestamp_when_no_ancestor,
+        test_pick_baseline_unknown_ancestry_falls_back,
         test_normalize_openswath_baseline_comparison,
         test_normalize_openswath_missing_correctness_defaults,
         test_normalize_openswath_missing_or_empty_stages,

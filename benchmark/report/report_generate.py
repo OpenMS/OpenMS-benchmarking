@@ -47,9 +47,18 @@ Subcommands:
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
         Convert a local ProteoBench scoring result into a tool result.
 
-    render [--results-dir DIR] [--current PATH] [--out report.html]
+    render [--results-dir DIR] [--current PATH] [--baseline RUN-ID|SHA|PATH]
+           [--no-sha-baseline] [--out report.html]
         Discover all results, compare the current run against the stored
         baseline, and render report.html.
+
+        Baseline selection: an explicit --baseline wins; otherwise the default
+        is the latest stored run of the same benchmark whose OpenMS version is
+        an ancestor of the current run's version (resolved via the GitHub
+        compare API, cached per render). If no ancestor run is known, or
+        ancestry cannot be resolved (offline, rate-limited), it falls back to
+        the previous timestamp rule; --no-sha-baseline disables the ancestry
+        step entirely.
 """
 
 import argparse
@@ -62,6 +71,9 @@ import math
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 SCHEMA_V1 = "openms-benchmarking/report/v1"
 SCHEMA_V2 = "openms-benchmarking/report/v2"
@@ -336,16 +348,91 @@ def load_results(results_dir):
     return openms_runs, tool_results
 
 
-def pick_baseline(current, openms_runs):
-    """The stored baseline = the previous OpenMS run of the same benchmark."""
+# GitHub compare-API cache for SHA-ancestor baseline selection (per render).
+_GH_COMPARE_CACHE = {}
+_GH_API_DISABLED = False
+
+
+def _sha_is_ancestor(base_sha, head_sha):
+    """True if base_sha is an ancestor of head_sha, False if not, None if unknown.
+
+    Uses the GitHub compare API on OpenMS/OpenMS: compare(base...head) reports
+    status "ahead" exactly when base is an ancestor of head. Rate limiting
+    (403/429) and network/infrastructure failures disable further lookups for
+    this process; per-pair unknowns (e.g. 404 for a version string that is not
+    a commit) are cached without disabling. Callers must treat None as "fall
+    back to the timestamp rule".
+    """
+    global _GH_API_DISABLED
+    if not base_sha or not head_sha:
+        return None
+    if base_sha == head_sha or head_sha.startswith(base_sha) or base_sha.startswith(head_sha):
+        return False  # same commit (full or short form) is not an ancestor
+    key = (base_sha, head_sha)
+    if key in _GH_COMPARE_CACHE:
+        return _GH_COMPARE_CACHE[key]
+    if _GH_API_DISABLED:
+        return None
+    url = ("https://api.github.com/repos/OpenMS/OpenMS/compare/"
+           + urllib.parse.quote(base_sha, safe="") + "..."
+           + urllib.parse.quote(head_sha, safe=""))
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "openms-benchmarking-render",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            _GH_API_DISABLED = True
+        _GH_COMPARE_CACHE[key] = None
+        return None
+    except (urllib.error.URLError, OSError, ValueError):
+        _GH_API_DISABLED = True
+        _GH_COMPARE_CACHE[key] = None
+        return None
+    status = data.get("status")
+    result = {"ahead": True, "behind": False, "diverged": False}.get(status)
+    _GH_COMPARE_CACHE[key] = result
+    return result
+
+
+def pick_baseline(current, openms_runs, use_sha_ancestry=True):
+    """The stored baseline = the previous OpenMS run of the same benchmark.
+
+    Default: prefer the latest stored run of the same benchmark whose OpenMS
+    version is an *ancestor* of the current run's version (resolved via the
+    GitHub compare API, cached per render), so the comparison stays meaningful
+    even when newer unrelated runs exist. When no ancestor run is known, or
+    ancestry cannot be resolved (offline, rate-limited, unknown SHAs), fall
+    back to the timestamp rule: the latest run of the same benchmark with
+    run_at < current's (or simply the latest other run when run_at is
+    missing). use_sha_ancestry=False (--no-sha-baseline) skips the ancestry
+    step entirely.
+    """
     if not openms_runs:
         return None
-    cur_at = _run_at(current)
     cur_bench = _benchmark_name(current)
     same_bench = [r for r in openms_runs
                   if _benchmark_name(r) == cur_bench and r is not current]
     if not same_bench:
         return None
+
+    if use_sha_ancestry:
+        cur_sha = _software_version(current)
+        if cur_sha and cur_sha != "unknown":
+            ancestors = [r for r in same_bench
+                         if _sha_is_ancestor(_software_version(r), cur_sha)]
+            if ancestors:
+                ancestors.sort(key=lambda r: _run_at(r))
+                return ancestors[-1]
+
+    cur_at = _run_at(current)
     same_bench.sort(key=lambda r: _run_at(r))
     if not cur_at:
         return same_bench[-1]
@@ -1044,6 +1131,27 @@ def normalize_proteobench(args):
     print(f"normalized tool result -> {out_path}")
 
 
+def _resolve_baseline_ref(ref, openms_runs, results_dir):
+    """Resolve a --baseline reference: a stored run id, an OpenMS SHA (short
+    or full), or a path to a result JSON file."""
+    for r in openms_runs:
+        if _run_id(r) == ref:
+            return r
+    candidates = [r for r in openms_runs
+                  if _software_version(r) and _software_version(r).startswith(ref)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        sys.exit(f"--baseline {ref!r}: SHA matches {len(candidates)} stored runs; "
+                 "disambiguate with the full SHA or a run id")
+    if os.path.exists(ref):
+        with open(ref, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["_file"] = os.path.relpath(ref, results_dir).replace(os.sep, "/")
+        return data
+    sys.exit(f"--baseline {ref!r}: no stored run id, SHA or file matches")
+
+
 def render_cmd(args):
     results_dir = args.results_dir
     openms_runs, tool_results = load_results(results_dir)
@@ -1055,7 +1163,11 @@ def render_cmd(args):
         current["_file"] = os.path.relpath(args.current, results_dir).replace(os.sep, "/")
     else:
         current = openms_runs[-1]
-    baseline = pick_baseline(current, openms_runs)
+    if args.baseline:
+        baseline = _resolve_baseline_ref(args.baseline, openms_runs, results_dir)
+    else:
+        baseline = pick_baseline(current, openms_runs,
+                                 use_sha_ancestry=not args.no_sha_baseline)
     render(current, baseline, openms_runs, tool_results, args.out,
            _dt.datetime.now(_dt.timezone.utc))
 
@@ -1126,6 +1238,12 @@ def main():
     r = sub.add_parser("render", help="discover results and render report.html")
     r.add_argument("--results-dir", default="benchmark/results")
     r.add_argument("--current", help="explicit current run result file")
+    r.add_argument("--baseline",
+                   help="explicit baseline: a stored run id, an OpenMS SHA "
+                        "(short or full), or a path to a result JSON")
+    r.add_argument("--no-sha-baseline", action="store_true",
+                   help="disable SHA-ancestor baseline selection "
+                        "(timestamp rule only)")
     r.add_argument("--out", default="benchmark/reports/report.html")
     r.set_defaults(fn=render_cmd)
 
