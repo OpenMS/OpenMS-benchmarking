@@ -1165,7 +1165,7 @@ jobs:
           base="https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ steps.archive.outputs.dir }}"
           listing=$(curl -fsSL --max-time 30 "$base/")
           printf '%s' "$listing" > "$GITHUB_WORKSPACE/nightly-deb-probe-results/archive_listing.html"
-          filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[^"/]+-Debian-Linux-x86_64\.deb' | head -1)
+          filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb' | head -1)
           if [[ -z "$filename" ]]; then
             echo "ERROR: no x86_64 Debian .deb in $base/" >&2
             exit 1
