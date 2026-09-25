@@ -1165,9 +1165,14 @@ jobs:
           base="https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ steps.archive.outputs.dir }}"
           listing=$(curl -fsSL --max-time 30 "$base/")
           printf '%s' "$listing" > "$GITHUB_WORKSPACE/nightly-deb-probe-results/archive_listing.html"
+          # Security: this filename comes from remote HTML and is stored in a
+          # step output. Restrict it to a shell-safe charset at capture time so
+          # no shell metacharacter can ever ride along, and anchor-validate
+          # before use. Consumers receive it via env:, never via textual
+          # ${{ }} expansion into a generated script.
           filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb' | head -1)
-          if [[ -z "$filename" ]]; then
-            echo "ERROR: no x86_64 Debian .deb in $base/" >&2
+          if [[ -z "$filename" ]] || ! [[ "$filename" =~ ^OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb$ ]]; then
+            echo "ERROR: no x86_64 Debian .deb with the expected shell-safe filename in $base/ (see archive_listing.html in the probe artifact)" >&2
             exit 1
           fi
           curl -fsSL --max-time 900 -o "$RUNNER_TEMP/openms-nightly.deb" "$base/$filename"
@@ -1207,6 +1212,9 @@ jobs:
             https://api.github.com/repos/OpenMS/OpenMS/commits/develop \
             | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' \
             || true)
+          # Only accept a 40-hex commit SHA from the API; anything unexpected
+          # is treated as unresolved rather than recorded verbatim.
+          printf '%s' "$dev_sha" | grep -qE '^[0-9a-f]{40}$' || dev_sha=""
           if [[ -z "$dev_sha" ]]; then
             dev_note="unresolved (GitHub API unavailable or rate-limited); provenance limited to the package build date"
           else
@@ -1298,12 +1306,14 @@ jobs:
 
       - name: Write provenance metadata
         shell: bash
+        env:
+          PACKAGE_FILENAME: ${{ steps.package.outputs.filename }}
         run: |
           set -euo pipefail
           results="$GITHUB_WORKSPACE/nightly-deb-probe-results"
           mkdir -p "$results"
           {
-            echo "package = ${{ steps.package.outputs.filename }}"
+            echo "package = $PACKAGE_FILENAME"
             echo "package_sha256 = ${{ steps.package.outputs.sha256 }}"
             echo "package_date = ${{ steps.package.outputs.pkg_date }} (build night)"
             echo "archive_dir = ${{ steps.archive.outputs.dir }} (upload day)"
@@ -1338,6 +1348,8 @@ jobs:
       # (guards against runner-side logic changes) and writes the summary.
       - name: Enforce probe verdict (explicit pass/fail)
         shell: bash
+        env:
+          PACKAGE_FILENAME: ${{ steps.package.outputs.filename }}
         run: |
           set -euo pipefail
           v=$(python3 -c 'import json; print(json.load(open("nightly-deb-probe-results/smoke/smoke.json"))["verdict"])')
@@ -1345,7 +1357,7 @@ jobs:
           {
             echo "## Nightly Debian .deb probe"
             echo ""
-            echo "Package: ${{ steps.package.outputs.filename }}"
+            echo "Package: $PACKAGE_FILENAME"
             echo ""
             echo "SHA256: ${{ steps.package.outputs.sha256 }}"
             echo ""
