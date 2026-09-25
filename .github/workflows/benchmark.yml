@@ -23,6 +23,16 @@ on:
         required: false
         default: false
         type: boolean
+      nightly_deb_probe:
+        description: "Opt-in nightly Debian .deb probe (develop-snapshot runtime-health check via the Smoke benchmark; NOT PR-SHA validation, no ONNX)"
+        required: false
+        default: false
+        type: boolean
+      nightly_deb_date:
+        description: "Optional archive date (YYYY.MM.DD, the upload-day directory; the .deb inside is the prior night's build). Empty = newest available at dispatch."
+        required: false
+        default: ""
+        type: string
 
 jobs:
   build-openms:
@@ -1054,6 +1064,301 @@ jobs:
           path: |
             results-prose-pxd028735-A
             results-prose-pxd028735-B
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Nightly Debian .deb probe (opt-in, via the nightly_deb_probe input).
+  #
+  # Runtime-health check of OpenMS' published nightly Debian package:
+  # downloads a nightly archive .deb from an explicit date directory
+  # (nightly_deb_date input) or, by default, the newest one available at
+  # dispatch, extracts it into $RUNNER_TEMP (never installed system-wide),
+  # and runs the existing Smoke benchmark (benchmark/run_smoke_benchmark.sh,
+  # reused unmodified) against the packaged binaries.
+  #
+  # Scope, stated explicitly:
+  #   - validates the *nightly develop snapshot* packaging, NOT the PR SHA:
+  #     nightlies track OpenMS develop and are built WITHOUT ONNX, so they
+  #     can never replace the SHA-pinned source build above.
+  #   - Smoke-only evidence: says nothing about OpenSwath or ProSE/PeptDeep.
+  #   - fully isolated: no needs:, excluded from render-report, cannot gate
+  #     or block any other job in this workflow.
+  #
+  # Library/data resolution: the packaged binaries carry
+  # RUNPATH=$ORIGIN/../lib/ and OpenMS resolves share/OpenMS relative to the
+  # install prefix, so the extraction layout usr/bin + usr/lib +
+  # usr/share/OpenMS is expected to run WITHOUT LD_LIBRARY_PATH or
+  # OPENMS_DATA_PATH. The package's declared Debian Depends are apt-installed
+  # first (what dpkg would do on a real system) so the probe tests the
+  # package's own runtime resolution, not the runner's stock library set.
+  # Both resolution assumptions are TESTED AT RUNTIME below (loader probe
+  # under env -i, then a CHEMISTRY-data probe); OPENMS_DATA_PATH is exported
+  # only if the probe proves it necessary, and that fact is recorded in
+  # PROVENANCE.txt. The package itself is never installed system-wide.
+  # ---------------------------------------------------------------------------
+  run-nightly-deb-probe:
+    name: "Nightly Debian .deb probe (develop snapshot, Smoke-only)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: ${{ inputs.nightly_deb_probe }}
+    steps:
+      - name: Checkout benchmarking repo (for the Smoke runner)
+        uses: actions/checkout@v6
+
+      # Created before anything can fail, so the if: always() artifact upload
+      # always has a place to put diagnostics (probe logs, archive index,
+      # PROVENANCE.txt) even when an early step fails.
+      - name: Initialize probe diagnostics directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/nightly-deb-probe-results"
+          {
+            echo "probe started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run_id = ${{ github.run_id }}"
+            echo "workflow_sha = ${{ github.sha }}"
+          } > "$GITHUB_WORKSPACE/nightly-deb-probe-results/probe_run.log"
+
+      # The archive keeps upload-day directories nightly/YYYY.MM.DD/ (the
+      # .deb filename carries the build night, one day earlier). An explicit
+      # nightly_deb_date input pins the exact directory; empty selects the
+      # newest one at dispatch. Either way the resolved date is recorded, so
+      # every run is reproducible from its provenance.
+      - name: Resolve nightly archive directory (explicit date or newest)
+        id: archive
+        env:
+          REQUESTED_DATE: ${{ inputs.nightly_deb_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$GITHUB_WORKSPACE/nightly-deb-probe-results"
+          index=$(curl -fsSL --max-time 30 https://archive.openms.de/openms/OpenMSInstaller/nightly/)
+          printf '%s' "$index" > "$results/archive_index.html"
+          requested="${REQUESTED_DATE:-}"
+          if [[ -n "$requested" ]]; then
+            if ! printf '%s' "$requested" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'; then
+              echo "ERROR: nightly_deb_date must be YYYY.MM.DD (archive upload-day directory), got: '$requested'" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$index" | grep -qF "href=\"$requested/\""; then
+              echo "ERROR: requested nightly archive dir '$requested' not found in archive index (see archive_index.html in the probe artifact)" >&2
+              exit 1
+            fi
+            dir="$requested"
+            echo "Using requested archive dir: $dir"
+          else
+            dir=$(printf '%s' "$index" | grep -oE 'href="[0-9]{4}\.[0-9]{2}\.[0-9]{2}/"' \
+                    | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' | sort | tail -1)
+            if [[ -z "$dir" ]]; then
+              echo "ERROR: no dated nightly directory found in archive index (see archive_index.html in the probe artifact)" >&2
+              exit 1
+            fi
+            echo "Resolved newest archive dir: $dir"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb and record filename, size and SHA256
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ steps.archive.outputs.dir }}"
+          listing=$(curl -fsSL --max-time 30 "$base/")
+          printf '%s' "$listing" > "$GITHUB_WORKSPACE/nightly-deb-probe-results/archive_listing.html"
+          filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[^"/]+-Debian-Linux-x86_64\.deb' | head -1)
+          if [[ -z "$filename" ]]; then
+            echo "ERROR: no x86_64 Debian .deb in $base/" >&2
+            exit 1
+          fi
+          curl -fsSL --max-time 900 -o "$RUNNER_TEMP/openms-nightly.deb" "$base/$filename"
+          bytes=$(stat -c %s "$RUNNER_TEMP/openms-nightly.deb")
+          sha=$(sha256sum "$RUNNER_TEMP/openms-nightly.deb" | cut -d' ' -f1)
+          pkg_date=$(printf '%s' "$filename" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          # Partial provenance now so it survives any later failure; the
+          # provenance step after the runtime probes rewrites the complete
+          # file (adding develop-SHA and the data-path finding).
+          {
+            echo "package = $filename"
+            echo "package_sha256 = $sha"
+            echo "package_date = $pkg_date (build night)"
+            echo "archive_dir = ${{ steps.archive.outputs.dir }} (upload day)"
+            echo "package_bytes = $bytes"
+            echo "source = OpenMS nightly/develop (https://archive.openms.de/openms/OpenMSInstaller/nightly/)"
+            echo "PR_SHA = ${{ github.sha }} (what this workflow checked out; the deb does NOT contain it)"
+            echo "ONNX = unavailable (nightly packages are built without ONNX; PeptDeep arm impossible)"
+            echo "validation = Smoke (DecoyDatabase -> CometAdapter -> PercolatorAdapter) only; no OpenSwath/ProSE evidence"
+          } > "$GITHUB_WORKSPACE/nightly-deb-probe-results/PROVENANCE.txt"
+          {
+            echo "filename=$filename"
+            echo "pkg_date=$pkg_date"
+            echo "bytes=$bytes"
+            echo "sha256=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Downloaded $filename ($bytes bytes)"
+          echo "SHA256: $sha"
+
+      - name: Resolve nightly provenance (best effort, never invented)
+        id: provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          dev_sha=$(curl -fsSL --max-time 30 \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/OpenMS/OpenMS/commits/develop \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' \
+            || true)
+          if [[ -z "$dev_sha" ]]; then
+            dev_note="unresolved (GitHub API unavailable or rate-limited); provenance limited to the package build date"
+          else
+            dev_note="resolved from OpenMS/OpenMS@develop at probe time (at/near the build date, not verified per-package)"
+          fi
+          {
+            echo "dev_sha=$dev_sha"
+            echo "dev_note=$dev_note"
+          } >> "$GITHUB_OUTPUT"
+
+      # The deb declares its runtime library Depends (xerces, libzip, arrow
+      # system pieces, Qt6 for GUI bits, ...). Satisfy them exactly as dpkg
+      # would, so the loader probe below measures the package's own
+      # resolution, not a stock-runner library gap. Only declared deps are
+      # installed; the package itself is never installed system-wide.
+      - name: Install the package's declared dependencies (as dpkg would)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # Feed the verbatim Depends field to apt-get satisfy, which parses
+          # Debian dependency syntax natively (alternatives "a | b", version
+          # constraints, commas) - no hand-rolled splitting that could mangle
+          # alternative groups.
+          depends=$(dpkg-deb -f "$RUNNER_TEMP/openms-nightly.deb" Depends)
+          echo "Depends: $depends"
+          sudo apt-get -y -qq satisfy --no-install-recommends "$depends"
+
+      - name: Extract package into $RUNNER_TEMP (no system install)
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/deb-prefix"
+          dpkg-deb -x "$RUNNER_TEMP/openms-nightly.deb" "$prefix"
+          for d in usr/bin usr/lib usr/share/OpenMS; do
+            [[ -d "$prefix/$d" ]] || { echo "ERROR: $d missing after extraction" >&2; exit 1; }
+          done
+          # Engines: the deb ships Linux engines under share/OpenMS/THIRDPARTY
+          # (Comet is comet.exe but is a statically linked Linux ELF).
+          test -x "$prefix/usr/share/OpenMS/THIRDPARTY/Comet/comet.exe"
+          test -x "$prefix/usr/share/OpenMS/THIRDPARTY/Percolator/percolator"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+
+      # Probe 1 (loader): run a TOPP tool under env -i to prove the bundled
+      # libs load via RUNPATH=$ORIGIN/../lib/ with no environment help.
+      # Probe 2 (shared data): Digestor reads CHEMISTRY data from
+      # share/OpenMS, proving data-path resolution without OPENMS_DATA_PATH.
+      - name: Runtime probes (native RPATH loader, then shared-data path)
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${{ steps.extract.outputs.prefix }}/usr/bin"
+          # --help, NOT --version: TOPP tools reject --version (exit 6,
+          # "Unknown option") even on a healthy package - verified directly
+          # against the 2026-09-24 nightly on Ubuntu 24.04. --help exercises
+          # the same loader/RUNPATH path and exits 0.
+          if ! env -i "$bin/FileMerger" --help >"$RUNNER_TEMP/loader_probe.log" 2>&1; then
+            cp "$RUNNER_TEMP/loader_probe.log" "$GITHUB_WORKSPACE/nightly-deb-probe-results/"
+            echo "FileMerger failed without env vars; loader probe log:" >&2
+            cat "$RUNNER_TEMP/loader_probe.log" >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/loader_probe.log" "$GITHUB_WORKSPACE/nightly-deb-probe-results/"
+          echo "Loader probe: FileMerger runs with NO LD_LIBRARY_PATH (native RUNPATH OK)"
+          printf '>probe_protein\nPEPTIDEKPROBESEQUENCEAAAAK\n' > "$RUNNER_TEMP/probe.fasta"
+          data_env=not_required
+          if ! env -i "$bin/Digestor" -in "$RUNNER_TEMP/probe.fasta" \
+               -out "$RUNNER_TEMP/probe.idXML" >"$RUNNER_TEMP/data_probe.log" 2>&1; then
+            cp "$RUNNER_TEMP/data_probe.log" "$GITHUB_WORKSPACE/nightly-deb-probe-results/"
+            # Classify the failure: a genuine missing-shared-data abort mentions
+            # the data root, its subdirectories, schema files, or the env var
+            # itself. Anything else is a non-data-path failure and must fail
+            # the probe loudly rather than be papered over with env vars.
+            if grep -qiE "shared data|OPENMS_DATA_PATH|data file|CHEMISTRY|SCHEMAS|\.xsd|share/OpenMS" "$RUNNER_TEMP/data_probe.log"; then
+              data_env=required
+              echo "Data probe: share/OpenMS not auto-resolved; OPENMS_DATA_PATH required (recorded in provenance)"
+            else
+              echo "Digestor probe failed for a non-data-path reason; log:" >&2
+              cat "$RUNNER_TEMP/data_probe.log" >&2
+              exit 1
+            fi
+          else
+            cp "$RUNNER_TEMP/data_probe.log" "$GITHUB_WORKSPACE/nightly-deb-probe-results/" 2>/dev/null || true
+            echo "Data probe: share/OpenMS auto-resolved (no OPENMS_DATA_PATH needed)"
+          fi
+          echo "data_env=$data_env" >> "$GITHUB_OUTPUT"
+
+      - name: Write provenance metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$GITHUB_WORKSPACE/nightly-deb-probe-results"
+          mkdir -p "$results"
+          {
+            echo "package = ${{ steps.package.outputs.filename }}"
+            echo "package_sha256 = ${{ steps.package.outputs.sha256 }}"
+            echo "package_date = ${{ steps.package.outputs.pkg_date }} (build night)"
+            echo "archive_dir = ${{ steps.archive.outputs.dir }} (upload day)"
+            echo "package_bytes = ${{ steps.package.outputs.bytes }}"
+            echo "source = OpenMS nightly/develop (https://archive.openms.de/openms/OpenMSInstaller/nightly/)"
+            echo "develop_head_sha = ${{ steps.provenance.outputs.dev_sha }}"
+            echo "develop_note = ${{ steps.provenance.outputs.dev_note }}"
+            echo "PR_SHA = ${{ github.sha }} (what this workflow checked out; the deb does NOT contain it)"
+            echo "ONNX = unavailable (nightly packages are built without ONNX; PeptDeep arm impossible)"
+            echo "validation = Smoke (DecoyDatabase -> CometAdapter -> PercolatorAdapter) only; no OpenSwath/ProSE evidence"
+            echo "data_path_env = ${{ steps.runtime.outputs.data_env }}"
+          } > "$results/PROVENANCE.txt"
+          cp "$RUNNER_TEMP/loader_probe.log" "$RUNNER_TEMP/data_probe.log" "$results/" 2>/dev/null || true
+
+      - name: Run existing Smoke benchmark against the packaged binaries
+        env:
+          OPENMS_BIN: ${{ steps.extract.outputs.prefix }}/usr/bin
+          ENGINES_DIR: ${{ steps.extract.outputs.prefix }}/usr/share/OpenMS/THIRDPARTY
+          OPENMS_SHA: nightly-deb-${{ steps.package.outputs.pkg_date }}
+          RESULTS_DIR: ${{ github.workspace }}/nightly-deb-probe-results/smoke
+        run: |
+          # OPENMS_DATA_PATH is exported ONLY if the runtime probe proved it
+          # necessary; otherwise the package must resolve its data on its own.
+          if [[ "${{ steps.runtime.outputs.data_env }}" == "required" ]]; then
+            export OPENMS_DATA_PATH="${{ steps.extract.outputs.prefix }}/usr/share/OpenMS"
+            echo "OPENMS_DATA_PATH exported (required per runtime probe)"
+          fi
+          bash benchmark/run_smoke_benchmark.sh
+
+      # Defense-in-depth: the Smoke runner already exits 1 when a required
+      # stage fails; this step re-checks the recorded verdict from smoke.json
+      # (guards against runner-side logic changes) and writes the summary.
+      - name: Enforce probe verdict (explicit pass/fail)
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(python3 -c 'import json; print(json.load(open("nightly-deb-probe-results/smoke/smoke.json"))["verdict"])')
+          echo "Nightly .deb probe verdict: $v"
+          {
+            echo "## Nightly Debian .deb probe"
+            echo ""
+            echo "Package: ${{ steps.package.outputs.filename }}"
+            echo ""
+            echo "SHA256: ${{ steps.package.outputs.sha256 }}"
+            echo ""
+            echo "Smoke verdict: **$v** - develop-snapshot packaging health only, not PR-SHA validation. ONNX unavailable in nightlies."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ "$v" == "pass" ]] || { echo "Probe FAILED" >&2; exit 1; }
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-deb-probe-${{ steps.package.outputs.pkg_date }}
+          path: nightly-deb-probe-results
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
