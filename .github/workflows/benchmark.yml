@@ -1076,30 +1076,39 @@ jobs:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
 
-      - name: Download benchmark result artifacts
+      # Keep the checked-in benchmark history: it contains the stored
+      # same-benchmark baselines. Current-run artifacts are merged into that
+      # tree rather than an empty directory, so SHA-ancestor selection has
+      # candidates to compare against.
+      - name: Merge current benchmark artifacts with stored history
         uses: actions/download-artifact@v8
         with:
           pattern: benchmark-*-${{ needs.build-openms.outputs.openms_sha }}
           merge-multiple: true
-          path: results
+          path: benchmark/results
 
-      - name: Render combined report
+      # The generic renderer displays one current OpenMS run at a time. Select
+      # the smoke result explicitly; otherwise the newest unrelated benchmark
+      # (for example ProSE) can become "current" and leave no baseline to show.
+      - name: Render smoke comparison report
         id: render
         shell: bash
         run: |
           set -euo pipefail
+          current="benchmark/results/smoke/openms/smoke-${{ github.run_id }}.json"
+          test -f "$current"
           python benchmark/report/report_generate.py render \
-            --results-dir results \
+            --results-dir benchmark/results \
+            --current "$current" \
             --out benchmark/reports/report.html
-          # Current-run verdict: the newest run in the merged results tree.
+          # Verdict for the explicitly rendered current run.
           verdict=$(python - <<'PY'
+          import json
           import sys
           sys.path.insert(0, "benchmark/report")
-          from report_generate import load_results, _verdict
-          runs, _ = load_results("results")
-          if not runs:
-              sys.exit("no runs found after artifact merge")
-          print(_verdict(runs[-1]))
+          from report_generate import _verdict
+          with open("benchmark/results/smoke/openms/smoke-${{ github.run_id }}.json", encoding="utf-8") as fh:
+              print(_verdict(json.load(fh)))
           PY
           )
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
