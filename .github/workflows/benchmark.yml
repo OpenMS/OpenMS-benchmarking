@@ -1523,7 +1523,7 @@ jobs:
           # step output. Restrict it to a shell-safe charset at capture time so
           # no shell metacharacter can ever ride along, and anchor-validate
           # before use. Consumers receive it via env:, never via textual
-          # ${{ }} expansion into a generated script.
+          # GitHub expression expansion into a generated script.
           filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb' | head -1)
           if [[ -z "$filename" ]] || ! [[ "$filename" =~ ^OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb$ ]]; then
             echo "ERROR: no x86_64 Debian .deb with the expected shell-safe filename in $base/ (see archive_listing.html in the probe artifact)" >&2
