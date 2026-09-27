@@ -30,7 +30,8 @@ from report_generate import (
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
     _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
-    normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED
+    normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED,
+    _runtime_source, _runtime_identity, render_cmd
 )
 
 
@@ -699,7 +700,9 @@ def _write_raw_openswath(path, run_id, run_at, wall=2.76, verdict="pass"):
 def _normalize_args(raw_path, run_id, results_dir, **overrides):
     import argparse
     kw = dict(cache="", build_time=3412.0, artifact_bytes=149265164,
-              run_at="", dataset="", out=None)
+              run_at="", dataset="", out=None,
+              runtime_source="source", package_filename="", package_sha256="",
+              package_archive_dir="", package_date="")
     kw.update(overrides)
     return argparse.Namespace(openswath_json=raw_path, run_id=run_id,
                               results_dir=results_dir, **kw)
@@ -1096,6 +1099,161 @@ def test_normalize_openswath_failure_propagation():
     finally:
         shutil.rmtree(tmpdir)
 
+
+def test_runtime_source_default():
+    """Pre-Stage-1 results (no identity.runtime) read as source mode."""
+    run = {"schema": "openms-benchmarking/report/v2",
+           "identity": {"benchmark": "smoke", "software": {"version": "abc123"}}}
+    assert _runtime_source(run) == "source"
+    # _runtime_identity with default args emits the minimal source object
+    import argparse
+    ns = argparse.Namespace(runtime_source="source")
+    assert _runtime_identity(ns) == {"runtime_source": "source"}
+    print("  PASS: runtime_source defaults to source")
+
+
+def test_runtime_identity_package_requires_metadata():
+    """Package mode without full package metadata must fail loudly (normalize
+    can never write a package run whose provenance is incomplete)."""
+    import argparse
+    ns = argparse.Namespace(runtime_source="package", package_filename="",
+                            package_sha256="abc", package_archive_dir="",
+                            package_date="")
+    try:
+        _runtime_identity(ns)
+    except SystemExit:
+        print("  PASS: package identity refuses incomplete metadata")
+    else:
+        raise AssertionError("incomplete package metadata did not fail")
+
+
+def test_normalize_openswath_package_provenance():
+    """normalize openswath with --runtime-source package records the full
+    package identity and keeps it distinct from a source run's identity."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        _write_raw_openswath(raw_path, "424242", "2026-09-27T00:00:00Z")
+        normalize_openswath(_normalize_args(
+            raw_path, "424242", tmpdir,
+            runtime_source="package",
+            package_filename="OpenMS-3.6.0-pre-nightly-2026-09-24-Debian-Linux-x86_64.deb",
+            package_sha256="deadbeef" * 8,
+            package_archive_dir="2026.09.25",
+            package_date="2026-09-24",
+            build_time=0.0,
+        ))
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-424242.json")
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
+        rt = out["identity"]["runtime"]
+        assert rt["runtime_source"] == "package"
+        assert rt["package"]["filename"].endswith(".deb")
+        assert rt["package"]["sha256"] == "deadbeef" * 8
+        assert rt["package"]["archive_dir"] == "2026.09.25"
+        assert rt["package"]["date"] == "2026-09-24"
+        # ...and the same file still round-trips through the loader
+        runs, _ = load_results(tmpdir)
+        assert len(runs) == 1 and _runtime_source(runs[0]) == "package"
+        print("  PASS: normalize openswath records package provenance")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_package_run_excluded_from_sha_ancestry():
+    """A package run must never be selected as an SHA-ancestor baseline, and a
+    package current run must fall back to the timestamp rule."""
+    base = _mk_run("smoke", "111", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                   "2026-09-01T00:00:00Z")
+    base["identity"]["runtime"] = {"runtime_source": "source"}
+    pkg_newer = _mk_run("smoke", "222", "8b25c6e",
+                        "2026-09-02T00:00:00Z")
+    pkg_newer["identity"]["runtime"] = {
+        "runtime_source": "package",
+        "package": {"filename": "x.deb", "sha256": "d" * 64,
+                    "archive_dir": "2026.09.03", "date": "2026-09-02"},
+    }
+    current = _mk_run("smoke", "333", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                      "2026-09-03T00:00:00Z")
+    current["identity"]["runtime"] = {"runtime_source": "source"}
+    import report_generate
+    saved_fn = report_generate._sha_is_ancestor
+    try:
+        # Deterministic ancestry: every source run is an "ancestor". The
+        # package run must be filtered from the candidate pool BEFORE this
+        # predicate is consulted, so despite qualifying by SHA it can't win.
+        report_generate._sha_is_ancestor = lambda b, h: True
+        b1 = pick_baseline(current, [base, pkg_newer, current])
+        assert b1 is base, "package run selected as SHA-ancestor baseline"
+        # Package current: ancestry comparison is skipped entirely, so even a
+        # source run that would qualify by SHA is not used; timestamp decides.
+        report_generate._sha_is_ancestor = lambda b, h: False
+        b2 = pick_baseline(pkg_newer, [base, current, pkg_newer])
+        assert b2 is base, "package current did not fall back to timestamp rule"
+    finally:
+        report_generate._sha_is_ancestor = saved_fn
+    print("  PASS: package runs excluded from SHA-ancestor selection")
+
+
+def test_current_run_never_its_own_baseline():
+    """--current must never compare a run against itself: the current file is
+    also discovered from the results tree as a *separate* object, and
+    pick_baseline excludes only by object identity. Baseline selection must
+    therefore exclude the current run by file path; with no other candidates
+    the report renders without a comparison card instead of self-comparing."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        run = {"schema": "openms-benchmarking/report/v2",
+               "identity": {"benchmark": "smoke", "dataset": "t",
+                            "software": {"version": "a" * 40}},
+               "run": {"run_id": "77", "run_at": "2026-09-01T00:00:00Z",
+                       "cache": "none"},
+               "performance": {"stages": []},
+               "metrics": {"verdict": "pass"}}
+        cur_path = os.path.join(tmpdir, "smoke", "openms", "smoke-77.json")
+        os.makedirs(os.path.dirname(cur_path), exist_ok=True)
+        with open(cur_path, "w", encoding="utf-8") as fh:
+            json.dump(run, fh)
+
+        import argparse
+        args = argparse.Namespace(results_dir=tmpdir, current=cur_path,
+                                  baseline=None, no_sha_baseline=False,
+                                  out=os.path.join(tmpdir, "report.html"))
+        render_cmd(args)  # must not exit even with zero baseline candidates
+        with open(args.out, encoding="utf-8") as fh:
+            html = fh.read()
+        assert "current vs previous run" not in html, \
+            "current run was compared against itself"
+        print("  PASS: --current is never its own baseline")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_promote_v1_carries_file_reference():
+    """load_results records _file before v1 promotion; the promoted run must
+    keep it. Without this, every promoted v1 run renders with an empty source
+    label and --current deduplication (which keys on _file) cannot see it."""
+    v1 = {"schema": "openms-benchmarking/report/v1", "source": "openms",
+          "benchmark": "smoke", "run_id": "5",
+          "run_at": "2026-08-01T00:00:00Z",
+          "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024"}
+    v1["_file"] = "smoke/openms/smoke-5.json"  # as load_results sets it
+    promoted = _promote_v1(v1)
+    assert promoted.get("_file") == "smoke/openms/smoke-5.json"
+    # ...and a v1 run discovered from disk carries it end to end
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "openms"))
+        with open(os.path.join(tmpdir, "openms", "smoke-5.json"), "w") as fh:
+            json.dump(v1, fh)
+        runs, _ = load_results(tmpdir)
+        assert runs and runs[0].get("_file") == "openms/smoke-5.json"
+        print("  PASS: v1 promotion carries the _file reference")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -1127,6 +1285,12 @@ def main():
         test_normalize_openswath_missing_correctness_defaults,
         test_normalize_openswath_missing_or_empty_stages,
         test_normalize_openswath_failure_propagation,
+        test_runtime_source_default,
+        test_runtime_identity_package_requires_metadata,
+        test_normalize_openswath_package_provenance,
+        test_package_run_excluded_from_sha_ancestry,
+        test_current_run_never_its_own_baseline,
+        test_promote_v1_carries_file_reference,
     ]
     passed = 0
     failed = 0

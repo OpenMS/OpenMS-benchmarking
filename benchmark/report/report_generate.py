@@ -77,6 +77,50 @@ import urllib.request
 
 SCHEMA_V1 = "openms-benchmarking/report/v1"
 SCHEMA_V2 = "openms-benchmarking/report/v2"
+
+
+# ---------------------------------------------------------------------------
+# Runtime provenance (Stage 1: package-vs-source).
+#
+# identity.runtime is ADDITIVE in the v2 schema: source-mode results carry
+# {"runtime_source": "source"} and are otherwise byte-identical to the
+# pre-Stage-1 output. Package-mode results additionally carry a "package"
+# object (filename, sha256, archive_dir, date) so a packaged run can never be
+# mistaken for an exact-SHA source build in the report.
+# ---------------------------------------------------------------------------
+def _add_runtime_source_args(parser):
+    """Attach the shared runtime-provenance options to a normalize subparser."""
+    parser.add_argument("--runtime-source", choices=["source", "package"],
+                        default="source",
+                        help="where the benchmarked OpenMS binaries came from")
+    parser.add_argument("--package-filename", default="",
+                        help="package mode: .deb filename as published")
+    parser.add_argument("--package-sha256", default="",
+                        help="package mode: SHA256 of the .deb")
+    parser.add_argument("--package-archive-dir", default="",
+                        help="package mode: nightly archive upload-day directory")
+    parser.add_argument("--package-date", default="",
+                        help="package mode: build night encoded in the package")
+
+
+def _runtime_identity(args):
+    """Build the identity.runtime object from normalize args (None when absent)."""
+    src = getattr(args, "runtime_source", "source") or "source"
+    runtime = {"runtime_source": src}
+    if src == "package":
+        pkg = {
+            "filename": getattr(args, "package_filename", ""),
+            "sha256": getattr(args, "package_sha256", ""),
+            "archive_dir": getattr(args, "package_archive_dir", ""),
+            "date": getattr(args, "package_date", ""),
+        }
+        missing = [k for k, v in pkg.items() if not v]
+        if missing:
+            sys.exit("normalize package-mode run missing required package metadata: "
+                     + ", ".join("--package-" + m.replace("_", "-") for m in missing))
+        runtime["package"] = pkg
+    return runtime
+
 SCHEMA = SCHEMA_V2  # default output schema
 
 # ---------------------------------------------------------------------------
@@ -194,6 +238,11 @@ def _software_version(result):
     return _identity(result).get("software", {}).get("version", "unknown")
 
 
+def _runtime_source(result):
+    """Return 'source' or 'package' (default 'source' for pre-Stage-1 results)."""
+    return _identity(result).get("runtime", {}).get("runtime_source", "source")
+
+
 def _benchmark_name(result):
     """Return the benchmark name from a v2 result."""
     return _identity(result).get("benchmark", "unknown")
@@ -295,6 +344,12 @@ def _promote_v1(data):
     # Carry over openms metrics that aren't verdict
     if data.get("metrics"):
         promoted["metrics"].update(data["metrics"])
+    # Carry over the discovery path (load_results sets _file before calling
+    # this): without it every promoted v1 run loses its file reference and
+    # renders with an empty source label; --current deduplication also keys
+    # on this field.
+    if data.get("_file"):
+        promoted["_file"] = data["_file"]
     return promoted
 
 
@@ -425,9 +480,16 @@ def pick_baseline(current, openms_runs, use_sha_ancestry=True):
 
     if use_sha_ancestry:
         cur_sha = _software_version(current)
-        if cur_sha and cur_sha != "unknown":
+        # Stage 1: SHA-ancestry comparison is defined between source builds.
+        # A package run's version string may be a nightly short SHA of a
+        # moving branch; mixing it into a source-SHA lineage would compare
+        # different *kinds* of versions. It stays in the timestamp pool only.
+        if _runtime_source(current) == "package":
+            use_sha_ancestry = False
+        if use_sha_ancestry and cur_sha and cur_sha != "unknown":
             ancestors = [r for r in same_bench
-                         if _sha_is_ancestor(_software_version(r), cur_sha)]
+                         if _runtime_source(r) == "source"
+                         and _sha_is_ancestor(_software_version(r), cur_sha)]
             if ancestors:
                 ancestors.sort(key=lambda r: _run_at(r))
                 return ancestors[-1]
@@ -576,15 +638,36 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     verdict_cls = status_class(verdict)
     bench = _benchmark_name(current)
     sha = _software_version(current)
+    rt = _runtime_source(current)
 
     # ----- header ----------------------------------------------------------
+    # Runtime provenance must be unambiguous: a package-mode run is labeled
+    # with its package identity and can never read as an exact-SHA build.
+    if rt == "package":
+        pkg = _identity(current).get("runtime", {}).get("package", {})
+        sha_row = (f"<div><dt>OpenMS revision</dt><dd>{esc(short_sha(sha))} "
+                   f"<span class=\"mono\" title=\"{esc(sha)}\">({esc(sha[:6])})</span> "
+                   f"— embedded in package</dd></div>")
+        runtime_rows = (
+            f"<div><dt>Runtime</dt><dd>{_chip('PACKAGE · nightly .deb', 'warn')}</dd></div>"
+            f"<div><dt>Package</dt><dd class='mono'>{esc(pkg.get('filename', ''))}</dd></div>"
+            f"<div><dt>Package SHA256</dt><dd class='mono'>{esc(pkg.get('sha256', ''))}</dd></div>"
+            f"<div><dt>Package archive</dt><dd>{esc(pkg.get('archive_dir', ''))} "
+            f"<span class='dim'>(build night {esc(pkg.get('date', ''))})</span></dd></div>"
+        )
+    else:
+        sha_row = (f"<div><dt>Software SHA</dt><dd>{esc(short_sha(sha))} "
+                   f"<span class=\"mono\" title=\"{esc(sha)}\">({esc(sha[:6])})</span></dd></div>")
+        runtime_rows = f"<div><dt>Runtime</dt><dd>{_chip('SOURCE · exact SHA build', 'ok')}</dd></div>"
+
     head = f"""
     <div class="card"><div class="inner">
       <h1>OpenMS Benchmark Report</h1>
       <div class="dim">{esc(bench)} benchmark —
       generated {esc(generated.strftime('%Y-%m-%d %H:%M %Z'))}</div>
       <dl class="meta">
-        <div><dt>Software SHA</dt><dd>{esc(short_sha(sha))} <span class="mono" title="{esc(sha)}">({esc(sha[:6])})</span></dd></div>
+        {runtime_rows}
+        {sha_row}
         <div><dt>Run</dt><dd>{esc(_run_id(current))} <span class="dim">({esc(current.get('_file', ''))})</span></dd></div>
         <div><dt>Run at</dt><dd>{esc(_run_at(current))}</dd></div>
         <div><dt>Cache</dt><dd>{_chip(cache, cache_cls)}</dd></div>
@@ -820,7 +903,7 @@ def normalize_smoke(args):
     """Convert a raw CI smoke.json into a normalized v2 OpenMS run result."""
     with open(args.smoke_json, encoding="utf-8") as fh:
         raw = json.load(fh)
-    if not args.build_time or not args.artifact_bytes or not args.run_id:
+    if args.build_time is None or not args.artifact_bytes or not args.run_id:
         sys.exit("normalize smoke needs --run-id, --build-time and --artifact-bytes")
     stages = []
     for st in raw.get("stages", []):
@@ -848,6 +931,7 @@ def normalize_smoke(args):
             "configuration": {
                 "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
             },
+            "runtime": _runtime_identity(args),
         },
         "run": {
             "run_id": args.run_id,
@@ -884,7 +968,7 @@ def normalize_openswath(args):
     """Convert a raw CI openswath.json into a normalized v2 OpenMS run result."""
     with open(args.openswath_json, encoding="utf-8") as fh:
         raw = json.load(fh)
-    if not args.build_time or not args.artifact_bytes or not args.run_id:
+    if args.build_time is None or not args.artifact_bytes or not args.run_id:
         sys.exit("normalize openswath needs --run-id, --build-time and --artifact-bytes")
     stages = []
     for st in raw.get("stages", []):
@@ -917,6 +1001,7 @@ def normalize_openswath(args):
                 "version": raw.get("openms_sha", ""),
             },
             "configuration": {},
+            "runtime": _runtime_identity(args),
         },
         "run": {
             "run_id": args.run_id,
@@ -1166,8 +1251,16 @@ def render_cmd(args):
     if args.baseline:
         baseline = _resolve_baseline_ref(args.baseline, openms_runs, results_dir)
     else:
-        baseline = pick_baseline(current, openms_runs,
-                                 use_sha_ancestry=not args.no_sha_baseline)
+        # pick_baseline excludes the current run by object identity; a
+        # --current file also lives in the discovery pool as a *separate*
+        # object, so exclude it by path instead. Keyed on the exact file,
+        # not the run id: PXD028735-style runs legitimately share a run-id
+        # prefix. An empty pool means there is nothing to compare against.
+        baseline_pool = [r for r in openms_runs
+                         if r.get("_file") != current["_file"]]
+        baseline = (pick_baseline(current, baseline_pool,
+                                  use_sha_ancestry=not args.no_sha_baseline)
+                    if baseline_pool else None)
     render(current, baseline, openms_runs, tool_results, args.out,
            _dt.datetime.now(_dt.timezone.utc))
 
@@ -1198,6 +1291,7 @@ def main():
                     help="what was benchmarked (default: smoke fixture)")
     ps.add_argument("--results-dir", default="benchmark/results")
     ps.add_argument("--out")
+    _add_runtime_source_args(ps)
     ps.set_defaults(fn=normalize_smoke)
 
     po = pn.add_parser("openswath", help="normalize a CI openswath.json (OpenSwath DIA benchmark)")
@@ -1213,6 +1307,7 @@ def main():
                     help="override the dataset label (default: value recorded in the raw result)")
     po.add_argument("--results-dir", default="benchmark/results")
     po.add_argument("--out")
+    _add_runtime_source_args(po)
     po.set_defaults(fn=normalize_openswath)
 
     pp = pn.add_parser("proteobench", help="normalize a local ProteoBench scoring JSON")

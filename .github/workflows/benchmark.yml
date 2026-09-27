@@ -14,10 +14,23 @@ name: "Benchmark"
 on:
   workflow_dispatch:
     inputs:
+      runtime_source:
+        description: "OpenMS runtime for the benchmarks: 'source' builds openms_sha from source (exact-SHA semantics, ONNX/ProSE/PeptDeep included); 'package' benchmarks a published Debian nightly .deb (Smoke + OpenSwath only; package provenance recorded; ONNX unavailable today)"
+        required: false
+        default: "source"
+        type: choice
+        options:
+          - source
+          - package
       openms_sha:
-        description: "OpenMS commit SHA to build and benchmark. ONNX/ProSE jobs additionally require a SHA carrying PR #9975 ONNX support (cmake/Modules/FindONNXRuntime.cmake, added after f1768367); the default satisfies both."
+        description: "OpenMS commit SHA to build and benchmark (source mode). ONNX/ProSE jobs additionally require a SHA carrying PR #9975 ONNX support (cmake/Modules/FindONNXRuntime.cmake, added after f1768367); the default satisfies both. In package mode this input is optional: if set, the package's embedded OpenMS SHA must match it or the run fails loudly."
         required: false
         default: "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+      package_date:
+        description: "Package mode only: archive date (YYYY.MM.DD, the upload-day directory; the .deb inside is the prior night's build). Empty = newest available at dispatch."
+        required: false
+        default: ""
+        type: string
       use_ms2rescore:
         description: "Request the extended (MS2Rescore) benchmark mode"
         required: false
@@ -38,6 +51,10 @@ jobs:
   build-openms:
     name: "Build OpenMS (Linux, fixed SHA)"
     runs-on: ubuntu-24.04
+    # Package mode consumes the published .deb instead of a source build; the
+    # build job is skipped entirely. Guarding here keeps every dependent job's
+    # `needs:` intact (skipped, not unfulfilled) so the workflow graph stays valid.
+    if: ${{ inputs.runtime_source != 'package' }}
     outputs:
       openms_sha: ${{ steps.sha.outputs.sha }}
       build_minutes: ${{ steps.build.outputs.minutes }}
@@ -264,28 +281,267 @@ jobs:
             _thirdparty
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Package runtime provider (runtime_source=package).
+  #
+  # Generalizes the nightly probe's download/extract/dependency steps into a
+  # runtime for the benchmark jobs: resolves the dated nightly archive dir,
+  # downloads the .deb (SHA256 recorded), satisfies the declared Depends,
+  # extracts into $RUNNER_TEMP (never installed system-wide), and resolves
+  # exact provenance from the package's own openms_package_version.h
+  # (OPENMS_GIT_SHA1 / OPENMS_GIT_BRANCH / OPENMS_PACKAGE_VERSION). The
+  # benchmark runners consume the extracted prefix via the same env contract
+  # the source-build path uses (OPENMS_BIN/ENGINES_DIR/OPENMS_SHA/RESULTS_DIR).
+  #
+  # Strict SHA guard: if the dispatch requested a specific openms_sha, the
+  # package's embedded SHA must match it (full or unambiguous prefix) or the
+  # job fails — a package may only satisfy an SHA request by actually being
+  # that revision. A nightly package can never silently replace a requested
+  # custom SHA.
+  #
+  # ONNX capability: published nightlies are built WITHOUT ONNX Runtime
+  # (payload-verified), so ProSE/PeptDeep jobs do not run in package mode.
+  # ---------------------------------------------------------------------------
+  package-runtime:
+    name: "Resolve package runtime (nightly .deb)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: ${{ inputs.runtime_source == 'package' }}
+    outputs:
+      package_filename: ${{ steps.package.outputs.filename }}
+      package_sha256: ${{ steps.package.outputs.sha256 }}
+      package_date: ${{ steps.package.outputs.pkg_date }}
+      archive_dir: ${{ steps.archive.outputs.dir }}
+      package_bytes: ${{ steps.package.outputs.bytes }}
+      openms_sha: ${{ steps.provenance.outputs.pkg_sha }}
+      openms_branch: ${{ steps.provenance.outputs.pkg_branch }}
+      openms_version: ${{ steps.provenance.outputs.pkg_version }}
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+
+      # Same archive-dir resolution as the nightly probe: explicit date or
+      # newest available; the resolved dir is recorded so every run is
+      # reproducible from its provenance.
+      - name: Resolve nightly archive directory (explicit date or newest)
+        id: archive
+        env:
+          REQUESTED_DATE: ${{ inputs.package_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          index=$(curl -fsSL --max-time 30 https://archive.openms.de/openms/OpenMSInstaller/nightly/)
+          requested="${REQUESTED_DATE:-}"
+          if [[ -n "$requested" ]]; then
+            if ! printf '%s' "$requested" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'; then
+              echo "ERROR: package_date must be YYYY.MM.DD (archive upload-day directory), got: '$requested'" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$index" | grep -qF "href=\"$requested/\""; then
+              echo "ERROR: requested package archive dir '$requested' not found in archive index" >&2
+              exit 1
+            fi
+            dir="$requested"
+            echo "Using requested archive dir: $dir"
+          else
+            dir=$(printf '%s' "$index" | grep -oE 'href="[0-9]{4}\.[0-9]{2}\.[0-9]{2}/"' \
+                    | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' | sort | tail -1)
+            if [[ -z "$dir" ]]; then
+              echo "ERROR: no dated nightly directory found in archive index" >&2
+              exit 1
+            fi
+            echo "Resolved newest archive dir: $dir"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb and record filename, size and SHA256
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ steps.archive.outputs.dir }}"
+          listing=$(curl -fsSL --max-time 30 "$base/")
+          # Security: the filename comes from remote HTML; restrict to a
+          # shell-safe charset at capture time and anchor-validate (same
+          # policy as the nightly probe).
+          filename=$(printf '%s' "$listing" | grep -oE 'OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb' | head -1)
+          if [[ -z "$filename" ]] || ! [[ "$filename" =~ ^OpenMS-[-A-Za-z0-9._+~]+-Debian-Linux-x86_64\.deb$ ]]; then
+            echo "ERROR: no x86_64 Debian .deb with the expected shell-safe filename in $base/" >&2
+            exit 1
+          fi
+          curl -fsSL --max-time 900 -o "$RUNNER_TEMP/openms-nightly.deb" "$base/$filename"
+          bytes=$(stat -c %s "$RUNNER_TEMP/openms-nightly.deb")
+          sha=$(sha256sum "$RUNNER_TEMP/openms-nightly.deb" | cut -d' ' -f1)
+          pkg_date=$(printf '%s' "$filename" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          echo "Downloaded $filename ($bytes bytes)"
+          echo "SHA256: $sha"
+          {
+            echo "filename=$filename"
+            echo "pkg_date=$pkg_date"
+            echo "bytes=$bytes"
+            echo "sha256=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install the package's declared dependencies (as dpkg would)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          depends=$(dpkg-deb -f "$RUNNER_TEMP/openms-nightly.deb" Depends)
+          echo "Depends: $depends"
+          sudo apt-get -y -qq satisfy --no-install-recommends "$depends"
+
+      - name: Extract package into $RUNNER_TEMP (no system install)
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/deb-prefix"
+          dpkg-deb -x "$RUNNER_TEMP/openms-nightly.deb" "$prefix"
+          for d in usr/bin usr/lib usr/share/OpenMS; do
+            [[ -d "$prefix/$d" ]] || { echo "ERROR: $d missing after extraction" >&2; exit 1; }
+          done
+          test -x "$prefix/usr/share/OpenMS/THIRDPARTY/Comet/comet.exe"
+          test -x "$prefix/usr/share/OpenMS/THIRDPARTY/Percolator/percolator"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+
+      # Exact provenance from the package itself: OpenMS embeds its git
+      # revision in the installed openms_package_version.h
+      # (OPENMS_GIT_SHA1, OPENMS_GIT_BRANCH, OPENMS_PACKAGE_VERSION). The
+      # short SHA is resolved to the full SHA via the GitHub API; a package
+      # with an unresolvable SHA is recorded with the short form only and
+      # fails any strict SHA request (fail-closed, never invented).
+      - name: Resolve package provenance (embedded OpenMS git SHA)
+        id: provenance
+        env:
+          REQUESTED_SHA: ${{ inputs.openms_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The input's non-empty default is treated as unset in package
+          # mode: workflow_dispatch cannot distinguish "user set it" from
+          # "default left in place", and a default package dispatch must
+          # never be required to match an arbitrary source-mode SHA.
+          PINNED_DEFAULT_SHA="e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+          hdr="$RUNNER_TEMP/deb-prefix/usr/include/OpenMS/openms_package_version.h"
+          if [[ ! -f "$hdr" ]]; then
+            echo "ERROR: $hdr not found in package - cannot establish provenance" >&2
+            exit 1
+          fi
+          pkg_short=$(sed -n 's/^#define OPENMS_GIT_SHA1 "\([0-9a-fA-F]*\)".*/\1/p' "$hdr" | head -1)
+          pkg_branch=$(sed -n 's/^#define OPENMS_GIT_BRANCH "\([^"]*\)".*/\1/p' "$hdr" | head -1)
+          pkg_version=$(sed -n 's/^#define OPENMS_PACKAGE_VERSION "\([^"]*\)".*/\1/p' "$hdr" | head -1)
+          if [[ -z "$pkg_short" ]] || ! printf '%s' "$pkg_short" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+            echo "ERROR: package header carries no usable OPENMS_GIT_SHA1 (got: '$pkg_short')" >&2
+            exit 1
+          fi
+          full=$(curl -fsSL --max-time 30 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/OpenMS/OpenMS/commits/$pkg_short" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' || true)
+          printf '%s' "$full" | grep -qE '^[0-9a-f]{40}$' || full=""
+          if [[ -z "$full" ]]; then
+            # Fail closed on a strict SHA request; otherwise record the short
+            # form with an explicit caveat. The pinned default counts as no
+            # request (see top of step).
+            if [[ -n "${REQUESTED_SHA:-}" && "$REQUESTED_SHA" != "$PINNED_DEFAULT_SHA" ]]; then
+              echo "ERROR: could not resolve package SHA '$pkg_short' to a full SHA; cannot verify it against the requested SHA. Aborting (strict SHA guard)." >&2
+              exit 1
+            fi
+            pkg_sha="$pkg_short"
+            sha_note="short SHA from package header; full-SHA resolution unavailable (GitHub API)"
+          else
+            pkg_sha="$full"
+            sha_note="resolved to full SHA via GitHub API"
+          fi
+          echo "Package provenance: sha=$pkg_sha branch=$pkg_branch version=$pkg_version ($sha_note)"
+          # Strict SHA guard: a requested openms_sha must match the package.
+          # The pinned default counts as no request (see top of step).
+          # Charset-validate the caller-controlled input before it reaches the
+          # commit-resolution API (defense in depth; a malformed SHA would
+          # otherwise be interpolated into the curl URL verbatim).
+          if [[ -n "${REQUESTED_SHA:-}" && "$REQUESTED_SHA" != "$PINNED_DEFAULT_SHA" ]]; then
+            printf '%s' "$REQUESTED_SHA" | grep -qE '^[0-9a-fA-F]{7,40}$' || {
+              echo "ERROR: requested OpenMS SHA '$REQUESTED_SHA' is not a plausible git SHA (7-40 hex chars)" >&2
+              exit 1
+            }
+            req_full=$(curl -fsSL --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/OpenMS/OpenMS/commits/$REQUESTED_SHA" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' || true)
+            printf '%s' "$req_full" | grep -qE '^[0-9a-f]{40}$' || req_full="$REQUESTED_SHA"
+            if [[ "$pkg_sha" != "$req_full" ]]; then
+              echo "ERROR: strict SHA guard failed - requested OpenMS SHA '$REQUESTED_SHA' (resolves to ${req_full:-unresolvable}) does not match the package's embedded SHA '$pkg_sha'. A package can only satisfy an SHA request by actually being that revision. Use runtime_source=source to benchmark a specific SHA, or clear openms_sha / set it to the package's SHA." >&2
+              exit 1
+            fi
+            echo "Strict SHA guard: requested SHA matches the package ($pkg_sha)"
+          fi
+          {
+            echo "pkg_sha=$pkg_sha"
+            echo "pkg_branch=$pkg_branch"
+            echo "pkg_version=$pkg_version"
+          } >> "$GITHUB_OUTPUT"
+
+      # Capability policy: benchmark support is NEVER inferred from binary
+      # availability. A component counts as supported in package mode only
+      # once its actual benchmark runner has executed successfully against a
+      # package runtime. Today the package-mode job graph runs Smoke and
+      # OpenSwath; the ProSE/PeptDeep jobs are structurally skipped (their
+      # ONNX source build does not run in package mode). No capability claim
+      # is recorded beyond what the executed runners prove.
+
+
   run-smoke-benchmark:
     name: "Smoke benchmark (Comet -> Percolator)"
     runs-on: ubuntu-24.04
-    needs: build-openms
+    # One of build-openms (source mode) or package-runtime (package mode)
+    # provides the runtime; the other is skipped by its mode guard, which is
+    # not an error. Real failures still block via the needs[...] result check.
+    needs: [build-openms, package-runtime]
+    if: ${{ !cancelled() && needs.build-openms.result != 'failure' && needs.package-runtime.result != 'failure' && (needs.build-openms.result == 'success' || needs.package-runtime.result == 'success') }}
     env:
       USE_MS2RESCORE: ${{ inputs.use_ms2rescore && 'true' || 'false' }}
     steps:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
 
-      # The smoke job runs on a fresh runner, but the downloaded binaries
-      # need OpenMS' runtime libraries (xerces, hdf5, libzip, boost, ...).
-      # Install the same non-GUI deps the build job uses. The deps script
-      # lives in the OpenMS repo (not this one), so fetch it at the exact
-      # pinned SHA rather than duplicating the package list here.
+      # Package mode only: fetch, verify, and extract the .deb on THIS runner
+      # (the provider job's prefix lives on a different runner; only metadata
+      # crosses jobs). Source mode skips this step entirely — its runtime
+      # paths are the pre-Stage-1 literals in the env blocks below.
+      - name: Resolve package runtime (package mode)
+        id: runtime
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 900 -o /tmp/openms-nightly.deb \
+            "https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ needs.package-runtime.outputs.archive_dir }}/${{ needs.package-runtime.outputs.package_filename }}"
+          echo "Expected package SHA256: ${{ needs.package-runtime.outputs.package_sha256 }}"
+          sha256sum /tmp/openms-nightly.deb
+          echo "$(sha256sum /tmp/openms-nightly.deb)" | grep -q "^${{ needs.package-runtime.outputs.package_sha256 }} " \
+            || { echo "ERROR: downloaded package does not match the SHA256 resolved by package-runtime" >&2; exit 1; }
+          sudo apt-get update -qq
+          depends=$(dpkg-deb -f /tmp/openms-nightly.deb Depends)
+          echo "Depends: $depends"
+          sudo apt-get -y -qq satisfy --no-install-recommends "$depends"
+          prefix="$RUNNER_TEMP/deb-prefix"
+          dpkg-deb -x /tmp/openms-nightly.deb "$prefix"
+          rm -f /tmp/openms-nightly.deb
+          echo "artifact_bytes=$(du -sb "$prefix" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      # Source mode: the downloaded binaries need OpenMS' runtime libraries
+      # (xerces, hdf5, libzip, boost, ...) from OpenMS' own deps script at the
+      # exact pinned SHA.
       - name: Install runtime dependencies
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
+        if: ${{ inputs.runtime_source != 'package' }}
         uses: actions/download-artifact@v8
         with:
           name: openms-bin-${{ needs.build-openms.outputs.openms_sha }}
@@ -294,35 +550,50 @@ jobs:
       # GitHub's artifact pipeline does not reliably restore the Unix
       # executable bit, so the downloaded binaries need chmod before use.
       - name: Make downloaded binaries executable
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: chmod -R +x openms/build/bin openms/_thirdparty
 
       - name: Run smoke benchmark
         shell: bash
         env:
-          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
-          ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
-          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
-          OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
+          # Both modes feed the same runner contract. Source mode resolves to
+          # the pre-Stage-1 literal paths; package mode to the extracted prefix
+          # (which resolves its own libs via RUNPATH and its own shared data,
+          # proven by the nightly probe — hence empty LD_LIBRARY_PATH/
+          # OPENMS_DATA_PATH there).
+          OPENMS_BIN: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/bin', runner.temp) || format('{0}/openms/build/bin', github.workspace) }}
+          ENGINES_DIR: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/share/OpenMS/THIRDPARTY', runner.temp) || format('{0}/openms/_thirdparty', github.workspace) }}
+          LD_LIBRARY_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) }}
+          OPENMS_DATA_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/share/OpenMS', github.workspace) }}
+          OPENMS_SHA: ${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh
 
-      # Compute artifact size for the normalization step (build job does not
-      # expose this directly). The vcpkg runtime lib dir contributes nothing
-      # on legacy-model builds (du skips missing dirs).
+      # Compute artifact size for the normalization step. Source mode: the
+      # binaries layout as before (vcpkg runtime lib dir contributes nothing
+      # on legacy-model builds; du skips missing dirs).
       - name: Compute artifact size
         id: artifact-size
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           bytes=$(du -sb openms/build/bin openms/build/lib $( [ -d openms/build/vcpkg_installed/x64-linux-dynamic/lib ] && printf '%s ' openms/build/vcpkg_installed/x64-linux-dynamic/lib ) openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
+
+      # Package mode: the extracted prefix size (recorded during resolution).
+      - name: Compute package artifact size
+        id: package-artifact-size
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: echo "bytes=${{ steps.runtime.outputs.artifact_bytes }}" >> "$GITHUB_OUTPUT"
 
       # Real cache state: report "warm" only when the vcpkg binary cache was
       # actually restored in the build job (legacy builds have no vcpkg cache
       # and are recorded as "none", matching the previous hardcoding).
       - name: Derive cache state
         id: cache-state
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           cache="none"
@@ -331,7 +602,26 @@ jobs:
           fi
           echo "cache=$cache" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize smoke results to v2 (package mode)
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize smoke \
+            results/smoke.json \
+            --run-id "${{ github.run_id }}" \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache none \
+            --build-time 0 \
+            --artifact-bytes "${{ steps.package-artifact-size.outputs.bytes }}" \
+            --runtime-source package \
+            --package-filename "${{ needs.package-runtime.outputs.package_filename }}" \
+            --package-sha256 "${{ needs.package-runtime.outputs.package_sha256 }}" \
+            --package-archive-dir "${{ needs.package-runtime.outputs.archive_dir }}" \
+            --package-date "${{ needs.package-runtime.outputs.package_date }}" \
+            --results-dir results
+
       - name: Normalize smoke results to v2
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           python benchmark/report/report_generate.py normalize smoke \
@@ -346,56 +636,91 @@ jobs:
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-results-${{ needs.build-openms.outputs.openms_sha }}
+          name: benchmark-results-${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           path: results
           if-no-files-found: error
 
   run-openswath-benchmark:
     name: "OpenSwath DIA benchmark"
     runs-on: ubuntu-24.04
-    needs: build-openms
+    needs: [build-openms, package-runtime]
+    if: ${{ !cancelled() && needs.build-openms.result != 'failure' && needs.package-runtime.result != 'failure' && (needs.build-openms.result == 'success' || needs.package-runtime.result == 'success') }}
     steps:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
 
+      # Package mode only: fetch, verify, and extract the .deb on THIS runner
+      # (same procedure as the smoke job's package step). Source mode skips
+      # this step entirely.
+      - name: Resolve package runtime (package mode)
+        id: runtime
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 900 -o /tmp/openms-nightly.deb \
+            "https://archive.openms.de/openms/OpenMSInstaller/nightly/${{ needs.package-runtime.outputs.archive_dir }}/${{ needs.package-runtime.outputs.package_filename }}"
+          echo "$(sha256sum /tmp/openms-nightly.deb)" | grep -q "^${{ needs.package-runtime.outputs.package_sha256 }} " \
+            || { echo "ERROR: downloaded package does not match the SHA256 resolved by package-runtime" >&2; exit 1; }
+          sudo apt-get update -qq
+          depends=$(dpkg-deb -f /tmp/openms-nightly.deb Depends)
+          echo "Depends: $depends"
+          sudo apt-get -y -qq satisfy --no-install-recommends "$depends"
+          prefix="$RUNNER_TEMP/deb-prefix"
+          dpkg-deb -x /tmp/openms-nightly.deb "$prefix"
+          rm -f /tmp/openms-nightly.deb
+          echo "artifact_bytes=$(du -sb "$prefix" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - name: Install runtime dependencies
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           curl -fsSL "https://raw.githubusercontent.com/OpenMS/OpenMS/${{ needs.build-openms.outputs.openms_sha }}/tools/ci/deps-ubuntu.sh" -o deps-ubuntu.sh
           bash deps-ubuntu.sh --skip-gui-deps
 
       - name: Download OpenMS binaries
+        if: ${{ inputs.runtime_source != 'package' }}
         uses: actions/download-artifact@v8
         with:
           name: openms-bin-${{ needs.build-openms.outputs.openms_sha }}
           path: openms
 
       - name: Make downloaded binaries executable
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: chmod -R +x openms/build/bin openms/_thirdparty
 
       - name: Run OpenSwath benchmark
         shell: bash
         env:
-          OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
-          LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
-          OPENMS_DATA_PATH: ${{ github.workspace }}/openms/share/OpenMS
-          OPENMS_SHA: ${{ needs.build-openms.outputs.openms_sha }}
+          OPENMS_BIN: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/bin', runner.temp) || format('{0}/openms/build/bin', github.workspace) }}
+          ENGINES_DIR: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/share/OpenMS/THIRDPARTY', runner.temp) || format('{0}/openms/_thirdparty', github.workspace) }}
+          LD_LIBRARY_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) }}
+          OPENMS_DATA_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/share/OpenMS', github.workspace) }}
+          OPENMS_SHA: ${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-openswath
         run: bash benchmark/run_openswath_benchmark.sh
 
       - name: Compute artifact size
         id: artifact-size
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           bytes=$(du -sb openms/build/bin openms/build/lib $( [ -d openms/build/vcpkg_installed/x64-linux-dynamic/lib ] && printf '%s ' openms/build/vcpkg_installed/x64-linux-dynamic/lib ) openms/share/OpenMS openms/_thirdparty 2>/dev/null | awk '{s+=$1} END{print s}')
           echo "bytes=${bytes:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute package artifact size
+        id: package-artifact-size
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: echo "bytes=${{ steps.runtime.outputs.artifact_bytes }}" >> "$GITHUB_OUTPUT"
 
       # Main's normalize contract: raw CI openswath.json (v1) + required
       # build-time/artifact-bytes provenance, normalized output written into
       # the results dir and shipped in the artifact.
       - name: Derive cache state
         id: cache-state
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           cache="none"
@@ -404,7 +729,26 @@ jobs:
           fi
           echo "cache=$cache" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize OpenSwath results to v2 (package mode)
+        if: ${{ inputs.runtime_source == 'package' }}
+        shell: bash
+        run: |
+          python benchmark/report/report_generate.py normalize openswath \
+            results-openswath/openswath.json \
+            --run-id "${{ github.run_id }}" \
+            --run-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache none \
+            --build-time 0 \
+            --artifact-bytes "${{ steps.package-artifact-size.outputs.bytes }}" \
+            --runtime-source package \
+            --package-filename "${{ needs.package-runtime.outputs.package_filename }}" \
+            --package-sha256 "${{ needs.package-runtime.outputs.package_sha256 }}" \
+            --package-archive-dir "${{ needs.package-runtime.outputs.archive_dir }}" \
+            --package-date "${{ needs.package-runtime.outputs.package_date }}" \
+            --results-dir results-openswath
+
       - name: Normalize OpenSwath results to v2
+        if: ${{ inputs.runtime_source != 'package' }}
         shell: bash
         run: |
           python benchmark/report/report_generate.py normalize openswath \
@@ -419,7 +763,7 @@ jobs:
       - name: Upload OpenSwath benchmark results
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-openswath-${{ needs.build-openms.outputs.openms_sha }}
+          name: benchmark-openswath-${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           path: results-openswath
           if-no-files-found: error
   # ---------------------------------------------------------------------------
@@ -444,6 +788,10 @@ jobs:
     name: "Build OpenMS with ONNX (ProSE + PeptDeep, fixed SHA)"
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # ONNX benchmarking requires a source build with WITH_ONNX=ON; published
+    # Debian packages do not contain ONNX Runtime (verified: no libonnxruntime
+    # and no share/OpenMS/models/*.onnx in the nightly payload).
+    if: ${{ inputs.runtime_source != 'package' }}
     outputs:
       openms_sha: ${{ steps.sha.outputs.sha }}
     steps:
@@ -717,6 +1065,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: build-openms-onnx
+    # Capability gate: ONNX benchmarks require the source ONNX build. Package
+    # mode provides no ONNX Runtime today (verified from the package payload),
+    # so these jobs are skipped there rather than failing or pretending.
+    if: ${{ !cancelled() && needs.build-openms-onnx.result == 'success' }}
     steps:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
@@ -871,6 +1223,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: build-openms-onnx
+    # Capability gate: see run-prose-peptdeep-benchmark.
+    if: ${{ !cancelled() && needs.build-openms-onnx.result == 'success' }}
     steps:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
@@ -1384,19 +1738,38 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - build-openms
+      - package-runtime
       - run-smoke-benchmark
       - run-openswath-benchmark
       - run-prose-peptdeep-benchmark
       - run-prose-pxd028735-benchmark
     if: ${{ !cancelled() }}
     steps:
+      # One label for the whole job: source mode keys everything by the built
+      # SHA (pre-Stage-1 behavior, preserved exactly); package mode keys by
+      # the package's embedded SHA (build-openms is skipped there, so its
+      # output would be empty).
+      - name: Resolve report label
+        id: label
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.runtime_source }}" == "package" ]]; then
+            echo "sha=${{ needs.package-runtime.outputs.openms_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ needs.build-openms.outputs.openms_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
 
+      # Artifact pattern is runtime-dependent: source mode keys artifacts by
+      # the built SHA (pre-Stage-1 behavior, preserved exactly); package mode
+      # keys by the package's embedded SHA, unknown at plan time.
       - name: Download benchmark result artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: benchmark-*-${{ needs.build-openms.outputs.openms_sha }}
+          pattern: ${{ inputs.runtime_source == 'package' && 'benchmark-*' || format('benchmark-*-{0}', needs.build-openms.outputs.openms_sha) }}
           merge-multiple: true
           path: results
 
@@ -1424,7 +1797,7 @@ jobs:
       - name: Upload report
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-report-${{ needs.build-openms.outputs.openms_sha }}
+          name: benchmark-report-${{ steps.label.outputs.sha }}
           path: benchmark/reports/report.html
           if-no-files-found: error
 
@@ -1433,10 +1806,10 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Benchmark report (${{ needs.build-openms.outputs.openms_sha }})"
+            echo "## Benchmark report (${{ steps.label.outputs.sha }})"
             echo ""
             echo "Current-run verdict: **${{ steps.render.outputs.verdict }}**"
             echo ""
             echo "report.html is attached to this run as artifact"
-            echo "benchmark-report-${{ needs.build-openms.outputs.openms_sha }}."
+            echo "benchmark-report-${{ steps.label.outputs.sha }}."
           } >> "$GITHUB_STEP_SUMMARY"
