@@ -564,8 +564,12 @@ jobs:
           # OPENMS_DATA_PATH there).
           OPENMS_BIN: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/bin', runner.temp) || format('{0}/openms/build/bin', github.workspace) }}
           ENGINES_DIR: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/share/OpenMS/THIRDPARTY', runner.temp) || format('{0}/openms/_thirdparty', github.workspace) }}
-          LD_LIBRARY_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) }}
-          OPENMS_DATA_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/share/OpenMS', github.workspace) }}
+          # Note the inverted condition: `cond && '' || fallback` never yields
+          # an empty value (GHA treats '' as falsy), so package mode would leak
+          # the source-mode paths. Inverted form genuinely emits '' in package
+          # mode; the source paths are always truthy, so source mode is unchanged.
+          LD_LIBRARY_PATH: ${{ inputs.runtime_source != 'package' && format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) || '' }}
+          OPENMS_DATA_PATH: ${{ inputs.runtime_source != 'package' && format('{0}/openms/share/OpenMS', github.workspace) || '' }}
           OPENMS_SHA: ${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results
         run: bash benchmark/run_smoke_benchmark.sh
@@ -695,8 +699,12 @@ jobs:
         env:
           OPENMS_BIN: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/bin', runner.temp) || format('{0}/openms/build/bin', github.workspace) }}
           ENGINES_DIR: ${{ inputs.runtime_source == 'package' && format('{0}/deb-prefix/usr/share/OpenMS/THIRDPARTY', runner.temp) || format('{0}/openms/_thirdparty', github.workspace) }}
-          LD_LIBRARY_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) }}
-          OPENMS_DATA_PATH: ${{ inputs.runtime_source == 'package' && '' || format('{0}/openms/share/OpenMS', github.workspace) }}
+          # Note the inverted condition: `cond && '' || fallback` never yields
+          # an empty value (GHA treats '' as falsy), so package mode would leak
+          # the source-mode paths. Inverted form genuinely emits '' in package
+          # mode; the source paths are always truthy, so source mode is unchanged.
+          LD_LIBRARY_PATH: ${{ inputs.runtime_source != 'package' && format('{0}/openms/build/lib:{0}/openms/build/vcpkg_installed/x64-linux-dynamic/lib', github.workspace) || '' }}
+          OPENMS_DATA_PATH: ${{ inputs.runtime_source != 'package' && format('{0}/openms/share/OpenMS', github.workspace) || '' }}
           OPENMS_SHA: ${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           RESULTS_DIR: ${{ github.workspace }}/results-openswath
         run: bash benchmark/run_openswath_benchmark.sh
