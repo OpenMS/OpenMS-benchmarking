@@ -215,13 +215,37 @@ Continuous integration
 --------
 
 The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs on
-`workflow_dispatch` with two inputs:
+`workflow_dispatch` with the following inputs:
 
-- `openms_sha` - the OpenMS commit SHA to build and benchmark (default: a
-  pinned develop SHA; the full SHA is resolved and recorded in every result)
+- `runtime_source` - `source` (default) or `package` (see below)
+- `openms_sha` - the OpenMS commit SHA to build and benchmark in source mode
+  (default: a pinned develop SHA; the full SHA is resolved and recorded in
+  every result). In package mode this input is optional: if set, the
+  package's embedded OpenMS SHA must match it or the run fails loudly (a
+  package can only satisfy an SHA request by actually being that revision).
+- `package_date` - package mode only: nightly archive date (`YYYY.MM.DD`,
+  the upload-day directory; the .deb inside is the prior night's build).
+  Empty selects the newest available at dispatch.
 - `use_ms2rescore` - `false` (default). The choice is recorded in the
   results, but MS2Rescore is not executed; rescoring belongs to the extended
   benchmark, which this repository does not run yet.
+- `nightly_deb_probe` - opt-in packaging-health probe (independent of
+  `runtime_source`).
+
+**Runtime modes.** With `runtime_source=source` (the default), OpenMS is
+built from the pinned SHA exactly as before: exact-SHA semantics, all
+benchmarks (Smoke, OpenSwath, ProSE/PeptDeep, PXD028735). With
+`runtime_source=package`, the published Debian nightly .deb is downloaded,
+its declared dependencies satisfied, and the extracted package provides the
+benchmark runtime: Smoke and OpenSwath run against the packaged binaries via
+the same runner scripts and the same `OPENMS_BIN`/`ENGINES_DIR`/`OPENMS_SHA`
+contract the source path uses. Package provenance (filename, SHA256, archive
+date, and the OpenMS revision embedded in the package's
+`openms_package_version.h`) is recorded in every result, and the report
+labels package runs explicitly so they can never be mistaken for exact-SHA
+builds. ProSE/PeptDeep do not run in package mode today: published packages
+contain no ONNX Runtime, and benchmark support is claimed only for runners
+that have actually executed - it is never inferred from binary availability.
 
 Jobs, in dependency order:
 

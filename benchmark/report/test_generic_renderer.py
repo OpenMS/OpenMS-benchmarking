@@ -30,7 +30,8 @@ from report_generate import (
     _metrics, _verdict, _cache, _stages, _build, _software_version,
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
     _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
-    normalize_openswath
+    normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED,
+    _runtime_source, _runtime_identity, render_cmd
 )
 
 
@@ -699,10 +700,214 @@ def _write_raw_openswath(path, run_id, run_at, wall=2.76, verdict="pass"):
 def _normalize_args(raw_path, run_id, results_dir, **overrides):
     import argparse
     kw = dict(cache="", build_time=3412.0, artifact_bytes=149265164,
-              run_at="", dataset="", out=None)
+              run_at="", dataset="", out=None,
+              runtime_source="source", package_filename="", package_sha256="",
+              package_archive_dir="", package_date="")
     kw.update(overrides)
     return argparse.Namespace(openswath_json=raw_path, run_id=run_id,
                               results_dir=results_dir, **kw)
+
+
+def _mk_run(bench, run_id, sha, run_at, cache="none"):
+    """Minimal stored v2 OpenMS run for baseline-selection tests."""
+    return {
+        "schema": "openms-benchmarking/report/v2",
+        "_file": f"{bench}/openms/{bench}-{run_id}.json",
+        "identity": {
+            "benchmark": bench,
+            "benchmark_version": 1,
+            "dataset": "synthetic",
+            "software": {"name": "OpenMS", "version": sha},
+            "configuration": {"use_ms2rescore": False},
+        },
+        "run": {"run_id": run_id, "run_at": run_at, "cache": cache},
+        "performance": {
+            "wall_time_s": 1.0, "cpu_time_s": 1.0, "peak_rss_kb": 1,
+            "build": {"wall_time_s": 60.0, "artifact_bytes": 1000},
+            "stages": [],
+        },
+        "metrics": {"verdict": "pass"},
+    }
+
+
+def test_sha_is_ancestor_offline_safe(monkeypatch=None):
+    """_sha_is_ancestor treats unknown/failed lookups as None (never raises)
+    and short-form prefixes of the same commit are not ancestors."""
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    try:
+        # short-form prefix of itself -> same commit -> not an ancestor
+        full = "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+        assert _sha_is_ancestor(full, full) is False
+        assert _sha_is_ancestor(full[:10], full) is False
+        assert _sha_is_ancestor(full, full[:10]) is False
+        # empty inputs are unknown
+        assert _sha_is_ancestor("", full) is None
+        # unreachable API -> None, not an exception (bogus host + no network
+        # path is not a GitHub error class we can rely on, so assert only on
+        # the non-raising contract for empty/disabled cases)
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        import report_generate
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_sha_is_ancestor_uses_compare_api(monkeypatch=None):
+    """The compare-API path returns True for ancestors and False for
+    non-ancestors, using an injected urllib handler (no real network)."""
+    import report_generate
+    import urllib.request as _ur
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def make_urlopen(compare_status):
+        def urlopen(req, timeout=None):
+            url = req.full_url
+            assert "api.github.com/repos/OpenMS/OpenMS/compare/" in url
+            # report_generate reads via json.load(resp): feed a tiny file obj
+            import io
+
+            resp_read = io.BytesIO(
+                ('{"status": "%s"}' % compare_status).encode("ascii")
+            )
+            resp_read.__enter__ = lambda s: s
+            resp_read.__exit__ = lambda s, *a: False
+            return resp_read
+        return urlopen
+
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    real_urlopen = _ur.urlopen
+    try:
+        base = "5f0f5de7b5019a9114a8231670534b1621250556"
+        head = "e4b9609c95cac0c64b7d991d0c047d5fac2c7a27"
+        _ur.urlopen = make_urlopen("ahead")  # base is ancestor of head
+        assert _sha_is_ancestor(base, head) is True
+        assert (base, head) in _GH_COMPARE_CACHE  # cached
+
+        other = "ffffffffffffffffffffffffffffffffffffffff"
+        _ur.urlopen = make_urlopen("diverged")  # not an ancestor
+        assert _sha_is_ancestor(other, head) is False
+    finally:
+        _ur.urlopen = real_urlopen
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_sha_is_ancestor_rate_limit_disables(monkeypatch=None):
+    """A 403/429 response disables further API use for the process instead of
+    hammering a rate-limited endpoint; already-cached pairs stay cached."""
+    import report_generate
+    import urllib.error
+    import urllib.request as _ur
+
+    calls = []
+
+    def urlopen_403(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 403, "rate limited", {}, None)
+
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    real_urlopen = _ur.urlopen
+    try:
+        _ur.urlopen = urlopen_403
+        assert _sha_is_ancestor("aaaa", "bbbb") is None
+        assert _sha_is_ancestor("cccc", "dddd") is None
+        assert len(calls) == 1  # second lookup served from the disabled flag
+        assert report_generate._GH_API_DISABLED is True
+    finally:
+        _ur.urlopen = real_urlopen
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        report_generate._GH_API_DISABLED = old_disabled
+
+
+def test_pick_baseline_prefers_ancestor_sha():
+    """With SHA ancestry available, the baseline is the newest ancestor run,
+    even when a newer non-ancestor run exists by timestamp."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache = _GH_COMPARE_CACHE.copy()
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = True   # run A is an ancestor
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = False  # run B is NOT (diverged)
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "A", _run_id(baseline)
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+
+
+def test_pick_baseline_falls_back_to_timestamp_when_no_ancestor():
+    """No ancestor (or ancestry unresolvable) -> timestamp rule, unchanged."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache = _GH_COMPARE_CACHE.copy()
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = False  # A is not an ancestor
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = False  # B is not an ancestor
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "B"  # latest by run_at
+        # same result when ancestry explicitly disabled
+        baseline = pick_baseline(current, runs, use_sha_ancestry=False)
+        assert _run_id(baseline) == "B"
+        # and when the current run's SHA is unusable
+        current2 = _mk_run("smoke", "C", "unknown", "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current2, runs)
+        assert _run_id(baseline) == "B"
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+
+
+def test_pick_baseline_unknown_ancestry_falls_back():
+    """Unresolvable ancestry (API unavailable -> None) falls back to the
+    timestamp rule rather than crashing or selecting nothing."""
+    sha_a = "1111111111111111111111111111111111111111"
+    sha_b = "2222222222222222222222222222222222222222"
+    sha_c = "3333333333333333333333333333333333333333"
+    old_cache, old_disabled = _GH_COMPARE_CACHE.copy(), _GH_API_DISABLED
+    _GH_COMPARE_CACHE.clear()
+    _GH_COMPARE_CACHE[(sha_a, sha_c)] = None  # ancestry unresolvable
+    _GH_COMPARE_CACHE[(sha_b, sha_c)] = None
+    try:
+        runs = [
+            _mk_run("smoke", "A", sha_a, "2026-08-01T00:00:00Z"),
+            _mk_run("smoke", "B", sha_b, "2026-08-02T00:00:00Z"),
+        ]
+        current = _mk_run("smoke", "C", sha_c, "2026-08-03T00:00:00Z")
+        baseline = pick_baseline(current, runs)
+        assert _run_id(baseline) == "B"
+    finally:
+        _GH_COMPARE_CACHE.clear()
+        _GH_COMPARE_CACHE.update(old_cache)
+        import report_generate
+        report_generate._GH_API_DISABLED = old_disabled
 
 
 def test_normalize_openswath_to_v2():
@@ -803,6 +1008,252 @@ def test_normalize_openswath_baseline_comparison():
         shutil.rmtree(tmpdir)
 
 
+def test_normalize_openswath_missing_correctness_defaults():
+    """Adapted from PR #1's test_normalize_openswath_missing_files: a raw result
+    without correctness/tool_versions blocks normalizes with empty defaults
+    instead of crashing (promised by the current raw-JSON implementation)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "MIN", "2026-08-26T18:40:29Z")
+        raw.pop("correctness")
+        raw.pop("tool_versions")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "MIN", tmpdir))
+
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-MIN.json")
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["schema"] == "openms-benchmarking/report/v2"
+        assert out["correctness"] == {}
+        assert out["tool_versions"] == {}
+        assert out["metrics"]["verdict"] == "pass"
+        print("  PASS: normalize openswath missing correctness/tool_versions -> empty defaults")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_missing_or_empty_stages():
+    """Adapted from PR #1's test_normalize_openswath_missing_stages/_empty_stages:
+    missing or empty stage lists must not crash and must aggregate to zero,
+    with verdict taken from the raw payload (default 'unknown')."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "NOSTAGE", "2026-08-26T18:40:29Z")
+        raw.pop("stages")
+        raw.pop("verdict")
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "NOSTAGE", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-NOSTAGE.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["performance"]["stages"] == []
+        assert out["performance"]["wall_time_s"] == 0
+        assert out["performance"]["cpu_time_s"] == 0
+        assert out["performance"]["peak_rss_kb"] == 0
+        assert out["metrics"]["verdict"] == "unknown"
+
+        raw2_path = os.path.join(tmpdir, "openswath-empty.json")
+        raw2 = _write_raw_openswath(raw2_path, "EMPTYSTAGE", "2026-08-26T18:40:29Z")
+        raw2["stages"] = []
+        with open(raw2_path, "w", encoding="utf-8") as fh:
+            json.dump(raw2, fh)
+        normalize_openswath(_normalize_args(raw2_path, "EMPTYSTAGE", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-EMPTYSTAGE.json"), encoding="utf-8") as fh:
+            out2 = json.load(fh)
+        assert out2["performance"]["stages"] == []
+        assert out2["performance"]["wall_time_s"] == 0
+        print("  PASS: normalize openswath missing/empty stages -> zero aggregates")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_failure_propagation():
+    """Adapted from PR #1's test_normalize_openswath_required_stage_fail: a failing
+    required stage and a fail verdict must survive normalization unchanged."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "FAILRUN", "2026-08-26T18:40:29Z",
+                                   wall=0.5, verdict="fail")
+        raw["stages"][0]["status"] = "fail"
+        raw["stages"][0]["exit_code"] = 1
+        raw["stages"][0]["reason"] = "crashed"
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "FAILRUN", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-FAILRUN.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["metrics"]["verdict"] == "fail"
+        st = out["performance"]["stages"][0]
+        assert st["status"] == "fail" and st["exit_code"] == 1
+        assert st["reason"] == "crashed"
+        assert out["performance"]["wall_time_s"] == 0.5
+        print("  PASS: normalize openswath failure propagation")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_runtime_source_default():
+    """Pre-Stage-1 results (no identity.runtime) read as source mode."""
+    run = {"schema": "openms-benchmarking/report/v2",
+           "identity": {"benchmark": "smoke", "software": {"version": "abc123"}}}
+    assert _runtime_source(run) == "source"
+    # _runtime_identity with default args emits the minimal source object
+    import argparse
+    ns = argparse.Namespace(runtime_source="source")
+    assert _runtime_identity(ns) == {"runtime_source": "source"}
+    print("  PASS: runtime_source defaults to source")
+
+
+def test_runtime_identity_package_requires_metadata():
+    """Package mode without full package metadata must fail loudly (normalize
+    can never write a package run whose provenance is incomplete)."""
+    import argparse
+    ns = argparse.Namespace(runtime_source="package", package_filename="",
+                            package_sha256="abc", package_archive_dir="",
+                            package_date="")
+    try:
+        _runtime_identity(ns)
+    except SystemExit:
+        print("  PASS: package identity refuses incomplete metadata")
+    else:
+        raise AssertionError("incomplete package metadata did not fail")
+
+
+def test_normalize_openswath_package_provenance():
+    """normalize openswath with --runtime-source package records the full
+    package identity and keeps it distinct from a source run's identity."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        _write_raw_openswath(raw_path, "424242", "2026-09-27T00:00:00Z")
+        normalize_openswath(_normalize_args(
+            raw_path, "424242", tmpdir,
+            runtime_source="package",
+            package_filename="OpenMS-3.6.0-pre-nightly-2026-09-24-Debian-Linux-x86_64.deb",
+            package_sha256="deadbeef" * 8,
+            package_archive_dir="2026.09.25",
+            package_date="2026-09-24",
+            build_time=0.0,
+        ))
+        out_path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                "openswath_dia-424242.json")
+        with open(out_path, encoding="utf-8") as fh:
+            out = json.load(fh)
+        rt = out["identity"]["runtime"]
+        assert rt["runtime_source"] == "package"
+        assert rt["package"]["filename"].endswith(".deb")
+        assert rt["package"]["sha256"] == "deadbeef" * 8
+        assert rt["package"]["archive_dir"] == "2026.09.25"
+        assert rt["package"]["date"] == "2026-09-24"
+        # ...and the same file still round-trips through the loader
+        runs, _ = load_results(tmpdir)
+        assert len(runs) == 1 and _runtime_source(runs[0]) == "package"
+        print("  PASS: normalize openswath records package provenance")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_package_run_excluded_from_sha_ancestry():
+    """A package run must never be selected as an SHA-ancestor baseline, and a
+    package current run must fall back to the timestamp rule."""
+    base = _mk_run("smoke", "111", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                   "2026-09-01T00:00:00Z")
+    base["identity"]["runtime"] = {"runtime_source": "source"}
+    pkg_newer = _mk_run("smoke", "222", "8b25c6e",
+                        "2026-09-02T00:00:00Z")
+    pkg_newer["identity"]["runtime"] = {
+        "runtime_source": "package",
+        "package": {"filename": "x.deb", "sha256": "d" * 64,
+                    "archive_dir": "2026.09.03", "date": "2026-09-02"},
+    }
+    current = _mk_run("smoke", "333", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                      "2026-09-03T00:00:00Z")
+    current["identity"]["runtime"] = {"runtime_source": "source"}
+    import report_generate
+    saved_fn = report_generate._sha_is_ancestor
+    try:
+        # Deterministic ancestry: every source run is an "ancestor". The
+        # package run must be filtered from the candidate pool BEFORE this
+        # predicate is consulted, so despite qualifying by SHA it can't win.
+        report_generate._sha_is_ancestor = lambda b, h: True
+        b1 = pick_baseline(current, [base, pkg_newer, current])
+        assert b1 is base, "package run selected as SHA-ancestor baseline"
+        # Package current: ancestry comparison is skipped entirely, so even a
+        # source run that would qualify by SHA is not used; timestamp decides.
+        report_generate._sha_is_ancestor = lambda b, h: False
+        b2 = pick_baseline(pkg_newer, [base, current, pkg_newer])
+        assert b2 is base, "package current did not fall back to timestamp rule"
+    finally:
+        report_generate._sha_is_ancestor = saved_fn
+    print("  PASS: package runs excluded from SHA-ancestor selection")
+
+
+def test_current_run_never_its_own_baseline():
+    """--current must never compare a run against itself: the current file is
+    also discovered from the results tree as a *separate* object, and
+    pick_baseline excludes only by object identity. Baseline selection must
+    therefore exclude the current run by file path; with no other candidates
+    the report renders without a comparison card instead of self-comparing."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        run = {"schema": "openms-benchmarking/report/v2",
+               "identity": {"benchmark": "smoke", "dataset": "t",
+                            "software": {"version": "a" * 40}},
+               "run": {"run_id": "77", "run_at": "2026-09-01T00:00:00Z",
+                       "cache": "none"},
+               "performance": {"stages": []},
+               "metrics": {"verdict": "pass"}}
+        cur_path = os.path.join(tmpdir, "smoke", "openms", "smoke-77.json")
+        os.makedirs(os.path.dirname(cur_path), exist_ok=True)
+        with open(cur_path, "w", encoding="utf-8") as fh:
+            json.dump(run, fh)
+
+        import argparse
+        args = argparse.Namespace(results_dir=tmpdir, current=cur_path,
+                                  baseline=None, no_sha_baseline=False,
+                                  out=os.path.join(tmpdir, "report.html"))
+        render_cmd(args)  # must not exit even with zero baseline candidates
+        with open(args.out, encoding="utf-8") as fh:
+            html = fh.read()
+        assert "current vs previous run" not in html, \
+            "current run was compared against itself"
+        print("  PASS: --current is never its own baseline")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_promote_v1_carries_file_reference():
+    """load_results records _file before v1 promotion; the promoted run must
+    keep it. Without this, every promoted v1 run renders with an empty source
+    label and --current deduplication (which keys on _file) cannot see it."""
+    v1 = {"schema": "openms-benchmarking/report/v1", "source": "openms",
+          "benchmark": "smoke", "run_id": "5",
+          "run_at": "2026-08-01T00:00:00Z",
+          "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024"}
+    v1["_file"] = "smoke/openms/smoke-5.json"  # as load_results sets it
+    promoted = _promote_v1(v1)
+    assert promoted.get("_file") == "smoke/openms/smoke-5.json"
+    # ...and a v1 run discovered from disk carries it end to end
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "openms"))
+        with open(os.path.join(tmpdir, "openms", "smoke-5.json"), "w") as fh:
+            json.dump(v1, fh)
+        runs, _ = load_results(tmpdir)
+        assert runs and runs[0].get("_file") == "openms/smoke-5.json"
+        print("  PASS: v1 promotion carries the _file reference")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -824,7 +1275,22 @@ def main():
         test_proteobench_no_spurious_stage_keys,
         test_normalize_openswath_to_v2,
         test_normalize_openswath_rejects_nonfinite,
+        test_sha_is_ancestor_offline_safe,
+        test_sha_is_ancestor_uses_compare_api,
+        test_sha_is_ancestor_rate_limit_disables,
+        test_pick_baseline_prefers_ancestor_sha,
+        test_pick_baseline_falls_back_to_timestamp_when_no_ancestor,
+        test_pick_baseline_unknown_ancestry_falls_back,
         test_normalize_openswath_baseline_comparison,
+        test_normalize_openswath_missing_correctness_defaults,
+        test_normalize_openswath_missing_or_empty_stages,
+        test_normalize_openswath_failure_propagation,
+        test_runtime_source_default,
+        test_runtime_identity_package_requires_metadata,
+        test_normalize_openswath_package_provenance,
+        test_package_run_excluded_from_sha_ancestry,
+        test_current_run_never_its_own_baseline,
+        test_promote_v1_carries_file_reference,
     ]
     passed = 0
     failed = 0

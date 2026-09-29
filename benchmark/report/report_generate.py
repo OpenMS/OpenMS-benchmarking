@@ -47,12 +47,22 @@ Subcommands:
     normalize proteobench <local-proteobench.json> --label LABEL [--out PATH]
         Convert a local ProteoBench scoring result into a tool result.
 
-    render [--results-dir DIR] [--current PATH] [--out report.html]
+    render [--results-dir DIR] [--current PATH] [--baseline RUN-ID|SHA|PATH]
+           [--no-sha-baseline] [--out report.html]
         Discover all results, compare the current run against the stored
         baseline, and render report.html.
+
+        Baseline selection: an explicit --baseline wins; otherwise the default
+        is the latest stored run of the same benchmark whose OpenMS version is
+        an ancestor of the current run's version (resolved via the GitHub
+        compare API, cached per render). If no ancestor run is known, or
+        ancestry cannot be resolved (offline, rate-limited), it falls back to
+        the previous timestamp rule; --no-sha-baseline disables the ancestry
+        step entirely.
 """
 
 import argparse
+import csv
 import datetime as _dt
 import glob
 import html
@@ -61,9 +71,56 @@ import math
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 SCHEMA_V1 = "openms-benchmarking/report/v1"
 SCHEMA_V2 = "openms-benchmarking/report/v2"
+
+
+# ---------------------------------------------------------------------------
+# Runtime provenance (Stage 1: package-vs-source).
+#
+# identity.runtime is ADDITIVE in the v2 schema: source-mode results carry
+# {"runtime_source": "source"} and are otherwise byte-identical to the
+# pre-Stage-1 output. Package-mode results additionally carry a "package"
+# object (filename, sha256, archive_dir, date) so a packaged run can never be
+# mistaken for an exact-SHA source build in the report.
+# ---------------------------------------------------------------------------
+def _add_runtime_source_args(parser):
+    """Attach the shared runtime-provenance options to a normalize subparser."""
+    parser.add_argument("--runtime-source", choices=["source", "package"],
+                        default="source",
+                        help="where the benchmarked OpenMS binaries came from")
+    parser.add_argument("--package-filename", default="",
+                        help="package mode: .deb filename as published")
+    parser.add_argument("--package-sha256", default="",
+                        help="package mode: SHA256 of the .deb")
+    parser.add_argument("--package-archive-dir", default="",
+                        help="package mode: nightly archive upload-day directory")
+    parser.add_argument("--package-date", default="",
+                        help="package mode: build night encoded in the package")
+
+
+def _runtime_identity(args):
+    """Build the identity.runtime object from normalize args (None when absent)."""
+    src = getattr(args, "runtime_source", "source") or "source"
+    runtime = {"runtime_source": src}
+    if src == "package":
+        pkg = {
+            "filename": getattr(args, "package_filename", ""),
+            "sha256": getattr(args, "package_sha256", ""),
+            "archive_dir": getattr(args, "package_archive_dir", ""),
+            "date": getattr(args, "package_date", ""),
+        }
+        missing = [k for k, v in pkg.items() if not v]
+        if missing:
+            sys.exit("normalize package-mode run missing required package metadata: "
+                     + ", ".join("--package-" + m.replace("_", "-") for m in missing))
+        runtime["package"] = pkg
+    return runtime
+
 SCHEMA = SCHEMA_V2  # default output schema
 
 # ---------------------------------------------------------------------------
@@ -181,6 +238,11 @@ def _software_version(result):
     return _identity(result).get("software", {}).get("version", "unknown")
 
 
+def _runtime_source(result):
+    """Return 'source' or 'package' (default 'source' for pre-Stage-1 results)."""
+    return _identity(result).get("runtime", {}).get("runtime_source", "source")
+
+
 def _benchmark_name(result):
     """Return the benchmark name from a v2 result."""
     return _identity(result).get("benchmark", "unknown")
@@ -282,6 +344,12 @@ def _promote_v1(data):
     # Carry over openms metrics that aren't verdict
     if data.get("metrics"):
         promoted["metrics"].update(data["metrics"])
+    # Carry over the discovery path (load_results sets _file before calling
+    # this): without it every promoted v1 run loses its file reference and
+    # renders with an empty source label; --current deduplication also keys
+    # on this field.
+    if data.get("_file"):
+        promoted["_file"] = data["_file"]
     return promoted
 
 
@@ -335,16 +403,98 @@ def load_results(results_dir):
     return openms_runs, tool_results
 
 
-def pick_baseline(current, openms_runs):
-    """The stored baseline = the previous OpenMS run of the same benchmark."""
+# GitHub compare-API cache for SHA-ancestor baseline selection (per render).
+_GH_COMPARE_CACHE = {}
+_GH_API_DISABLED = False
+
+
+def _sha_is_ancestor(base_sha, head_sha):
+    """True if base_sha is an ancestor of head_sha, False if not, None if unknown.
+
+    Uses the GitHub compare API on OpenMS/OpenMS: compare(base...head) reports
+    status "ahead" exactly when base is an ancestor of head. Rate limiting
+    (403/429) and network/infrastructure failures disable further lookups for
+    this process; per-pair unknowns (e.g. 404 for a version string that is not
+    a commit) are cached without disabling. Callers must treat None as "fall
+    back to the timestamp rule".
+    """
+    global _GH_API_DISABLED
+    if not base_sha or not head_sha:
+        return None
+    if base_sha == head_sha or head_sha.startswith(base_sha) or base_sha.startswith(head_sha):
+        return False  # same commit (full or short form) is not an ancestor
+    key = (base_sha, head_sha)
+    if key in _GH_COMPARE_CACHE:
+        return _GH_COMPARE_CACHE[key]
+    if _GH_API_DISABLED:
+        return None
+    url = ("https://api.github.com/repos/OpenMS/OpenMS/compare/"
+           + urllib.parse.quote(base_sha, safe="") + "..."
+           + urllib.parse.quote(head_sha, safe=""))
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "openms-benchmarking-render",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            _GH_API_DISABLED = True
+        _GH_COMPARE_CACHE[key] = None
+        return None
+    except (urllib.error.URLError, OSError, ValueError):
+        _GH_API_DISABLED = True
+        _GH_COMPARE_CACHE[key] = None
+        return None
+    status = data.get("status")
+    result = {"ahead": True, "behind": False, "diverged": False}.get(status)
+    _GH_COMPARE_CACHE[key] = result
+    return result
+
+
+def pick_baseline(current, openms_runs, use_sha_ancestry=True):
+    """The stored baseline = the previous OpenMS run of the same benchmark.
+
+    Default: prefer the latest stored run of the same benchmark whose OpenMS
+    version is an *ancestor* of the current run's version (resolved via the
+    GitHub compare API, cached per render), so the comparison stays meaningful
+    even when newer unrelated runs exist. When no ancestor run is known, or
+    ancestry cannot be resolved (offline, rate-limited, unknown SHAs), fall
+    back to the timestamp rule: the latest run of the same benchmark with
+    run_at < current's (or simply the latest other run when run_at is
+    missing). use_sha_ancestry=False (--no-sha-baseline) skips the ancestry
+    step entirely.
+    """
     if not openms_runs:
         return None
-    cur_at = _run_at(current)
     cur_bench = _benchmark_name(current)
     same_bench = [r for r in openms_runs
                   if _benchmark_name(r) == cur_bench and r is not current]
     if not same_bench:
         return None
+
+    if use_sha_ancestry:
+        cur_sha = _software_version(current)
+        # Stage 1: SHA-ancestry comparison is defined between source builds.
+        # A package run's version string may be a nightly short SHA of a
+        # moving branch; mixing it into a source-SHA lineage would compare
+        # different *kinds* of versions. It stays in the timestamp pool only.
+        if _runtime_source(current) == "package":
+            use_sha_ancestry = False
+        if use_sha_ancestry and cur_sha and cur_sha != "unknown":
+            ancestors = [r for r in same_bench
+                         if _runtime_source(r) == "source"
+                         and _sha_is_ancestor(_software_version(r), cur_sha)]
+            if ancestors:
+                ancestors.sort(key=lambda r: _run_at(r))
+                return ancestors[-1]
+
+    cur_at = _run_at(current)
     same_bench.sort(key=lambda r: _run_at(r))
     if not cur_at:
         return same_bench[-1]
@@ -488,15 +638,36 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     verdict_cls = status_class(verdict)
     bench = _benchmark_name(current)
     sha = _software_version(current)
+    rt = _runtime_source(current)
 
     # ----- header ----------------------------------------------------------
+    # Runtime provenance must be unambiguous: a package-mode run is labeled
+    # with its package identity and can never read as an exact-SHA build.
+    if rt == "package":
+        pkg = _identity(current).get("runtime", {}).get("package", {})
+        sha_row = (f"<div><dt>OpenMS revision</dt><dd>{esc(short_sha(sha))} "
+                   f"<span class=\"mono\" title=\"{esc(sha)}\">({esc(sha[:6])})</span> "
+                   f"— embedded in package</dd></div>")
+        runtime_rows = (
+            f"<div><dt>Runtime</dt><dd>{_chip('PACKAGE · nightly .deb', 'warn')}</dd></div>"
+            f"<div><dt>Package</dt><dd class='mono'>{esc(pkg.get('filename', ''))}</dd></div>"
+            f"<div><dt>Package SHA256</dt><dd class='mono'>{esc(pkg.get('sha256', ''))}</dd></div>"
+            f"<div><dt>Package archive</dt><dd>{esc(pkg.get('archive_dir', ''))} "
+            f"<span class='dim'>(build night {esc(pkg.get('date', ''))})</span></dd></div>"
+        )
+    else:
+        sha_row = (f"<div><dt>Software SHA</dt><dd>{esc(short_sha(sha))} "
+                   f"<span class=\"mono\" title=\"{esc(sha)}\">({esc(sha[:6])})</span></dd></div>")
+        runtime_rows = f"<div><dt>Runtime</dt><dd>{_chip('SOURCE · exact SHA build', 'ok')}</dd></div>"
+
     head = f"""
     <div class="card"><div class="inner">
       <h1>OpenMS Benchmark Report</h1>
       <div class="dim">{esc(bench)} benchmark —
       generated {esc(generated.strftime('%Y-%m-%d %H:%M %Z'))}</div>
       <dl class="meta">
-        <div><dt>Software SHA</dt><dd>{esc(short_sha(sha))} <span class="mono" title="{esc(sha)}">({esc(sha[:6])})</span></dd></div>
+        {runtime_rows}
+        {sha_row}
         <div><dt>Run</dt><dd>{esc(_run_id(current))} <span class="dim">({esc(current.get('_file', ''))})</span></dd></div>
         <div><dt>Run at</dt><dd>{esc(_run_at(current))}</dd></div>
         <div><dt>Cache</dt><dd>{_chip(cache, cache_cls)}</dd></div>
@@ -732,7 +903,7 @@ def normalize_smoke(args):
     """Convert a raw CI smoke.json into a normalized v2 OpenMS run result."""
     with open(args.smoke_json, encoding="utf-8") as fh:
         raw = json.load(fh)
-    if not args.build_time or not args.artifact_bytes or not args.run_id:
+    if args.build_time is None or not args.artifact_bytes or not args.run_id:
         sys.exit("normalize smoke needs --run-id, --build-time and --artifact-bytes")
     stages = []
     for st in raw.get("stages", []):
@@ -760,6 +931,7 @@ def normalize_smoke(args):
             "configuration": {
                 "use_ms2rescore": raw.get("use_ms2rescore") in (True, "true", "1"),
             },
+            "runtime": _runtime_identity(args),
         },
         "run": {
             "run_id": args.run_id,
@@ -796,7 +968,7 @@ def normalize_openswath(args):
     """Convert a raw CI openswath.json into a normalized v2 OpenMS run result."""
     with open(args.openswath_json, encoding="utf-8") as fh:
         raw = json.load(fh)
-    if not args.build_time or not args.artifact_bytes or not args.run_id:
+    if args.build_time is None or not args.artifact_bytes or not args.run_id:
         sys.exit("normalize openswath needs --run-id, --build-time and --artifact-bytes")
     stages = []
     for st in raw.get("stages", []):
@@ -829,6 +1001,7 @@ def normalize_openswath(args):
                 "version": raw.get("openms_sha", ""),
             },
             "configuration": {},
+            "runtime": _runtime_identity(args),
         },
         "run": {
             "run_id": args.run_id,
@@ -859,6 +1032,129 @@ def normalize_openswath(args):
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(out, fh, indent=2)
     print(f"normalized OpenMS run result -> {out_path}")
+
+
+def normalize_prose_peptdeep(args):
+    """Convert raw ProSE+PeptDeep benchmark output into a normalized v2 run result.
+
+    Reads prose.json, stages.tsv and meta.txt from the results directory
+    produced by run_prose_benchmark.sh and writes a v2 canonical result JSON.
+    The two arms (baseline, peptdeep) are configurations of one benchmark and
+    stay in one result: the headline metrics become arm-qualified metric keys
+    (target_psms_at_1pct_fdr_baseline / _peptdeep), which the generic renderer
+    compares like any other metric. The peptdeep arm's wall time and peak RSS
+    are the whole-run performance figures (both arms run the same search, so
+    they are directly comparable across runs of the same SHA).
+    """
+    results_dir = args.results_dir
+
+    # Read meta
+    meta = {}
+    meta_path = os.path.join(results_dir, "meta.txt")
+    if os.path.exists(meta_path):
+        with open(meta_path) as fh:
+            for line in fh:
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    meta[k.strip()] = v.strip()
+
+    # Read stages (the raw prose.json already carries them; stages.tsv is the
+    # fallback when only a CI artifact subset is available)
+    stages = []
+    prose_json_path = os.path.join(results_dir, "prose.json")
+    raw = {}
+    if os.path.exists(prose_json_path):
+        with open(prose_json_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        stages = raw.get("stages", [])
+    if not stages:
+        stages_path = os.path.join(results_dir, "stages.tsv")
+        if os.path.exists(stages_path):
+            with open(stages_path) as fh:
+                for row in csv.reader(fh, delimiter="\t"):
+                    if not row:
+                        continue
+                    name, required, rc, wall, cpu, peak, status, reason = (row + [""] * 8)[:8]
+
+                    def _num(v, cast, default):
+                        try:
+                            return cast(v)
+                        except (ValueError, TypeError):
+                            return default
+
+                    stages.append({
+                        "name": name,
+                        "required": required == "true",
+                        "exit_code": _num(rc, int, 0),
+                        "wall_time_s": _num(wall, float, 0.0),
+                        "cpu_time_s": _num(cpu, float, 0.0),
+                        "peak_rss_kb": _num(peak, int, 0),
+                        "status": status,
+                        "reason": reason,
+                    })
+
+    arms = raw.get("arms", {})
+    metrics = {
+        "verdict": raw.get("verdict", "fail" if not stages else "unknown"),
+    }
+    for arm in ("baseline", "peptdeep"):
+        counts = arms.get(arm)
+        if not counts:
+            continue
+        for key in ("target_psms_at_1pct_fdr", "target_peptides_at_1pct_fdr",
+                    "entrapment_psms_at_1pct_fdr", "entrapment_peptides_at_1pct_fdr"):
+            metrics[f"{key}_{arm}"] = counts.get(key)
+        metrics[f"wall_time_s_{arm}"] = counts.get("wall_time_s")
+        metrics[f"peak_rss_mb_{arm}"] = counts.get("peak_rss_mb")
+    metrics = {k: v for k, v in metrics.items() if v is not None}
+
+    # Empty/missing stages are never a pass — a benchmark with no stages did
+    # not run successfully (same rule as normalize_openswath).
+    if not stages:
+        verdict = "fail"
+    else:
+        required_ok = all(s.get("status") == "pass" for s in stages if s.get("required"))
+        verdict = "pass" if required_ok else "fail"
+
+    out = {
+        "schema": SCHEMA_V2,
+        "identity": {
+            "benchmark": "prose_peptdeep",
+            "dataset": args.dataset or meta.get("prose_input", ""),
+            "software": {
+                "name": "OpenMS",
+                "version": meta.get("openms_sha", raw.get("openms_sha", "")),
+            },
+            "configuration": {
+                "entrapment_prefix": meta.get("entrapment_prefix", ""),
+                "peptdeep_instrument": meta.get("peptdeep_instrument", ""),
+                "prose_extra_search_args": meta.get("prose_extra_search_args", ""),
+            },
+        },
+        "run": {
+            "run_id": args.run_id,
+            "run_at": args.run_at or raw.get("run_at", ""),
+            "cache": args.cache or "unknown",
+        },
+        "performance": {
+            "wall_time_s": sum(s.get("wall_time_s", 0) for s in stages),
+            "cpu_time_s": sum(s.get("cpu_time_s", 0) for s in stages),
+            "peak_rss_kb": max((s.get("peak_rss_kb", 0) for s in stages), default=0),
+            "build": {},
+            "stages": stages,
+        },
+        "metrics": metrics,
+    }
+
+    # default output path — inside --results-dir so CI artifact upload captures it
+    out_path = args.out or os.path.join(
+        args.results_dir, "prose_peptdeep", "openms",
+        f"prose_peptdeep-{args.run_id}.json"
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"normalized ProSE+PeptDeep run result -> {out_path}")
 
 
 def normalize_proteobench(args):
@@ -920,6 +1216,27 @@ def normalize_proteobench(args):
     print(f"normalized tool result -> {out_path}")
 
 
+def _resolve_baseline_ref(ref, openms_runs, results_dir):
+    """Resolve a --baseline reference: a stored run id, an OpenMS SHA (short
+    or full), or a path to a result JSON file."""
+    for r in openms_runs:
+        if _run_id(r) == ref:
+            return r
+    candidates = [r for r in openms_runs
+                  if _software_version(r) and _software_version(r).startswith(ref)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        sys.exit(f"--baseline {ref!r}: SHA matches {len(candidates)} stored runs; "
+                 "disambiguate with the full SHA or a run id")
+    if os.path.exists(ref):
+        with open(ref, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["_file"] = os.path.relpath(ref, results_dir).replace(os.sep, "/")
+        return data
+    sys.exit(f"--baseline {ref!r}: no stored run id, SHA or file matches")
+
+
 def render_cmd(args):
     results_dir = args.results_dir
     openms_runs, tool_results = load_results(results_dir)
@@ -931,7 +1248,19 @@ def render_cmd(args):
         current["_file"] = os.path.relpath(args.current, results_dir).replace(os.sep, "/")
     else:
         current = openms_runs[-1]
-    baseline = pick_baseline(current, openms_runs)
+    if args.baseline:
+        baseline = _resolve_baseline_ref(args.baseline, openms_runs, results_dir)
+    else:
+        # pick_baseline excludes the current run by object identity; a
+        # --current file also lives in the discovery pool as a *separate*
+        # object, so exclude it by path instead. Keyed on the exact file,
+        # not the run id: PXD028735-style runs legitimately share a run-id
+        # prefix. An empty pool means there is nothing to compare against.
+        baseline_pool = [r for r in openms_runs
+                         if r.get("_file") != current["_file"]]
+        baseline = (pick_baseline(current, baseline_pool,
+                                  use_sha_ancestry=not args.no_sha_baseline)
+                    if baseline_pool else None)
     render(current, baseline, openms_runs, tool_results, args.out,
            _dt.datetime.now(_dt.timezone.utc))
 
@@ -962,6 +1291,7 @@ def main():
                     help="what was benchmarked (default: smoke fixture)")
     ps.add_argument("--results-dir", default="benchmark/results")
     ps.add_argument("--out")
+    _add_runtime_source_args(ps)
     ps.set_defaults(fn=normalize_smoke)
 
     po = pn.add_parser("openswath", help="normalize a CI openswath.json (OpenSwath DIA benchmark)")
@@ -977,6 +1307,7 @@ def main():
                     help="override the dataset label (default: value recorded in the raw result)")
     po.add_argument("--results-dir", default="benchmark/results")
     po.add_argument("--out")
+    _add_runtime_source_args(po)
     po.set_defaults(fn=normalize_openswath)
 
     pp = pn.add_parser("proteobench", help="normalize a local ProteoBench scoring JSON")
@@ -988,9 +1319,26 @@ def main():
     pp.add_argument("--out")
     pp.set_defaults(fn=normalize_proteobench)
 
+    pr = pn.add_parser("prose-peptdeep", help="normalize raw ProSE+PeptDeep benchmark output into v2")
+    pr.add_argument("--run-id", required=True)
+    pr.add_argument("--cache", choices=["cold", "warm", "none", "unknown"], default="unknown")
+    pr.add_argument("--run-at", default="")
+    pr.add_argument("--dataset", default="",
+                    help="what was benchmarked (default: the runner's input mzML)")
+    pr.add_argument("--results-dir", required=True,
+                    help="raw results directory from run_prose_benchmark.sh")
+    pr.add_argument("--out")
+    pr.set_defaults(fn=normalize_prose_peptdeep)
+
     r = sub.add_parser("render", help="discover results and render report.html")
     r.add_argument("--results-dir", default="benchmark/results")
     r.add_argument("--current", help="explicit current run result file")
+    r.add_argument("--baseline",
+                   help="explicit baseline: a stored run id, an OpenMS SHA "
+                        "(short or full), or a path to a result JSON")
+    r.add_argument("--no-sha-baseline", action="store_true",
+                   help="disable SHA-ancestor baseline selection "
+                        "(timestamp rule only)")
     r.add_argument("--out", default="benchmark/reports/report.html")
     r.set_defaults(fn=render_cmd)
 
