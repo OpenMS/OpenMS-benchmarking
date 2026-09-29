@@ -45,12 +45,10 @@ jobs:
       # a shallow clone of HEAD is all the latest view needs. If upstream is
       # temporarily unreachable the pinned view is still published.
       - name: Shallow-clone upstream for the latest view
-        id: upstream
         continue-on-error: true
         run: |
           git clone --depth 1 --quiet \
             https://github.com/Proteobench/Results_quant_ion_DDA upstream
-          echo "available=${{ success() }}" >> "$GITHUB_OUTPUT"
 
       - name: Generate site (pinned reference view + optional latest view)
         run: |
@@ -61,6 +59,10 @@ jobs:
             echo "::warning::upstream clone unavailable; publishing pinned reference view only"
           fi
           python benchmark/pages_generate.py "${ARGS[@]}"
+          # Benchmark report from the committed results tree (Stage 1 runs,
+          # incl. their runtime provenance). Same renderer the CI report uses.
+          python benchmark/report/report_generate.py render \
+            --results-dir benchmark/results --out site/report.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

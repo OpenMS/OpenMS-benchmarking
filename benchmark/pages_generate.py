@@ -194,6 +194,14 @@ pinned view above remains the citable default, and this page reflects
 whatever upstream contained most recently.</p>
 </div>
 
+<div class="viewcard pinned">
+<h2><a href="report.html">Benchmark report</a></h2>
+<p>The OpenMS benchmark report (smoke, OpenSwath DIA, ...) rendered from
+the committed results tree (<code>benchmark/results/</code>), including
+each run's runtime provenance (exact-SHA source build vs nightly
+debian package). Regenerated on every site build.</p>
+</div>
+
 <p class="muted"><strong>Provenance.</strong> Upstream:
 <code>{upstream_repo}</code>; pinned commit:
 <code>{source_commit}</code>; module: <code>{module_id}</code>.
