@@ -1,0 +1,181 @@
+name: "Nightly Benchmark (routine package mode)"
+
+# Routine benchmarking loop (Issue #8788 follow-up): turn the already-proven
+# package-mode pipeline of benchmark.yml into a scheduled benchmark.
+#
+# Flow (all on this repository):
+#   schedule / workflow_dispatch
+#     -> dispatch benchmark.yml on main with runtime_source=package
+#     -> wait for that run to finish (fail here if it failed)
+#     -> download only its benchmark result artifacts (tiny JSONs)
+#     -> extract the normalized result JSONs (fail loudly if missing)
+#     -> commit them to benchmark/results/ and push to main
+#     -> pages.yml (push trigger) regenerates and publishes the report
+#
+# Why dispatch instead of adding a schedule to benchmark.yml itself:
+# benchmark.yml is dispatch-only today, its inputs have defaults tuned for
+# source mode, and scheduled runs receive empty inputs. Dispatching it with
+# explicit inputs reuses the proven pipeline verbatim and leaves every
+# existing behavior (manual dispatch included) untouched.
+#
+# Permissions (minimum required):
+#   actions: write   - dispatch benchmark.yml + download its run artifacts
+#   contents: write  - commit result JSONs and push to main
+# Nothing else. The dispatched run itself keeps benchmark.yml's permissions.
+
+on:
+  schedule:
+    # Daily at 03:15 UTC. Package mode resolves the newest published Debian
+    # nightly .deb at dispatch time, so the exact hour is not load-bearing.
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-benchmark
+  cancel-in-progress: false
+
+jobs:
+  persist-nightly-package-results:
+    name: "Dispatch package benchmark, persist results"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout benchmarking repo
+        uses: actions/checkout@v6
+        with:
+          # Cheap; also keeps the rebase-before-push below safe even if a
+          # commit lands on main while the benchmark is running.
+          fetch-depth: 0
+
+      - name: Dispatch benchmark.yml (package mode) and wait for it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(git rev-parse origin/main)"
+          # Window start, not a strict dispatch timestamp: clock skew between
+          # runner and API plus second-granularity comparison could otherwise
+          # miss the run that was just created. Narrow window + newest match
+          # below keeps a stale run from being picked up.
+          DISPATCH_AT="$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)"
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/dispatches" \
+            -f ref=main \
+            -F "inputs[runtime_source]=package"
+          echo "Dispatched Benchmark (package mode) on main @ $MAIN_SHA at $DISPATCH_AT"
+
+          # The dispatch API does not return the created run; locate it by
+          # head SHA and creation time. Poll until it exists, then until it
+          # completes (package mode takes ~2 minutes end to end).
+          BENCH_RUN_ID=""
+          for _ in $(seq 1 60); do
+            BENCH_RUN_ID="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow benchmark.yml \
+              --head_sha "$MAIN_SHA" \
+              --created ">=$DISPATCH_AT" \
+              --limit 5 \
+              --json databaseId,createdAt \
+              --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // ""' || true)"
+            [ -n "$BENCH_RUN_ID" ] && break
+            sleep 20
+          done
+          if [ -z "$BENCH_RUN_ID" ]; then
+            echo "::error::no benchmark.yml run appeared after the dispatch"
+            exit 1
+          fi
+          echo "Bench run id: $BENCH_RUN_ID"
+          echo "BENCH_RUN_ID=$BENCH_RUN_ID" >> "$GITHUB_ENV"
+
+          for _ in $(seq 1 90); do
+            read -r STATUS CONCLUSION <<<"$(gh run view "$BENCH_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json status,conclusion \
+              --jq '.status + " " + (.conclusion // "")')"
+            [ "$STATUS" = "completed" ] && break
+            sleep 30
+          done
+          if [ "$STATUS" != "completed" ]; then
+            echo "::error::timed out waiting for benchmark run $BENCH_RUN_ID"
+            exit 1
+          fi
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error::dispatched benchmark run $BENCH_RUN_ID finished with conclusion '$CONCLUSION'"
+            exit 1
+          fi
+
+      - name: Download benchmark result artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BENCH_RUN_ID/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name | test("^benchmark-(results|openswath)-")) | .id' \
+            > artifact-ids.txt
+          if [ ! -s artifact-ids.txt ]; then
+            echo "::error::benchmark run $BENCH_RUN_ID produced no benchmark-results-*/benchmark-openswath-* artifacts"
+            exit 1
+          fi
+          while read -r artifact_id; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "artifact-$artifact_id.zip"
+            unzip -o -q "artifact-$artifact_id.zip" -d downloaded
+          done < artifact-ids.txt
+
+      # Persist exactly the two normalized result JSONs, renamed to this
+      # dispatch's run ID (the report keys runs by run_id, so the name must
+      # match the ID inside the file), into the locations the committed
+      # results already use. Everything else in the artifacts (raw JSONs,
+      # resource logs, tools/) stays out of the repository.
+      - name: Extract result JSONs
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/results/openms benchmark/results/openswath_dia/openms
+          smoke="$(find downloaded -name 'smoke-*.json' ! -path '*/tools/*' ! -path '*/reference/*' -print -quit)"
+          if [ -z "$smoke" ]; then
+            echo "::error::no smoke-*.json result in the benchmark artifacts"
+            exit 1
+          fi
+          cp "$smoke" "benchmark/results/openms/smoke-$BENCH_RUN_ID.json"
+          openswath="$(find downloaded -name 'openswath_dia-*.json' ! -path '*/tools/*' ! -path '*/reference/*' -print -quit)"
+          if [ -z "$openswath" ]; then
+            echo "::error::no openswath_dia-*.json result in the benchmark artifacts"
+            exit 1
+          fi
+          cp "$openswath" "benchmark/results/openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
+          python3 - "$BENCH_RUN_ID" <<'PY'
+          import json, os, sys
+          expected = str(sys.argv[1])
+          for name in (f"smoke-{expected}.json", f"openswath_dia-{expected}.json"):
+              path = os.path.join("benchmark", "results", "openms", name) if name.startswith("smoke-") \
+                  else os.path.join("benchmark", "results", "openswath_dia", "openms", name)
+              with open(path, encoding="utf-8") as fh:
+                  data = json.load(fh)
+              # v2 schema keeps run_id under run.run_id; tolerate the legacy
+              # top-level key so a future schema change fails here loudly.
+              run_id = data.get("run", {}).get("run_id") or data.get("run_id")
+              if str(run_id) != expected:
+                  sys.exit(f"{name}: run_id mismatch (file says {run_id!r}, expected {expected})")
+          print("result JSONs valid; run_id matches")
+          PY
+
+      - name: Commit results to main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmark/results
+          if git diff --cached --quiet; then
+            echo "::error::nothing new to persist for benchmark run $BENCH_RUN_ID (unexpected for a fresh run)"
+            exit 1
+          fi
+          git commit -m "Persist package-mode benchmark results (benchmark run $BENCH_RUN_ID)"
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main

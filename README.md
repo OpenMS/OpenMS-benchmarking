@@ -247,6 +247,14 @@ builds. ProSE/PeptDeep do not run in package mode today: published packages
 contain no ONNX Runtime, and benchmark support is claimed only for runners
 that have actually executed - it is never inferred from binary availability.
 
+**Routine runs.** The `Nightly Benchmark` workflow
+(`.github/workflows/nightly-benchmark.yml`) runs the package-mode pipeline
+daily (and on `workflow_dispatch`): it dispatches `benchmark.yml` with
+`runtime_source=package`, waits for the run, persists the resulting
+Smoke/OpenSwath result JSONs to `benchmark/results/`, and pushes them to
+`main`; the Pages workflow then publishes the updated history. No build or
+runner logic is involved.
+
 Jobs, in dependency order:
 
 1. **build-openms** - checks out OpenMS at the pinned SHA, installs
@@ -346,7 +354,6 @@ This repository deliberately does not (yet):
 - execute MS2Rescore (the workflow input is recorded, rescoring is not run);
 - run ProteoBench scoring in CI - ProteoBench results enter the report as
   reference results generated externally (see [Benchmarks](#benchmarks));
-- run on a schedule (nightly).
 
 Resources
 --------
