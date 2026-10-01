@@ -10,7 +10,9 @@ name: "Nightly Benchmark (routine package mode)"
 #     -> download only its benchmark result artifacts (tiny JSONs)
 #     -> extract the normalized result JSONs (fail loudly if missing)
 #     -> commit them to benchmark/results/ and push to main
-#     -> pages.yml (push trigger) regenerates and publishes the report
+#     -> dispatch pages.yml explicitly: a GITHUB_TOKEN push does not fire
+#        pages.yml's push trigger (GitHub never triggers push events for
+#        GITHUB_TOKEN pushes), so the report would otherwise go stale
 #
 # Why dispatch instead of adding a schedule to benchmark.yml itself:
 # benchmark.yml is dispatch-only today, its inputs have defaults tuned for
@@ -136,36 +138,48 @@ jobs:
       - name: Extract result JSONs
         run: |
           set -euo pipefail
-          mkdir -p benchmark/results/openms benchmark/results/openswath_dia/openms
           smoke="$(find downloaded -name 'smoke-*.json' ! -path '*/tools/*' ! -path '*/reference/*' -print -quit)"
           if [ -z "$smoke" ]; then
             echo "::error::no smoke-*.json result in the benchmark artifacts"
             exit 1
           fi
-          cp "$smoke" "benchmark/results/openms/smoke-$BENCH_RUN_ID.json"
           openswath="$(find downloaded -name 'openswath_dia-*.json' ! -path '*/tools/*' ! -path '*/reference/*' -print -quit)"
           if [ -z "$openswath" ]; then
             echo "::error::no openswath_dia-*.json result in the benchmark artifacts"
             exit 1
           fi
-          cp "$openswath" "benchmark/results/openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
-          python3 - "$BENCH_RUN_ID" <<'PY'
-          import json, os, sys
-          expected = str(sys.argv[1])
-          for name in (f"smoke-{expected}.json", f"openswath_dia-{expected}.json"):
-              path = os.path.join("benchmark", "results", "openms", name) if name.startswith("smoke-") \
-                  else os.path.join("benchmark", "results", "openswath_dia", "openms", name)
+          # Verify BOTH results before persisting anything: package-mode
+          # runtime identity plus run_id match. Nothing reaches the results
+          # tree until both checks pass, so a failed guard cannot leave
+          # anything behind for the commit step to pick up.
+          python3 - "$smoke" "$openswath" "$BENCH_RUN_ID" <<'PY'
+          import json, sys
+          smoke_path, openswath_path, expected = sys.argv[1], sys.argv[2], sys.argv[3]
+          for label, path in (("smoke", smoke_path), ("openswath", openswath_path)):
               with open(path, encoding="utf-8") as fh:
                   data = json.load(fh)
+              # Race guard: only persist what this workflow dispatched. A
+              # benchmark run adopted by mistake (e.g. a concurrent manual
+              # source-mode dispatch on main inside the discovery window)
+              # carries a different runtime identity and must fail here.
+              runtime_source = data.get("identity", {}).get("runtime", {}).get("runtime_source")
+              if runtime_source != "package":
+                  sys.exit(f"{label}: identity.runtime.runtime_source is {runtime_source!r}, "
+                           f"expected 'package' - refusing to persist a non-package run")
               # v2 schema keeps run_id under run.run_id; tolerate the legacy
               # top-level key so a future schema change fails here loudly.
               run_id = data.get("run", {}).get("run_id") or data.get("run_id")
               if str(run_id) != expected:
-                  sys.exit(f"{name}: run_id mismatch (file says {run_id!r}, expected {expected})")
-          print("result JSONs valid; run_id matches")
+                  sys.exit(f"{label}: run_id mismatch (file says {run_id!r}, expected {expected})")
+          print("result JSONs valid; package runtime and run_id verified")
           PY
+          mkdir -p benchmark/results/openms benchmark/results/openswath_dia/openms
+          cp "$smoke" "benchmark/results/openms/smoke-$BENCH_RUN_ID.json"
+          cp "$openswath" "benchmark/results/openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
 
       - name: Commit results to main
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -179,3 +193,10 @@ jobs:
           git fetch origin main
           git rebase origin/main
           git push origin HEAD:main
+
+          # Regenerate the report explicitly: the GITHUB_TOKEN push above does
+          # not trigger pages.yml's push trigger, but workflow_dispatch is the
+          # documented exception GITHUB_TOKEN dispatches are allowed to run.
+          # Last command of this step under set -e: only reached after a
+          # successful commit AND push, and a failed dispatch fails the job.
+          gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main
