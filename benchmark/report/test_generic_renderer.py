@@ -31,7 +31,8 @@ from report_generate import (
     _benchmark_name, _dataset, _run_id, _discover_shared_metrics,
     _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
     normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED,
-    _runtime_source, _runtime_identity, render_cmd
+    _runtime_source, _runtime_identity, render_cmd,
+    build_history_series, _trend_series_section
 )
 
 
@@ -1254,6 +1255,198 @@ def test_promote_v1_carries_file_reference():
         shutil.rmtree(tmpdir)
 
 
+def _trend_run(run_id, run_at, benchmark="smoke", dataset="fixture",
+               runtime_source="source", metrics=None, **performance):
+    """Build a minimal v2 OpenMS result for trend tests."""
+    return {
+        "schema": "openms-benchmarking/report/v2",
+        "identity": {
+            "benchmark": benchmark,
+            "dataset": dataset,
+            "software": {"name": "OpenMS", "version": "abc123"},
+            "runtime": {"runtime_source": runtime_source},
+        },
+        "run": {"run_id": run_id, "run_at": run_at, "cache": "warm"},
+        "performance": dict(performance),
+        "metrics": dict(metrics or {}),
+    }
+
+
+def test_build_history_series_groups_by_benchmark_dataset_runtime():
+    """Runs split into one series per (benchmark, dataset, runtime_source)."""
+    runs = [
+        _trend_run("1", "2026-08-01T00:00:00Z"),
+        _trend_run("2", "2026-08-02T00:00:00Z", dataset="other"),
+        _trend_run("3", "2026-08-03T00:00:00Z", benchmark="openswath_dia"),
+        _trend_run("4", "2026-08-04T00:00:00Z", runtime_source="package"),
+    ]
+    series = build_history_series(runs)
+    keys = [s["key"] for s in series]
+    assert len(series) == 4
+    assert ("smoke", "fixture", "source") in keys
+    assert ("smoke", "other", "source") in keys
+    assert ("openswath_dia", "fixture", "source") in keys
+    assert ("smoke", "fixture", "package") in keys
+    assert [s["key"] for s in series] == sorted(keys)
+    print("  PASS: history series grouping")
+
+
+def test_build_history_series_orders_chronologically():
+    """Each series lists runs oldest -> newest regardless of input order."""
+    runs = [
+        _trend_run("late", "2026-08-03T00:00:00Z"),
+        _trend_run("early", "2026-08-01T00:00:00Z"),
+        _trend_run("mid", "2026-08-02T00:00:00Z"),
+    ]
+    series = build_history_series(runs)
+    assert len(series) == 1
+    assert [r["run"]["run_id"] for r in series[0]["runs"]] == ["early", "mid", "late"]
+    print("  PASS: history series chronological ordering")
+
+
+def test_build_history_series_discovers_metrics_and_preserves_missing():
+    """Metric keys are discovered dynamically; missing values stay None."""
+    runs = [
+        _trend_run("1", "2026-08-01T00:00:00Z",
+                   wall_time_s=10.0, cpu_time_s=20.0, peak_rss_kb=300000,
+                   metrics={"psms": 100}),
+        _trend_run("2", "2026-08-02T00:00:00Z",
+                   wall_time_s=11.0, cpu_time_s=21.0, peak_rss_kb=310000,
+                   metrics={"psms": 120, "score": 0.5}),
+        _trend_run("3", "2026-08-03T00:00:00Z",
+                   wall_time_s=12.0, cpu_time_s=22.0, peak_rss_kb=320000,
+                   metrics={"psms": 110, "score": 1.25}),
+    ]
+    series = build_history_series(runs)
+    assert len(series) == 1
+    cols = {c["name"]: c["kind"] for c in series[0]["columns"]}
+    # fixed performance scalars are always discovered
+    assert "performance.wall_time_s" in cols
+    assert "performance.cpu_time_s" in cols
+    assert "performance.peak_rss_kb" in cols
+    # dynamic metrics keys are discovered, verdict excluded
+    assert "psms" in cols and "score" in cols
+    assert "verdict" not in cols
+    # score is absent from the first two runs -> None placeholders kept
+    assert series[0]["values"]["score"] == [None, 0.5, 1.25]
+    assert series[0]["values"]["psms"] == [100, 120, 110]
+    print("  PASS: dynamic metric discovery + missing values")
+
+
+def test_build_history_series_numeric_vs_categorical_and_bool():
+    """Series-wide classification: bools are categorical, mixed types too."""
+    runs = [
+        _trend_run("1", "2026-08-01T00:00:00Z",
+                   wall_time_s=10.0, metrics={"ok": True}),
+        _trend_run("2", "2026-08-02T00:00:00Z",
+                   wall_time_s=20.0, metrics={"ok": False, "label": "v2"}),
+        _trend_run("3", "2026-08-03T00:00:00Z",
+                   wall_time_s=30.0, metrics={"label": "v1"}),
+    ]
+    series = build_history_series(runs)
+    cols = {c["name"]: c["kind"] for c in series[0]["columns"]}
+    assert cols["ok"] == "categorical"  # bool must not count as numeric
+    assert cols["label"] == "categorical"  # mixed strings
+    assert cols["performance.wall_time_s"] == "numeric"
+    assert series[0]["values"]["ok"] == [True, False, None]
+    print("  PASS: numeric vs categorical classification (incl. bool)")
+
+
+def test_render_trends_v1_promotion_path():
+    """v1 files promoted through load_results() still produce a Trends card."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "openms"))
+        for i, (run_id, run_at) in enumerate([("101", "2026-08-01T10:00:00Z"),
+                                              ("102", "2026-08-02T10:00:00Z")]):
+            v1 = {
+                "schema": "openms-benchmarking/report/v1",
+                "source": "openms",
+                "benchmark": "smoke",
+                "milestone": 1,
+                "run_id": run_id,
+                "run_at": run_at,
+                "openms_sha": "f1768367fa66f7901b4fa78a9ebece64b2ce9024",
+                "cache": "warm",
+                "dataset": "smoke fixture (CometAdapter_3)",
+                "stages": [{"name": "comet", "wall_time_s": 5.0 + i, "status": "pass"}],
+                "verdict": "pass",
+                "metrics": {"psms": 100 + i},
+            }
+            with open(os.path.join(tmpdir, "openms", f"smoke-{run_id}.json"), "w") as fh:
+                json.dump(v1, fh)
+
+        openms_runs, tool_results = load_results(tmpdir)
+        current = openms_runs[-1]
+        out_path = os.path.join(tmpdir, "report.html")
+        import datetime as _dt
+        render(current, None, openms_runs, tool_results, out_path,
+               _dt.datetime(2026, 8, 2, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as f:
+            html = f.read()
+
+        assert "Trends " in html
+        assert "smoke · smoke fixture (CometAdapter_3) · source" in html
+        assert "psms" in html
+        # verdict is excluded from Trends entirely
+        assert '<th class="num">verdict</th>' not in html
+        # rows are oldest -> newest inside the Trends card
+        idx = html.find("Trends ")
+        assert idx != -1
+        assert html.find("<td>2026-08-01T10:00:00Z</td>", idx) \
+            < html.find("<td>2026-08-02T10:00:00Z</td>", idx)
+        print("  PASS: render Trends via v1 promotion path")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_render_trends_single_run_and_missing_metric():
+    """Single-run series render; missing values show an em dash and no bar."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "openswath_dia", "openms"))
+        runs = [
+            _trend_run("201", "2026-08-01T00:00:00Z", benchmark="openswath_dia",
+                       dataset="DIA fixture", wall_time_s=10.0, cpu_time_s=1.0,
+                       peak_rss_kb=280000, metrics={"psms": 50, "verdict": "pass"}),
+            _trend_run("202", "2026-08-02T00:00:00Z", benchmark="openswath_dia",
+                       dataset="DIA fixture", wall_time_s=20.0, cpu_time_s=2.0,
+                       metrics={"verdict": "pass"}),  # psms not recorded
+        ]
+        for run in runs:
+            path = os.path.join(tmpdir, "openswath_dia", "openms",
+                                f"openswath_dia-{run['run']['run_id']}.json")
+            with open(path, "w") as fh:
+                json.dump(run, fh)
+
+        # data level: a single run still forms a renderable series
+        single = build_history_series([runs[0]])
+        assert len(single) == 1 and len(single[0]["runs"]) == 1
+        assert "psms" in [c["name"] for c in single[0]["columns"]]
+
+        openms_runs, tool_results = load_results(tmpdir)
+        current = openms_runs[-1]
+        out_path = os.path.join(tmpdir, "report.html")
+        import datetime as _dt
+        render(current, None, openms_runs, tool_results, out_path,
+               _dt.datetime(2026, 8, 2, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as f:
+            html = f.read()
+
+        assert 'Trends <span class="sub">— openswath_dia · DIA fixture · source</span>' in html
+        # constant column (psms has one value) -> deterministic full bar, no div by zero
+        assert "width:100.0%" in html
+        # min-max normalization across runs -> both extremes occur
+        assert "width:0.0%" in html
+        # missing psms/peak_rss in run 202 -> em dash cell, no bar
+        assert html.count('<td class="num tbar-cell">—</td>') == 2
+        # exactly six bars: wall/cpu x2 runs + psms/peak_rss x1 recorded run each
+        assert html.count('<div class="tbar"') == 6
+        print("  PASS: render Trends single run + missing values")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -1291,6 +1484,12 @@ def main():
         test_package_run_excluded_from_sha_ancestry,
         test_current_run_never_its_own_baseline,
         test_promote_v1_carries_file_reference,
+        test_build_history_series_groups_by_benchmark_dataset_runtime,
+        test_build_history_series_orders_chronologically,
+        test_build_history_series_discovers_metrics_and_preserves_missing,
+        test_build_history_series_numeric_vs_categorical_and_bool,
+        test_render_trends_v1_promotion_path,
+        test_render_trends_single_run_and_missing_metric,
     ]
     passed = 0
     failed = 0
