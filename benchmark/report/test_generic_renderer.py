@@ -14,6 +14,7 @@ Tests:
 9. Missing/optional sections
 10. OpenSwath normalization (raw v1 -> v2)
 11. OpenSwath baseline selection + comparison end-to-end
+12. CI artifact discovery at any depth (merged-artifact layout)
 """
 
 import json
@@ -1254,6 +1255,91 @@ def test_promote_v1_carries_file_reference():
         shutil.rmtree(tmpdir)
 
 
+def test_load_results_finds_nested_ci_artifact_layout():
+    """CI merges several uploaded artifacts into one results/ directory, and each
+    artifact carries the job's own top-level directory (results/,
+    results-openswath/, results-prose/, ...). The v2 runs therefore land at
+    results/<artifact-dir>/<benchmark>/openms/*.json - one level deeper than the
+    local layout. Discovery used to glob a fixed depth, so every one of those
+    runs (the OpenSwath ones especially) was invisible to the CI report even
+    though the Trends machinery can plot them once loaded.
+
+    Runs must be found at any depth, the flat v1 and v2 layouts must keep
+    working, and nothing may be loaded twice.
+    """
+
+    def write_json(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def v2_run(bench, run_id, run_at, sha="v2test"):
+        return {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": bench, "benchmark_version": 1,
+                         "dataset": "synthetic",
+                         "software": {"name": "OpenMS", "version": sha},
+                         "configuration": {"use_ms2rescore": False}},
+            "run": {"run_id": run_id, "run_at": run_at, "cache": "none"},
+            "performance": {"wall_time_s": 1.0, "cpu_time_s": 1.0,
+                            "peak_rss_kb": 1,
+                            "build": {"wall_time_s": 60.0, "artifact_bytes": 1000},
+                            "stages": []},
+            "metrics": {"verdict": "pass"},
+        }
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        merged = os.path.join(tmpdir, "results")
+
+        # nested OpenSwath run, exactly where the merged CI artifact puts it
+        raw_path = os.path.join(merged, "results-openswath", "openswath.json")
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        _write_raw_openswath(raw_path, "900", "2026-09-20T12:00:00Z")
+        normalize_openswath(_normalize_args(
+            raw_path, "900", os.path.join(merged, "results-openswath")))
+
+        # nested tool result from the ProSE artifact
+        write_json(os.path.join(merged, "results-prose", "proteobench",
+                                "reference", "comet.json"),
+                   v2_run("proteobench", "333", "2026-03-01T00:00:00Z"))
+
+        # flat v1 layout, unchanged
+        write_json(os.path.join(merged, "openms", "smoke-111.json"), {
+            "schema": "openms-benchmarking/report/v1", "benchmark": "smoke",
+            "openms_sha": "v1test", "run_id": "111",
+            "run_at": "2026-01-01T00:00:00Z", "cache": "warm",
+            "stages": [], "verdict": "pass", "build": {},
+        })
+        # flat v2 layout, unchanged
+        write_json(os.path.join(merged, "smoke", "openms", "smoke-222.json"),
+                   v2_run("smoke", "222", "2026-02-01T00:00:00Z"))
+
+        runs, tools = load_results(merged)
+
+        # exactly the four files written above: depth-agnostic discovery must not
+        # also re-scan the nested trees through a second, shallower glob
+        assert len(runs) == 3, [r["_file"] for r in runs]
+        assert len(tools) == 1, [t["_file"] for t in tools]
+
+        by_id = {r["run"]["run_id"]: r for r in runs}
+        assert set(by_id) == {"111", "222", "900"}, sorted(by_id)
+        assert by_id["900"]["_file"] == \
+            "results-openswath/openswath_dia/openms/openswath_dia-900.json", \
+            by_id["900"]["_file"]
+        assert by_id["222"]["_file"] == "smoke/openms/smoke-222.json", \
+            by_id["222"]["_file"]
+        # the flat v1 run is still promoted on the way in
+        assert by_id["111"]["schema"] == "openms-benchmarking/report/v2", by_id["111"]
+        # oldest first, with the nested run joining the same ordering
+        assert [r["run"]["run_id"] for r in runs] == ["111", "222", "900"]
+        assert tools[0]["_file"] == \
+            "results-prose/proteobench/reference/comet.json", tools[0]["_file"]
+        print("  PASS: load_results finds runs in the nested CI artifact layout")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -1291,6 +1377,7 @@ def main():
         test_package_run_excluded_from_sha_ancestry,
         test_current_run_never_its_own_baseline,
         test_promote_v1_carries_file_reference,
+        test_load_results_finds_nested_ci_artifact_layout,
     ]
     passed = 0
     failed = 0
