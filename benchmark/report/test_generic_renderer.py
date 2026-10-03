@@ -32,7 +32,7 @@ from report_generate import (
     _flat_compare, fmt_seconds, fmt_bytes, fmt_delta, pick_baseline,
     normalize_openswath, _sha_is_ancestor, _GH_COMPARE_CACHE, _GH_API_DISABLED,
     _runtime_source, _runtime_identity, render_cmd,
-    build_history_series, _trend_series_section
+    build_history_series, _trend_series_section, _fmt_metric
 )
 
 
@@ -1447,6 +1447,156 @@ def test_render_trends_single_run_and_missing_metric():
         shutil.rmtree(tmpdir)
 
 
+def _library_correctness():
+    """The correctness block run_openswath_benchmark.sh records after the
+    TraML <-> featureXML join (see benchmark/openswath_metrics.py)."""
+    return {
+        "expected_features": 6,
+        "actual_features": 6,
+        "features_match": True,
+        "overall_quality_sum": 14.088245,
+        "total_intensity": 149891.59,
+        "qc_charge_distribution": [[1, 19], [2, 19], [3, 19]],
+        "library_peptides": 7,
+        "library_precursor_mz": 6,
+        "library_transitions": 18,
+        "identified_peptides": 6,
+        "identified_precursor_mz": 6,
+        "identified_proteins": 1,
+        "transitions_used": 18,
+        "library_coverage": 0.857143,
+    }
+
+
+def test_normalize_openswath_lifts_library_metrics():
+    """The OpenSwath measurements reach metrics{} under their documented
+    names, and the raw correctness block stays verbatim. expected_features /
+    features_match / qc_charge_distribution are not measurements and must not
+    be lifted; PSM/FDR keys must never appear (DIA emits none)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "555", "2026-09-20T12:00:00Z")
+        raw["correctness"] = _library_correctness()
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "555", tmpdir))
+
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-555.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        m = out["metrics"]
+
+        assert m["verdict"] == "pass", m
+        # renamed on the way into the flat metric bag
+        assert m["identified_features"] == 6, m
+        assert m["feature_quality_sum"] == 14.088245, m
+        # same names, straight from the library join
+        assert m["total_intensity"] == 149891.59, m
+        assert m["library_peptides"] == 7, m
+        assert m["library_precursor_mz"] == 6, m
+        assert m["library_transitions"] == 18, m
+        assert m["identified_peptides"] == 6, m
+        assert m["identified_precursor_mz"] == 6, m
+        assert m["identified_proteins"] == 1, m
+        assert m["transitions_used"] == 18, m
+        assert m["library_coverage"] == 0.857143, m
+
+        # not measurements -> not lifted
+        assert "expected_features" not in m, m
+        assert "features_match" not in m, m
+        assert "qc_charge_distribution" not in m, m
+        # DIA has no spectrum-level identifications: no PSM/FDR claim
+        assert not [k for k in m if "psm" in k.lower()], m
+        assert not [k for k in m if "fdr" in k.lower()], m
+        # every lifted value is numeric, so Trends can chart it
+        assert all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   for k, v in m.items() if k != "verdict"), m
+
+        # the raw correctness block is preserved unchanged
+        assert out["correctness"] == _library_correctness(), out["correctness"]
+        print("  PASS: normalize openswath lifts library metrics into metrics{}")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_openswath_library_metrics_reach_trends():
+    """The generic Trends machinery discovers the new OpenSwath metric keys
+    with no renderer change: they become numeric trend columns, and a stored
+    run that predates them still renders with a dash."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # run 1: historical shape, no library metrics recorded
+        p1 = os.path.join(tmpdir, "raw-1.json")
+        _write_raw_openswath(p1, "100", "2026-08-26T18:40:29Z")
+        normalize_openswath(_normalize_args(p1, "100", tmpdir))
+        # run 2: carries the library metrics
+        p2 = os.path.join(tmpdir, "raw-2.json")
+        raw = _write_raw_openswath(p2, "200", "2026-09-20T12:00:00Z")
+        raw["correctness"] = _library_correctness()
+        with open(p2, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(p2, "200", tmpdir))
+
+        runs, _ = load_results(tmpdir)
+        assert len(runs) == 2, len(runs)
+        series = build_history_series(runs)
+        assert len(series) == 1, series
+        cols = {c["name"]: c["kind"] for c in series[0]["columns"]}
+        for key in ("identified_peptides", "identified_precursor_mz",
+                    "identified_proteins", "library_peptides",
+                    "library_coverage", "identified_features",
+                    "feature_quality_sum", "total_intensity"):
+            assert key in cols, (key, sorted(cols))
+            assert cols[key] == "numeric", (key, cols[key])
+
+        # the run that predates the metrics keeps a None (rendered as a dash)
+        assert series[0]["values"]["identified_peptides"] == [None, 6], \
+            series[0]["values"]["identified_peptides"]
+        assert series[0]["values"]["library_coverage"] == [None, 0.857143], \
+            series[0]["values"]["library_coverage"]
+
+        # and the values reach the rendered HTML through the generic path
+        import datetime as _dt
+        out_path = os.path.join(tmpdir, "report.html")
+        render(runs[-1], runs[0], runs, [], out_path,
+               _dt.datetime(2026, 9, 20, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as fh:
+            html = fh.read()
+        assert "identified_peptides" in html, "metric column not rendered"
+        assert "library_coverage" in html, "metric column not rendered"
+        # the cell text is whatever the shared formatter produces for the
+        # metric, not the raw JSON number (_fmt_metric applies its own
+        # precision rules), so assert against the formatter itself.
+        assert _fmt_metric("library_coverage", 0.857143) in html, \
+            "formatted metric value not rendered"
+        print("  PASS: OpenSwath library metrics reach the generic Trends table")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_normalize_openswath_null_correctness_is_not_fatal():
+    """A raw result whose correctness is JSON null must normalize to empty
+    correctness rather than raising: the pre-existing code stored such a value
+    verbatim, so lifting metrics must not turn it into a crash."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        raw_path = os.path.join(tmpdir, "openswath.json")
+        raw = _write_raw_openswath(raw_path, "NULL", "2026-09-20T12:00:00Z")
+        raw["correctness"] = None
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        normalize_openswath(_normalize_args(raw_path, "NULL", tmpdir))
+        with open(os.path.join(tmpdir, "openswath_dia", "openms",
+                               "openswath_dia-NULL.json"), encoding="utf-8") as fh:
+            out = json.load(fh)
+        assert out["correctness"] == {}, out["correctness"]
+        assert out["metrics"] == {"verdict": "pass"}, out["metrics"]
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: normalize openswath tolerates null correctness")
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -1490,6 +1640,9 @@ def main():
         test_build_history_series_numeric_vs_categorical_and_bool,
         test_render_trends_v1_promotion_path,
         test_render_trends_single_run_and_missing_metric,
+        test_normalize_openswath_lifts_library_metrics,
+        test_openswath_library_metrics_reach_trends,
+        test_normalize_openswath_null_correctness_is_not_fatal,
     ]
     passed = 0
     failed = 0

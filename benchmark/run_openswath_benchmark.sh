@@ -164,11 +164,18 @@ while IFS=$'\t' read -r name required _rc _wall _cpu _peak status _reason; do
 done < "${RESULTS_DIR}/stages.tsv"
 
 export RESULTS_DIR
+export FIXTURES_DIR
+export SCRIPT_DIR
 python3 - <<'PY'
-import csv, json, os
+import csv, json, os, sys
 import xml.etree.ElementTree as ET
 
 results_dir = os.environ["RESULTS_DIR"]
+# The TraML <-> featureXML join lives in openswath_metrics.py so it can be unit
+# tested, mirroring how run_prose_benchmark.sh imports prose_metrics. The
+# feature counting below stays here, in the runner.
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import openswath_metrics as om
 
 # Read meta
 meta = {}
@@ -230,8 +237,41 @@ if os.path.exists(qc_path):
     with open(qc_path) as fh:
         qc_metrics = json.load(fh)
 
+# Join the picked features against the TraML library to count the peptides,
+# precursor m/z values and proteins the run actually reached. A precursor here
+# is the (isolation m/z, charge) window, NOT upstream's peptideRef-keyed
+# transition group, so isobaric peptides share one precursor -- see
+# openswath_metrics.py. These are library-level
+# identifications derived through the library mapping -- NOT PSMs and NOT FDR:
+# OpenSwathWorkflow emits no idXML/mzTab and its featureXML carries no
+# PeptideIdentification/ProteinIdentification/IdentificationConfidence, so
+# spectrum-level counts do not exist here and are not invented. A library that
+# cannot be parsed, or a feature referencing an unknown transition, fails the
+# benchmark loudly instead of reporting a partial count.
+traml_path = os.path.join(os.environ["FIXTURES_DIR"], "OpenSwathWorkflow_1_input.TraML")
+library_counts = {}
+library_error = ""
+try:
+    library_counts = om.count_identifications(om.parse_traml(traml_path), featurexml_path)
+except om.OpenSwathMetricsError as exc:
+    library_error = str(exc)
+
 required_ok = all(s["status"] == "pass" for s in stages if s["required"])
-verdict = "pass" if required_ok else "fail"
+verdict = "pass" if required_ok and not library_error else "fail"
+
+correctness = {
+    "expected_features": 6,
+    "actual_features": feature_count,
+    "features_match": feature_count == 6,
+    "overall_quality_sum": round(sum(overall_qualities), 6) if overall_qualities else 0,
+    "total_intensity": round(sum(intensities), 2) if intensities else 0,
+    "qc_charge_distribution": qc_metrics.get("ChargeDistributionMS1", []),
+}
+# Library counts are appended, never substituted: the feature-count contract
+# above is unchanged, so every previously recorded raw field keeps its meaning.
+correctness.update(library_counts)
+if library_error:
+    correctness["library_error"] = library_error
 
 report = {
     "schema": "openms-benchmarking/report/v1",
@@ -245,14 +285,7 @@ report = {
     "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
     "stages": stages,
     "verdict": verdict,
-    "correctness": {
-        "expected_features": 6,
-        "actual_features": feature_count,
-        "features_match": feature_count == 6,
-        "overall_quality_sum": round(sum(overall_qualities), 6) if overall_qualities else 0,
-        "total_intensity": round(sum(intensities), 2) if intensities else 0,
-        "qc_charge_distribution": qc_metrics.get("ChargeDistributionMS1", []),
-    },
+    "correctness": correctness,
     "tool_versions": {k: v for k, v in meta.items() if k.endswith("_version")},
 }
 
@@ -262,7 +295,25 @@ PY
 
 # --- summary -----------------------------------------------------------------
 
+# The stage verdict above cannot see a library-join failure: the join runs
+# inside the Python block, which writes its own verdict into openswath.json.
+# Read that verdict back so summary.txt and the exit status cannot claim
+# success while the machine-readable result says fail (same pattern, and same
+# reason, as run_prose_benchmark.sh).
+if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["verdict"] == "pass" else 1)' "${RESULTS_DIR}/openswath.json" 2>/dev/null; then
+  : # openswath.json verdict already combines stage + library-join outcomes
+else
+  verdict="fail"
+  log "library join failed - see library_error in openswath.json"
+fi
+
 log ""
 log "Verdict: ${verdict}"
 log "Machine-readable results: ${RESULTS_DIR}/openswath.json"
+
+if [ "${verdict}" == "fail" ]; then
+  log "Done with failures - see logs/ and openswath.json."
+  exit 1
+fi
+
 log "Done."
