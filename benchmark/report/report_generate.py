@@ -556,6 +556,13 @@ tbody tr:nth-child(even) { background: #fcfcfd; }
 .dim { color: var(--muted); }
 footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 0 24px; }
 .badrow td { background: #fef2f2; }
+
+/* trend bars (CSS-only, no JS/SVG) */
+.tbar-cell { min-width: 130px; }
+.tbar-wrap { display: block; width: 100%; height: 8px; margin: 3px 0 4px;
+             background: #eef2f7; border: 1px solid var(--line);
+             border-radius: 4px; overflow: hidden; }
+.tbar { display: block; height: 100%; background: var(--accent); }
 """
 
 
@@ -623,6 +630,142 @@ def _discover_shared_metrics(current, baseline):
     base_c = _flat_compare(baseline)
     shared = sorted(set(cur_c.keys()) | set(base_c.keys()))
     return shared
+
+
+# ---------------------------------------------------------------------------
+# historical trends
+# ---------------------------------------------------------------------------
+
+_TREND_FIXED_COLUMNS = (
+    "performance.wall_time_s",
+    "performance.cpu_time_s",
+    "performance.peak_rss_kb",
+)
+
+
+def _is_numeric_value(value):
+    """True for real numbers; bool is deliberately NOT numeric."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _trend_value(run, column):
+    """Value of one trend column for a run, or None when not recorded.
+
+    Fixed performance scalars are read from performance[]; every other
+    column is a key of the metrics dict.
+    """
+    if column in _metrics(run):
+        return _metrics(run)[column]
+    if column.startswith("performance."):
+        return (_performance(run) or {}).get(column[len("performance."):])
+    return None
+
+
+def build_history_series(openms_runs):
+    """Group historical runs into per-benchmark trend series.
+
+    Runs are grouped by (identity.benchmark, identity.dataset,
+    identity.runtime.runtime_source) and each series is sorted oldest ->
+    newest by run_at.  Metric columns are discovered dynamically: the three
+    fixed performance scalars plus every metrics key except 'verdict'.  A
+    column is classified series-wide — numeric only when every non-None
+    value is a real number (bool never counts) — and columns without a
+    single recorded value are dropped.  Missing values stay None so the
+    renderer can mark them.
+    """
+    groups = {}
+    for run in openms_runs:
+        key = (_benchmark_name(run), _dataset(run), _runtime_source(run))
+        groups.setdefault(key, []).append(run)
+
+    series_list = []
+    for key in sorted(groups):
+        runs = groups[key]
+        runs.sort(key=lambda r: _run_at(r))
+        names = set(_TREND_FIXED_COLUMNS)
+        for run in runs:
+            names.update(k for k in (_metrics(run) or {}) if k != "verdict")
+        values = {}
+        kinds = {}
+        for name in sorted(names):
+            vals = [_trend_value(run, name) for run in runs]
+            present = [v for v in vals if v is not None]
+            if not present:
+                continue  # nothing recorded for this column in this series
+            values[name] = vals
+            kinds[name] = ("numeric" if all(_is_numeric_value(v) for v in present)
+                           else "categorical")
+        series_list.append({
+            "key": key,
+            "label": " · ".join(str(part) for part in key),
+            "runs": runs,
+            "columns": [{"name": name, "kind": kinds[name]}
+                        for name in sorted(kinds)],
+            "values": values,
+        })
+    return series_list
+
+
+def _trend_series_section(series_list):
+    """Render one Trends card per history series ("" when there are none).
+
+    Numeric columns get a CSS-only bar whose width is normalized to the
+    column's min-max range within the series (constant columns render a
+    full bar; widths are clamped to [0, 100]); missing values render as an
+    em dash with no bar.  Categorical values render as literal text.
+    """
+    if not series_list:
+        return ""
+    esc = html.escape
+    sections = ""
+    for series in series_list:
+        label = esc(series["label"])
+        header = "<th>Run at</th><th>Run</th><th>SHA</th>"
+        for col in series["columns"]:
+            header += f'<th class="num">{esc(col["name"])}</th>'
+        ranges = {}
+        for col in series["columns"]:
+            if col["kind"] == "numeric":
+                present = [v for v in series["values"][col["name"]]
+                           if v is not None]
+                ranges[col["name"]] = (min(present), max(present))
+        rows = ""
+        for i, run in enumerate(series["runs"]):
+            cells = (f"<td>{esc(_run_at(run))}</td>"
+                     f"<td class='mono'>{esc(_run_id(run))}</td>"
+                     f"<td class='mono'>{esc(short_sha(_software_version(run)))}</td>")
+            for col in series["columns"]:
+                name = col["name"]
+                value = series["values"][name][i]
+                if value is None:
+                    cells += '<td class="num tbar-cell">—</td>'
+                elif col["kind"] == "numeric":
+                    lo, hi = ranges[name]
+                    if hi == lo:
+                        width = 100.0  # constant column: deterministic full bar
+                    else:
+                        width = (value - lo) / (hi - lo) * 100.0
+                    width = max(0.0, min(100.0, width))
+                    cells += (f'<td class="num tbar-cell">'
+                              f'<div class="tbar-wrap"><div class="tbar" '
+                              f'style="width:{width:.1f}%"></div></div>'
+                              f'{esc(_fmt_metric(name, value))}</td>')
+                else:
+                    cells += f'<td class="num tbar-cell">{esc(_fmt_metric(name, value))}</td>'
+            rows += f"<tr>{cells}</tr>"
+        sections += f"""
+        <div class="card"><h2>Trends <span class="sub">— {label}</span></h2><div class="inner">
+          <table>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+          <div class="note">Oldest → newest run per column. Each numeric column
+          is scaled independently to its min-max range within this series (a
+          constant column shows a full bar); a dash (—) marks a value the run
+          did not record. Categorical values and the per-run verdict live in
+          <b>Run history</b>.</div>
+        </div></div>"""
+    return sections
 
 
 def render(current, baseline, openms_runs, tool_results, out_path, generated):
@@ -813,6 +956,9 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
           compared.</div>
         </div></div>"""
 
+    # ----- historical trends (one card per benchmark/dataset/runtime series) -
+    trends_section = _trend_series_section(build_history_series(openms_runs))
+
     # ----- history ---------------------------------------------------------
     history_section = ""
     if len(openms_runs) > 1:
@@ -877,6 +1023,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
 {metrics_section}
 {tool_section}
 {comp_section}
+{trends_section}
 {history_section}
 {status_section}
 <footer>Generated by <code>benchmark/report/report_generate.py</code>
@@ -959,6 +1106,47 @@ def normalize_smoke(args):
     print(f"normalized OpenMS run result -> {out_path}")
 
 
+# correctness[] key -> metrics[] key, for the OpenSwath DIA benchmark.
+#
+# The generic renderer treats metrics{} as a flat bag of name/value pairs and
+# discovers its columns dynamically, so surfacing the numeric measurements
+# here is all it takes for them to become Trends columns. Two keys are renamed
+# because their OpenMS-canonical names are unclear once flattened into a
+# metric bag; every other key keeps its own name.
+#
+# The `_precursor_mz` keys are NOT renamed for clarity, they carry a semantic
+# decision: library_precursor_mz / identified_precursor_mz measure distinct
+# isolation-window (m/z, charge) identities, which is deliberately NOT OpenMS's
+# own transition-group identity. MRMFeatureFinderScoring keys transition
+# groups by Transition@peptideRef alone, so an isobaric pair (Leu/Ile) counts
+# as ONE precursor_mz here but TWO transition groups there. The `_mz` suffix is
+# what keeps that difference from being silently flattened into an alias of the
+# peptide count; see benchmark/openswath_metrics.py and the isobaric regression
+# test in benchmark/test_openswath_metrics.py.
+#
+# Deliberately NOT mapped:
+#   expected_features     a hardcoded expectation, not a measurement
+#   features_match        a boolean verdict, and booleans are not numeric
+#   qc_charge_distribution a list, not a scalar
+#   library_error         a string; the failure is already carried by verdict
+#
+# PSM / FDR counts are absent by design: DIA emits no spectrum-level
+# identifications. See benchmark/openswath_metrics.py for the definitions.
+_OPENSWATH_CORRECTNESS_METRICS = {
+    "actual_features": "identified_features",
+    "overall_quality_sum": "feature_quality_sum",
+    "total_intensity": "total_intensity",
+    "library_peptides": "library_peptides",
+    "library_precursor_mz": "library_precursor_mz",
+    "library_transitions": "library_transitions",
+    "identified_peptides": "identified_peptides",
+    "identified_precursor_mz": "identified_precursor_mz",
+    "identified_proteins": "identified_proteins",
+    "transitions_used": "transitions_used",
+    "library_coverage": "library_coverage",
+}
+
+
 def normalize_openswath(args):
     """Convert a raw CI openswath.json into a normalized v2 OpenMS run result."""
     with open(args.openswath_json, encoding="utf-8") as fh:
@@ -985,6 +1173,18 @@ def normalize_openswath(args):
             "reason": st.get("reason", ""),
         })
     benchmark = raw.get("benchmark", "openswath")
+    # The raw correctness block is preserved verbatim below; its numeric
+    # measurements are additionally lifted into metrics so the generic Trends
+    # and Comparison machinery plot them over time. Keys absent from an older
+    # or partial raw result are simply not invented. `or {}` also covers a raw
+    # result whose correctness is JSON null (previously stored verbatim, so
+    # this must not become a crash).
+    correctness = raw.get("correctness") or {}
+    metrics = {"verdict": raw.get("verdict", "unknown")}
+    for raw_key, metric_key in _OPENSWATH_CORRECTNESS_METRICS.items():
+        value = correctness.get(raw_key)
+        if value is not None:
+            metrics[metric_key] = value
     out = {
         "schema": SCHEMA_V2,
         "identity": {
@@ -1013,10 +1213,8 @@ def normalize_openswath(args):
             },
             "stages": stages,
         },
-        "metrics": {
-            "verdict": raw.get("verdict", "unknown"),
-        },
-        "correctness": raw.get("correctness", {}),
+        "metrics": metrics,
+        "correctness": correctness,
         "tool_versions": raw.get("tool_versions", {}),
     }
     out_path = args.out or os.path.join(
