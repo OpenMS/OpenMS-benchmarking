@@ -363,40 +363,35 @@ def load_results(results_dir):
 
     Supports both v1 (flat openms/tools directories) and v2 (benchmark-specific
     subdirectories) layouts, with automatic v1->v2 promotion.
+
+    Discovery is depth-agnostic. A locally produced tree looks like
+    results/<benchmark>/openms/*.json, but CI merges several uploaded artifacts
+    into results/ and every artifact carries the job's own top-level directory
+    (results/, results-openswath/, results-prose/, ...), so the same v2 files
+    arrive at results/<artifact-dir>/<benchmark>/openms/*.json. Globbing a fixed
+    depth silently dropped every one of them, so the CI report showed no
+    OpenSwath run at all even though the Trends machinery can plot them once
+    loaded.
     """
     openms_runs, tool_results = [], []
 
-    # v1 layout: results/openms/*.json and results/tools/*.json
-    for path in sorted(glob.glob(os.path.join(results_dir, "openms", "*.json"))):
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-        openms_runs.append(_promote_v1(data))
-    for path in sorted(glob.glob(os.path.join(results_dir, "tools", "*.json"))):
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-        tool_results.append(_promote_v1(data))
+    def _load(parts, sink):
+        """Load every JSON matching results_dir/<parts> at any depth."""
+        pattern = os.path.join(results_dir, *parts)
+        for path in sorted(glob.glob(pattern, recursive=True)):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
+            sink.append(_promote_v1(data))
 
-    # v2 layout: results/<benchmark>/openms/*.json and results/<benchmark>/reference/*.json
-    for benchmark_dir in sorted(glob.glob(os.path.join(results_dir, "*"))):
-        if not os.path.isdir(benchmark_dir):
-            continue
-        benchmark_name = os.path.basename(benchmark_dir)
-        if benchmark_name in ("openms", "tools"):
-            continue  # already handled above
-        # OpenMS runs
-        for path in sorted(glob.glob(os.path.join(benchmark_dir, "openms", "*.json"))):
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-            openms_runs.append(_promote_v1(data))
-        # Reference/tool results
-        for path in sorted(glob.glob(os.path.join(benchmark_dir, "reference", "*.json"))):
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            data["_file"] = os.path.relpath(path, results_dir).replace(os.sep, "/")
-            tool_results.append(_promote_v1(data))
+    # '**' matches zero or more directories, so each of these covers both the
+    # v1 flat layout (results/openms/*.json) and the v2 layout
+    # (results/<benchmark>/openms/*.json) in a single pass. Replacing the old
+    # fixed-depth globs rather than adding to them is what keeps a file from
+    # being loaded twice.
+    _load(("**", "openms", "*.json"), openms_runs)
+    _load(("**", "tools", "*.json"), tool_results)
+    _load(("**", "reference", "*.json"), tool_results)
 
     # oldest first; the "current" run is the most recent one
     openms_runs.sort(key=lambda r: _run_at(r))
