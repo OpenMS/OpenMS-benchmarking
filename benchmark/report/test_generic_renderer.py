@@ -20,6 +20,7 @@ Tests:
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import shutil
@@ -1450,7 +1451,12 @@ def test_render_trends_single_run_and_missing_metric():
 
 def _library_correctness():
     """The correctness block run_openswath_benchmark.sh records after the
-    TraML <-> featureXML join (see benchmark/openswath_metrics.py)."""
+    TraML <-> featureXML join (see benchmark/openswath_metrics.py).
+
+    Mirrors the reference fixture: 7 declared peptides, one of which
+    (PEPTIDEA_Extra) carries no transitions, so 6 are identifiable and all 6
+    were identified -> library_coverage 1.0 over the identifiable base.
+    """
     return {
         "expected_features": 6,
         "actual_features": 6,
@@ -1459,13 +1465,15 @@ def _library_correctness():
         "total_intensity": 149891.59,
         "qc_charge_distribution": [[1, 19], [2, 19], [3, 19]],
         "library_peptides": 7,
+        "library_peptides_identifiable": 6,
+        "library_peptides_orphan": 1,
         "library_precursor_mz": 6,
         "library_transitions": 18,
         "identified_peptides": 6,
         "identified_precursor_mz": 6,
         "identified_proteins": 1,
         "transitions_used": 18,
-        "library_coverage": 0.857143,
+        "library_coverage": 1.0,
     }
 
 
@@ -1495,13 +1503,17 @@ def test_normalize_openswath_lifts_library_metrics():
         # same names, straight from the library join
         assert m["total_intensity"] == 149891.59, m
         assert m["library_peptides"] == 7, m
+        assert m["library_peptides_identifiable"] == 6, m
+        assert m["library_peptides_orphan"] == 1, m
         assert m["library_precursor_mz"] == 6, m
         assert m["library_transitions"] == 18, m
         assert m["identified_peptides"] == 6, m
         assert m["identified_precursor_mz"] == 6, m
         assert m["identified_proteins"] == 1, m
         assert m["transitions_used"] == 18, m
-        assert m["library_coverage"] == 0.857143, m
+        # coverage is over the identifiable base, so a run that finds every
+        # searchable peptide reads 1.0 while the orphan stays visible above
+        assert m["library_coverage"] == 1.0, m
 
         # not measurements -> not lifted
         assert "expected_features" not in m, m
@@ -1546,6 +1558,8 @@ def test_openswath_library_metrics_reach_trends():
         cols = {c["name"]: c["kind"] for c in series[0]["columns"]}
         for key in ("identified_peptides", "identified_precursor_mz",
                     "identified_proteins", "library_peptides",
+                    "library_peptides_identifiable",
+                    "library_peptides_orphan",
                     "library_coverage", "identified_features",
                     "feature_quality_sum", "total_intensity"):
             assert key in cols, (key, sorted(cols))
@@ -1554,8 +1568,10 @@ def test_openswath_library_metrics_reach_trends():
         # the run that predates the metrics keeps a None (rendered as a dash)
         assert series[0]["values"]["identified_peptides"] == [None, 6], \
             series[0]["values"]["identified_peptides"]
-        assert series[0]["values"]["library_coverage"] == [None, 0.857143], \
+        assert series[0]["values"]["library_coverage"] == [None, 1.0], \
             series[0]["values"]["library_coverage"]
+        assert series[0]["values"]["library_peptides_orphan"] == [None, 1], \
+            series[0]["values"]["library_peptides_orphan"]
 
         # and the values reach the rendered HTML through the generic path
         import datetime as _dt
@@ -1566,11 +1582,36 @@ def test_openswath_library_metrics_reach_trends():
             html = fh.read()
         assert "identified_peptides" in html, "metric column not rendered"
         assert "library_coverage" in html, "metric column not rendered"
-        # the cell text is whatever the shared formatter produces for the
-        # metric, not the raw JSON number (_fmt_metric applies its own
-        # precision rules), so assert against the formatter itself.
-        assert _fmt_metric("library_coverage", 0.857143) in html, \
-            "formatted metric value not rendered"
+        assert "library_peptides_identifiable" in html, "metric column not rendered"
+        assert "library_peptides_orphan" in html, "metric column not rendered"
+        # Assert against a LITERAL expected rendering, not a live
+        # _fmt_metric() call. Comparing against the formatter's own output
+        # passes for the wrong reason: any formatter change, including a total
+        # regression, would satisfy it. Instead the coverage CELL is extracted
+        # from the rendered row and compared to the expected literal, so the
+        # formatter is genuinely protected. library_coverage is a fraction of
+        # a population, so it must render as a percentage (1.0 -> "100.0%")
+        # and never as a bare "1.000" scalar.
+        cell = re.search(
+            r"<td class='mono'>library_coverage</td><td class='num'>([^<]*)</td>",
+            html)
+        assert cell, "library_coverage row not found in rendered HTML"
+        assert cell.group(1) == "100.0%", (
+            "library_coverage rendered as %r, expected '100.0%%'" % cell.group(1))
+        # same expectation for the comparison table, whose key is namespaced.
+        # That row is [key | baseline | current | delta]; the baseline run
+        # predates the library metrics, so its cell is an em dash and the
+        # current run's cell is the formatted value.
+        cell_cmp = re.search(
+            r"<td class='mono'>correctness\.library_coverage</td>"
+            r"<td class='num'>([^<]*)</td><td class='num'>([^<]*)</td>", html)
+        assert cell_cmp, "correctness.library_coverage row not found"
+        assert cell_cmp.group(1) == "—", (
+            "expected an em dash for the pre-metrics baseline, got %r"
+            % cell_cmp.group(1))
+        assert cell_cmp.group(2) == "100.0%", (
+            "correctness.library_coverage rendered as %r, expected '100.0%%'"
+            % cell_cmp.group(2))
         print("  PASS: OpenSwath library metrics reach the generic Trends table")
     finally:
         shutil.rmtree(tmpdir)

@@ -22,7 +22,11 @@ TERMINOLOGY (these are not interchangeable):
               `_precursor_mz` metric names.
 - feature     one picked chromatographic feature (a top-level <feature>). The
               runner owns the feature count; this module does not duplicate it.
-- peptide     a distinct TraML <Peptide>.
+- peptide     a distinct TraML <Peptide>.  A declared peptide with at least
+              one transition is "identifiable"; one with none is an "orphan".
+              library_peptides counts BOTH (it is the declared population);
+              library_peptides_identifiable and library_peptides_orphan split
+              it, and library_coverage is measured over the identifiable half.
 - protein     a distinct TraML <Protein> reached through a peptide's
               ProteinRef.
 
@@ -62,6 +66,14 @@ TRAML_NS = "http://psi.hupo.org/ms/traml"
 # library_coverage is a ratio, rounded like the runner's other ratio/sum
 # scalars (overall_quality_sum rounds to 6 decimals).
 COVERAGE_DECIMALS = 6
+
+# library_peptides_identifiable is the base of library_coverage. A TraML
+# peptide with no transitions is still declared in the library (it counts
+# towards library_peptides, matching upstream TargetedExperiment::getSummary())
+# but it has no precursor, so no transition, so no native_id a feature could
+# carry: it can never be identified. Dividing by such an entry would cap
+# coverage at a ceiling fixed by library construction rather than by the tool,
+# so it is excluded from the ratio and reported separately instead.
 
 
 class OpenSwathMetricsError(Exception):
@@ -163,10 +175,16 @@ def count_identifications(library, featurexml_path):
     """Join a featureXML against a parsed library and return the counts.
 
     Returns (all integers unless noted):
-        library_peptides, library_precursor_mz, library_transitions,
+        library_peptides, library_peptides_identifiable,
+        library_peptides_orphan, library_precursor_mz, library_transitions,
         identified_peptides, identified_precursor_mz, identified_proteins,
         transitions_used, library_coverage (float, identified_peptides /
-        library_peptides rounded to COVERAGE_DECIMALS)
+        library_peptides_identifiable rounded to COVERAGE_DECIMALS)
+
+    library_peptides stays the full declared count so an orphan library entry
+    stays visible; library_coverage is divided by the identifiable subset
+    only, because an orphan is structurally incapable of being identified and
+    would otherwise impose a ceiling no tool result can exceed.
 
     Raises OpenSwathMetricsError if the featureXML cannot be parsed or a
     feature references a transition the library does not define.
@@ -208,10 +226,18 @@ def count_identifications(library, featurexml_path):
             identified_proteins.update(peptide["proteins"])
 
     library_peptides = library["library_peptides"]
-    coverage = (len(identified_peptides) / library_peptides
-                if library_peptides else 0.0)
+    # Identifiable = declared peptides that at least one transition references.
+    # Intersecting with the declared set keeps a transition pointing at an
+    # undeclared peptide out of the denominator; the join above still fails
+    # loudly if a feature reaches such a peptide.
+    identifiable = {t["peptide"] for t in transitions.values()} & set(peptides)
+    identifiable_count = len(identifiable)
+    coverage = (len(identified_peptides) / identifiable_count
+                if identifiable_count else 0.0)
     return {
         "library_peptides": library_peptides,
+        "library_peptides_identifiable": identifiable_count,
+        "library_peptides_orphan": library_peptides - identifiable_count,
         "library_precursor_mz": library["library_precursor_mz"],
         "library_transitions": library["library_transitions"],
         "identified_peptides": len(identified_peptides),
