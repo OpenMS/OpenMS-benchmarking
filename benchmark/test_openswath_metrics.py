@@ -189,11 +189,17 @@ def test_feature_join_counts():
         assert counts["identified_precursor_mz"] == 2, counts    # one m/z each
         assert counts["identified_proteins"] == 2, counts       # ProtA, ProtB
         assert counts["transitions_used"] == 3, counts
-        assert counts["library_peptides"] == 4, counts          # incl. orphan
+        assert counts["library_peptides"] == 4, counts          # incl. orphans
+        # Only PepA and PepB carry transitions; PepC and PepOrphan are both
+        # declared-but-transition-less, so 4 declared splits 2 + 2.
+        assert counts["library_peptides_identifiable"] == 2, counts  # PepA, PepB
+        assert counts["library_peptides_orphan"] == 2, counts   # PepC, PepOrphan
         assert counts["library_precursor_mz"] == 2, counts
         assert counts["library_transitions"] == 3, counts
-        # 2 of 4 library peptides
-        assert counts["library_coverage"] == 0.5, counts
+        # both IDENTIFIABLE peptides were found, so coverage is 1.0 over the
+        # identifiable base even though the library declares twice as many
+        # peptides as can actually be searched.
+        assert counts["library_coverage"] == 1.0, counts
     print("PASS: feature join (distinct peptides/precursors/proteins, coverage)")
 
 
@@ -235,6 +241,10 @@ def test_empty_and_missing_inputs():
         assert counts["identified_peptides"] == 0, counts
         assert counts["library_coverage"] == 0.0, counts
         assert counts["library_peptides"] == 2, counts
+        # PepB is declared but transition-less, so only 1 peptide is
+        # identifiable even though the library declares 2.
+        assert counts["library_peptides_identifiable"] == 1, counts
+        assert counts["library_peptides_orphan"] == 1, counts
 
         for bad in (os.path.join(tmp, "nope.featureXML"),
                     os.path.join(tmp, "broken.TraML")):
@@ -254,8 +264,11 @@ def test_empty_and_missing_inputs():
 
 def test_reference_fixture_join():
     """Regression guard on the real committed OpenSwath fixtures: the vendored
-    library has 7 peptides but only 6 precursor m/z values, because one library
-    peptide carries no transitions and therefore can never be identified."""
+    library declares 7 peptides but only 6 carry transitions, because
+    PEPTIDEA_Extra has no transitions and therefore can never be identified.
+    The run is perfect on every other axis (18/18 transitions, 6/6 precursor
+    m/z), so coverage must be 6/6 = 1.0 over the identifiable subset, while
+    the orphan stays visible as its own count instead of penalising it."""
     traml = os.path.join(FIXTURES, "OpenSwathWorkflow_1_input.TraML")
     feat = os.path.join(FIXTURES, "OpenSwathWorkflow_1_output.featureXML")
     lib = om.parse_traml(traml)
@@ -268,12 +281,91 @@ def test_reference_fixture_join():
     assert counts["identified_precursor_mz"] == 6, counts
     assert counts["identified_proteins"] == 1, counts
     assert counts["transitions_used"] == 18, counts
-    assert counts["library_coverage"] == 0.857143, counts
+    # declared / identifiable / orphan must all stay observable
+    assert counts["library_peptides"] == 7, counts
+    assert counts["library_peptides_identifiable"] == 6, counts
+    assert counts["library_peptides_orphan"] == 1, counts
+    assert counts["library_peptides_orphan"] == (
+        counts["library_peptides"] - counts["library_peptides_identifiable"]), counts
+    assert counts["library_coverage"] == 1.0, counts
     # No PSM/FDR key may ever appear: DIA emits no spectrum-level
     # identifications, so such a count would be fabricated.
     assert not [k for k in counts if "psm" in k.lower()], counts
     assert not [k for k in counts if "fdr" in k.lower()], counts
-    print("PASS: reference fixture join (7 peptides / 6 precursor m/z / 6 identified)")
+    print("PASS: reference fixture join (7 declared / 6 identifiable / 6 identified "
+          "-> coverage 1.0)")
+
+
+def test_orphan_peptide_does_not_penalise_coverage():
+    """F5 regression guard: a declared-but-transition-less peptide must not
+    lower library_coverage.
+
+    The fixture library carries one such orphan (PEPTIDEA_Extra). Two runs
+    that find every IDENTIFIABLE peptide must both report coverage 1.0,
+    whether or not the library also declares orphans. Before this guard the
+    metric divided by all declared peptides, so the same perfect run reported
+    6/7 = 0.857143 and looked like a 14% identification failure caused by the
+    tool. If this test ever fails, either the denominator changed again or the
+    orphan counts changed -- both require the module docstring to change too.
+    """
+    traml = os.path.join(FIXTURES, "OpenSwathWorkflow_1_input.TraML")
+    feat = os.path.join(FIXTURES, "OpenSwathWorkflow_1_output.featureXML")
+    lib = om.parse_traml(traml)
+    counts = om.count_identifications(lib, feat)
+
+    # every identifiable peptide was found
+    assert counts["identified_peptides"] == counts["library_peptides_identifiable"], \
+        counts
+    # so coverage is exactly 1.0 despite the orphan being declared
+    assert counts["library_peptides_orphan"] > 0, counts   # the orphan is present
+    assert counts["library_coverage"] == 1.0, counts
+
+    # Same result with an orphan-free library: 3 declared, 3 identifiable,
+    # all 3 identified -> coverage 1.0. Identifiable coverage is therefore
+    # independent of how many orphans the library happens to declare.
+    with tempfile.TemporaryDirectory() as tmp:
+        lib2 = os.path.join(tmp, "noorphan.TraML")
+        make_traml(
+            lib2,
+            proteins=[("ProtA", "uniprot_a")],
+            peptides=[("PepA", "AAAA", "2", "ProtA"),
+                      ("PepB", "BBBB", "2", "ProtA"),
+                      ("PepC", "CCCC", "2", "ProtA")],
+            transitions=[("t1", "PepA", "400.5"),
+                         ("t2", "PepB", "500.5"),
+                         ("t3", "PepC", "600.5")],
+        )
+        feat2 = os.path.join(tmp, "all.featureXML")
+        make_featurexml(feat2, [["t1"], ["t2"], ["t3"]])
+        c2 = om.count_identifications(om.parse_traml(lib2), feat2)
+        assert c2["library_peptides"] == 3, c2
+        assert c2["library_peptides_identifiable"] == 3, c2
+        assert c2["library_peptides_orphan"] == 0, c2
+        assert c2["library_coverage"] == 1.0, c2
+
+    # A genuine miss must still be penalised: drop one peptide's feature and
+    # coverage falls below 1.0. This is what stops the orphan exclusion from
+    # degenerating into "coverage is always 1.0".
+    with tempfile.TemporaryDirectory() as tmp:
+        lib3 = os.path.join(tmp, "miss.TraML")
+        make_traml(
+            lib3,
+            proteins=[("ProtA", "uniprot_a")],
+            peptides=[("PepA", "AAAA", "2", "ProtA"),
+                      ("PepB", "BBBB", "2", "ProtA"),
+                      ("PepC", "CCCC", "2", "ProtA")],
+            transitions=[("t1", "PepA", "400.5"),
+                         ("t2", "PepB", "500.5"),
+                         ("t3", "PepC", "600.5")],
+        )
+        feat3 = os.path.join(tmp, "partial.featureXML")
+        make_featurexml(feat3, [["t1"], ["t2"]])   # PepC not identified
+        c3 = om.count_identifications(om.parse_traml(lib3), feat3)
+        assert c3["identified_peptides"] == 2, c3
+        assert c3["library_peptides_identifiable"] == 3, c3
+        assert c3["library_coverage"] == 0.666667, c3
+
+    print("PASS: orphan peptide does not penalise coverage; real misses still do")
 
 
 def test_isobaric_peptides_share_one_precursor_mz():
@@ -325,6 +417,7 @@ def main():
     test_unmatched_transition_fails_loudly()
     test_empty_and_missing_inputs()
     test_reference_fixture_join()
+    test_orphan_peptide_does_not_penalise_coverage()
     test_isobaric_peptides_share_one_precursor_mz()
     print("\nAll openswath_metrics tests passed.")
 
