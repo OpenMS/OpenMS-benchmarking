@@ -201,6 +201,13 @@ def _fmt_metric(name, value):
             return f"{value:.2f} s"
         if name.endswith("peak_rss_kb"):
             return fmt_bytes(float(value) * 1024)
+        # library_coverage is a fraction of a population, not a bare scalar:
+        # render it as a percentage so it cannot be misread as an absolute
+        # count or an error magnitude. The numerator/denominator are shown as
+        # their own rows (identified_peptides / library_peptides_identifiable),
+        # so the fraction itself stays reconstructible from the table.
+        if name.endswith("library_coverage"):
+            return f"{value * 100:.1f}%"
         if name.endswith("_s"):
             return fmt_seconds(value)
         if abs(value) < 10:
@@ -1132,11 +1139,27 @@ def normalize_smoke(args):
 #
 # PSM / FDR counts are absent by design: DIA emits no spectrum-level
 # identifications. See benchmark/openswath_metrics.py for the definitions.
+#
+# library_coverage is measured over library_peptides_identifiable, NOT over
+# library_peptides. A declared peptide with no transitions has no precursor,
+# so no transition, so no native_id a feature could carry: it can never be
+# identified, and counting it in the ratio capped coverage at a ceiling fixed
+# by library construction rather than by the tool. library_peptides stays the
+# full declared count so such an orphan stays visible, and
+# library_peptides_orphan reports it outright.
+#
+# NOTE FOR TRENDS: this changed library_coverage's MEANING, not just its
+# accuracy. Historical values are identified/library_peptides and are NOT
+# comparable with values recorded after this change, which are
+# identified/library_peptides_identifiable. Runs recorded either side of the
+# change will plot as one series with a step at the change point.
 _OPENSWATH_CORRECTNESS_METRICS = {
     "actual_features": "identified_features",
     "overall_quality_sum": "feature_quality_sum",
     "total_intensity": "total_intensity",
     "library_peptides": "library_peptides",
+    "library_peptides_identifiable": "library_peptides_identifiable",
+    "library_peptides_orphan": "library_peptides_orphan",
     "library_precursor_mz": "library_precursor_mz",
     "library_transitions": "library_transitions",
     "identified_peptides": "identified_peptides",
