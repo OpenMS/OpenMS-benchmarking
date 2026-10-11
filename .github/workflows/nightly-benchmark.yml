@@ -74,17 +74,40 @@ jobs:
 
           # The dispatch API does not return the created run; locate it by
           # head SHA and creation time. Poll until it exists, then until it
-          # completes (package mode takes ~2 minutes end to end).
+          # completes (package mode takes ~2 minutes end to end). gh failures
+          # are surfaced, never folded into "not found yet": an empty result
+          # means the run is not visible yet, anything else is an error.
           BENCH_RUN_ID=""
+          GH_ERRS=0
+          gh_err="$(mktemp)"
           for _ in $(seq 1 60); do
-            BENCH_RUN_ID="$(gh run list \
+            if BENCH_RUN_ID="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow benchmark.yml \
-              --head_sha "$MAIN_SHA" \
+              --commit "$MAIN_SHA" \
               --created ">=$DISPATCH_AT" \
               --limit 5 \
               --json databaseId,createdAt \
-              --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // ""' || true)"
+              --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // ""' \
+              2>"$gh_err")"; then
+              GH_ERRS=0
+            else
+              cat "$gh_err" >&2
+              # A malformed query (unsupported flag, bad field, bad date)
+              # will never succeed: fail immediately instead of polling.
+              if grep -qiE "unknown (flag|command|argument|field)|usage:" "$gh_err"; then
+                echo "::error::gh run list rejected the discovery query (command/configuration error)"
+                exit 1
+              fi
+              # API/auth failure: retry briefly, then surface it rather than
+              # reporting "no run appeared" as if the query had succeeded.
+              GH_ERRS=$((GH_ERRS + 1))
+              if [ "$GH_ERRS" -ge 3 ]; then
+                echo "::error::gh run list failed $GH_ERRS times (API/auth error); last error above"
+                exit 1
+              fi
+              BENCH_RUN_ID=""
+            fi
             [ -n "$BENCH_RUN_ID" ] && break
             sleep 20
           done
