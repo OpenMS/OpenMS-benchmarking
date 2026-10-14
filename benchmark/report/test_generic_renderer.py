@@ -1724,6 +1724,163 @@ def test_load_results_finds_nested_ci_artifact_layout():
         shutil.rmtree(tmpdir)
 
 
+def test_string_metric_values_are_html_escaped():
+    """Issue #6: a string value reaching an HTML table cell through
+    _fmt_metric() must be escaped at the insertion point - correctness,
+    primary metrics, reference/tool results, and both comparison columns -
+    while the Trends card, which already escapes, keeps escaping exactly
+    once. _fmt_metric() itself must stay a plain-text formatter: escaping
+    belongs to the HTML insertion points, so putting it inside the formatter
+    would double-escape through esc(_fmt_metric(...))."""
+    payload = "<script>alert(1)</script>"
+    esc_payload = "&lt;script&gt;alert(1)&lt;/script&gt;"
+    amp = "A & B"
+    esc_amp = "A &amp; B"
+
+    # plain-text contract of the formatter itself
+    assert _fmt_metric("k", payload) == payload
+    assert _fmt_metric("k", amp) == amp
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(tmpdir, "escape_check", "openms"))
+        os.makedirs(os.path.join(tmpdir, "escape_check", "reference"))
+
+        def write_openms(run_id, run_at, metrics, correctness):
+            run = {
+                "schema": "openms-benchmarking/report/v2",
+                "identity": {"benchmark": "escape_check", "dataset": "fixture",
+                             "software": {"name": "OpenMS", "version": "abc123"}},
+                "run": {"run_id": run_id, "run_at": run_at, "cache": "warm"},
+                "performance": {"stages": []},
+                "metrics": dict(metrics, verdict="pass"),
+                "correctness": correctness,
+            }
+            path = os.path.join(tmpdir, "escape_check", "openms",
+                                f"escape_check-{run_id}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(run, fh)
+
+        # Both runs carry a string-valued metric/correctness entry so the
+        # comparison renders strings in BOTH the baseline and current column.
+        # "trend_only" exists in the current run alone so its escaped value
+        # occurs exactly once inside the Trends card.
+        write_openms("1", "2026-08-01T00:00:00Z",
+                     {"shared_script": payload},
+                     {"qc_expect": amp})
+        write_openms("2", "2026-08-02T00:00:00Z",
+                     {"shared_script": payload, "trend_only": amp},
+                     {"qc_expect": amp, "qc_charge": payload})
+
+        # a reference/tool result with string-valued metrics
+        tool = {
+            "schema": "openms-benchmarking/report/v2",
+            "identity": {"benchmark": "escape_check", "dataset": "fixture",
+                         "software": {"name": "quantms", "version": "1.8.0"}},
+            "run": {"run_id": "Ref 1", "run_at": "2026-07-01T00:00:00Z"},
+            "tool": {"name": "quantms", "version": "1.8.0"},
+            "metrics": {"roc_auc": 0.89, "tool_script": payload,
+                        "tool_amp": amp},
+        }
+        with open(os.path.join(tmpdir, "escape_check", "reference", "ref-1.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(tool, fh)
+
+        openms_runs, tool_results = load_results(tmpdir)
+        assert len(openms_runs) == 2, len(openms_runs)
+        assert len(tool_results) == 1, len(tool_results)
+
+        out_path = os.path.join(tmpdir, "report.html")
+        import datetime as _dt
+        render(openms_runs[-1], openms_runs[0], openms_runs, tool_results,
+               out_path, _dt.datetime(2026, 8, 2, tzinfo=_dt.timezone.utc))
+        with open(out_path, encoding="utf-8") as fh:
+            doc = fh.read()
+
+        def card(marker):
+            """One report card's HTML, sliced at the next sibling card so an
+            assertion for one table cannot be satisfied by another table."""
+            start = doc.find(marker)
+            assert start != -1, "card %r not found in rendered HTML" % marker
+            end = doc.find('<div class="card">', start)
+            return doc[start:] if end == -1 else doc[start:end]
+
+        def cell(table_html, row_re, where):
+            """First capture group of one row inside one card."""
+            m = re.search(row_re, table_html)
+            assert m, "%s row not found in rendered HTML" % where
+            return m.group(1)
+
+        # 1. Correctness table value
+        c_card = card("<h2>Correctness</h2>")
+        assert cell(c_card, r"<td class='mono'>qc_charge</td>"
+                           r"<td class='num'>(.*?)</td>",
+                    "correctness qc_charge") == esc_payload
+        assert cell(c_card, r"<td class='mono'>qc_expect</td>"
+                           r"<td class='num'>(.*?)</td>",
+                    "correctness qc_expect") == esc_amp
+        assert payload not in c_card, "raw <script> in Correctness card"
+        assert amp not in c_card, "raw 'A & B' in Correctness card"
+
+        # 2. Primary metrics table value
+        m_card = card("<h2>Metrics</h2>")
+        assert cell(m_card, r"<td class='mono'>trend_only</td>"
+                           r"<td class='num'>(.*?)</td>",
+                    "metrics trend_only") == esc_amp
+        assert cell(m_card, r"<td class='mono'>shared_script</td>"
+                           r"<td class='num'>(.*?)</td>",
+                    "metrics shared_script") == esc_payload
+        assert payload not in m_card, "raw <script> in Metrics card"
+        assert amp not in m_card, "raw 'A & B' in Metrics card"
+
+        # 3. Reference / tool-results metric value
+        r_card = card("<h2>Reference results")
+        assert cell(r_card, r"<tr><td>tool_script</td>"
+                            r"<td class='num'>(.*?)</td>",
+                    "reference tool_script") == esc_payload
+        assert cell(r_card, r"<tr><td>tool_amp</td>"
+                            r"<td class='num'>(.*?)</td>",
+                    "reference tool_amp") == esc_amp
+        assert payload not in r_card, "raw <script> in Reference results card"
+        assert amp not in r_card, "raw 'A & B' in Reference results card"
+
+        # 4/5. Comparison baseline and current cells
+        cmp_card = card("<h2>Comparison")
+        m = re.search(r"<td class='mono'>shared_script</td>"
+                      r"<td class='num'>(.*?)</td>"
+                      r"<td class='num'>(.*?)</td>", cmp_card)
+        assert m, "comparison shared_script row not found"
+        assert m.group(1) == esc_payload, \
+            "baseline cell not escaped: %r" % m.group(1)
+        assert m.group(2) == esc_payload, \
+            "current cell not escaped: %r" % m.group(2)
+        m = re.search(r"<td class='mono'>correctness\.qc_expect</td>"
+                      r"<td class='num'>(.*?)</td>"
+                      r"<td class='num'>(.*?)</td>", cmp_card)
+        assert m, "comparison correctness.qc_expect row not found"
+        assert m.group(1) == esc_amp, \
+            "baseline cell not escaped: %r" % m.group(1)
+        assert m.group(2) == esc_amp, \
+            "current cell not escaped: %r" % m.group(2)
+        assert payload not in cmp_card, "raw <script> in Comparison card"
+        assert amp not in cmp_card, "raw 'A & B' in Comparison card"
+
+        # Trends: the categorical string value is escaped exactly once
+        # (single occurrence, single escaping level)
+        t_card = card("Trends <span")
+        assert t_card.count('<td class="num tbar-cell">%s</td>' % esc_amp) == 1, \
+            "expected exactly one escaped categorical Trends cell"
+        assert payload not in t_card, "raw <script> in Trends card"
+        assert amp not in t_card, "raw 'A & B' in Trends card"
+
+        # global invariants across the whole document
+        assert payload not in doc, "raw <script> markup emitted from a value"
+        assert "&amp;lt;" not in doc, "double-escaped value detected"
+        print("  PASS: string metric values are html-escaped")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def main():
     print("Running generic renderer tests...\n")
     tests = [
@@ -1771,6 +1928,7 @@ def main():
         test_normalize_openswath_lifts_library_metrics,
         test_openswath_library_metrics_reach_trends,
         test_normalize_openswath_null_correctness_is_not_fatal,
+        test_string_metric_values_are_html_escaped,
     ]
     passed = 0
     failed = 0
