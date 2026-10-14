@@ -856,7 +856,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     correctness_section = ""
     if correctness:
         crows = "".join(
-            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
+            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{esc(_fmt_metric(k, v))}</td></tr>"
             for k, v in sorted(correctness.items())
         )
         correctness_section = f"""
@@ -871,7 +871,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
     metrics_section = ""
     if display_metrics:
         mrows = "".join(
-            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{_fmt_metric(k, v)}</td></tr>"
+            f"<tr><td class='mono'>{esc(k)}</td><td class='num'>{esc(_fmt_metric(k, v))}</td></tr>"
             for k, v in display_metrics.items()
         )
         metrics_section = f"""
@@ -894,7 +894,7 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
         for mk in all_metric_keys:
             vals = [_metrics(t).get(mk) for t in tool_results]
             cells = "".join(
-                f"<td class='num'>{_fmt_metric(mk, v)}</td>" for v in vals
+                f"<td class='num'>{esc(_fmt_metric(mk, v))}</td>" for v in vals
             )
             if all(isinstance(v, (int, float)) for v in vals if v is not None):
                 cells += f"<td class='num'>{html.escape(fmt_delta(vals[-1], vals[0], True))}</td>"
@@ -938,8 +938,8 @@ def render(current, baseline, openms_runs, tool_results, out_path, generated):
             delta_cell = html.escape(fmt_delta(cur_v, base_v, numeric))
             rows += (
                 f"<tr><td class='mono'>{esc(key)}</td>"
-                f"<td class='num'>{_fmt_metric(key, base_v)}</td>"
-                f"<td class='num'>{_fmt_metric(key, cur_v)}</td>"
+                f"<td class='num'>{esc(_fmt_metric(key, base_v))}</td>"
+                f"<td class='num'>{esc(_fmt_metric(key, cur_v))}</td>"
                 f"<td class='num'>{delta_cell}</td></tr>"
             )
         cache_note = ""
