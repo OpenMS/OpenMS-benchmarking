@@ -60,62 +60,54 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          MAIN_SHA="$(git rev-parse origin/main)"
-          # Window start, not a strict dispatch timestamp: clock skew between
-          # runner and API plus second-granularity comparison could otherwise
-          # miss the run that was just created. Narrow window + newest match
-          # below keeps a stale run from being picked up.
-          DISPATCH_AT="$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)"
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/dispatches" \
+          # Dispatch the proven package-mode pipeline and ask the dispatch API
+          # for the created run's id directly (return_run_details=true, the
+          # approach suggested in OpenMS/OpenMS-benchmarking#7; announced
+          # 2026-02-19, GHES/ignored-flag servers may still answer 204 with an
+          # empty body, which fails the empty check below). The returned
+          # workflow_run_id is the ONLY identifier trusted downstream - there
+          # is deliberately no commit-SHA/time-window/recency discovery
+          # fallback. If the call fails or yields no usable id, the job fails
+          # here, before any waiting, artifact download, or persistence.
+          if ! BENCH_RUN_ID="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/dispatches" \
             -f ref=main \
-            -F "inputs[runtime_source]=package"
-          echo "Dispatched Benchmark (package mode) on main @ $MAIN_SHA at $DISPATCH_AT"
-
-          # The dispatch API does not return the created run; locate it by
-          # head SHA and creation time. Poll until it exists, then until it
-          # completes (package mode takes ~2 minutes end to end). gh failures
-          # are surfaced, never folded into "not found yet": an empty result
-          # means the run is not visible yet, anything else is an error.
-          BENCH_RUN_ID=""
-          GH_ERRS=0
-          gh_err="$(mktemp)"
-          for _ in $(seq 1 60); do
-            if BENCH_RUN_ID="$(gh run list \
-              --repo "$GITHUB_REPOSITORY" \
-              --workflow benchmark.yml \
-              --commit "$MAIN_SHA" \
-              --created ">=$DISPATCH_AT" \
-              --limit 5 \
-              --json databaseId,createdAt \
-              --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // ""' \
-              2>"$gh_err")"; then
-              GH_ERRS=0
-            else
-              cat "$gh_err" >&2
-              # A malformed query (unsupported flag, bad field, bad date)
-              # will never succeed: fail immediately instead of polling.
-              if grep -qiE "unknown (flag|command|argument|field)|usage:" "$gh_err"; then
-                echo "::error::gh run list rejected the discovery query (command/configuration error)"
-                exit 1
-              fi
-              # API/auth failure: retry briefly, then surface it rather than
-              # reporting "no run appeared" as if the query had succeeded.
-              GH_ERRS=$((GH_ERRS + 1))
-              if [ "$GH_ERRS" -ge 3 ]; then
-                echo "::error::gh run list failed $GH_ERRS times (API/auth error); last error above"
-                exit 1
-              fi
-              BENCH_RUN_ID=""
-            fi
-            [ -n "$BENCH_RUN_ID" ] && break
-            sleep 20
-          done
-          if [ -z "$BENCH_RUN_ID" ]; then
-            echo "::error::no benchmark.yml run appeared after the dispatch"
+            -F "inputs[runtime_source]=package" \
+            -F return_run_details=true \
+            --jq '.workflow_run_id // empty')"; then
+            echo "::error::workflow dispatch API call failed - cannot determine which run was created"
             exit 1
           fi
-          echo "Bench run id: $BENCH_RUN_ID"
+
+          # Strict id validation: reject empty (missing/204/null), non-numeric,
+          # malformed, zero, or negative values before touching the run.
+          if [ -z "$BENCH_RUN_ID" ]; then
+            echo "::error::dispatch returned no workflow_run_id (empty or null response)"
+            exit 1
+          fi
+          # Match the WHOLE captured value with bash's own regex, not grep:
+          # grep is line-oriented and would accept an embedded-newline value
+          # as long as one line is all digits, letting malformed input reach
+          # GITHUB_ENV (and an [ -eq ] that errors are silently swallowed
+          # inside if conditions).
+          if [[ ! "$BENCH_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::dispatch returned a non-numeric or malformed workflow_run_id: '$BENCH_RUN_ID'"
+            exit 1
+          fi
+          # Bound the length before integer comparison: 18 digits stays well
+          # inside int64 so the zero check below cannot overflow into an
+          # "integer expression expected" error that set -e would miss inside if.
+          if [ "${#BENCH_RUN_ID}" -gt 18 ]; then
+            echo "::error::dispatch returned an implausibly large workflow_run_id: '$BENCH_RUN_ID'"
+            exit 1
+          fi
+          if [ "$BENCH_RUN_ID" -eq 0 ]; then
+            echo "::error::dispatch returned workflow_run_id 0 (invalid)"
+            exit 1
+          fi
+
+          echo "Dispatched Benchmark (package mode) on main; captured workflow_run_id=$BENCH_RUN_ID"
           echo "BENCH_RUN_ID=$BENCH_RUN_ID" >> "$GITHUB_ENV"
 
           for _ in $(seq 1 90); do
@@ -183,8 +175,8 @@ jobs:
                   data = json.load(fh)
               # Race guard: only persist what this workflow dispatched. A
               # benchmark run adopted by mistake (e.g. a concurrent manual
-              # source-mode dispatch on main inside the discovery window)
-              # carries a different runtime identity and must fail here.
+              # source-mode dispatch on main) carries a different runtime
+              # identity and must fail here.
               runtime_source = data.get("identity", {}).get("runtime", {}).get("runtime_source")
               if runtime_source != "package":
                   sys.exit(f"{label}: identity.runtime.runtime_source is {runtime_source!r}, "
