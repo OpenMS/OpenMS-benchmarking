@@ -167,7 +167,8 @@ fi
   echo "openms_sha=${OPENMS_SHA}"
   echo "use_ms2rescore=${USE_MS2RESCORE}"
   for t in FileConverter CometAdapter DecoyDatabase PercolatorAdapter; do
-    echo "${t}_version=$("${OPENMS_BIN}/${t}" --version 2>&1 | head -1 || true)"
+    version="$("${OPENMS_BIN}/${t}" -help 2>&1 | sed -n 's/^[[:space:]]*Version:[[:space:]]*//p' | head -n 1 || true)"
+    echo "${t}_version=${version:-unknown}"
   done
   echo "comet_engine_version=$("${COMET_ENGINE}" -v 2>&1 | head -1 || true)"
   echo "percolator_engine_version=$("${PERCOLATOR_ENGINE}" --version 2>&1 | head -1 || true)"
