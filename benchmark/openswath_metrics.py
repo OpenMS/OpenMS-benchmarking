@@ -32,14 +32,35 @@ TERMINOLOGY (these are not interchangeable):
 
 So "identified_peptides" means: distinct library peptides reached by the
 
-    featureXML subordinate <UserParam name="native_id">
-        -> TraML <Transition id="...">
+    featureXML subordinate <UserParam name="native_id">   (canonical id)
+        -> transition_canonical_to_source[canonical id]
+        -> TraML <Transition id="...">                     (source id)
         -> Transition@peptideRef
         -> TraML <Peptide id="...">
         -> Peptide/ProteinRef@ref
         -> TraML <Protein id="...">
 
 join. It does NOT mean peptide-spectrum matches.
+
+TRANSITION ID CONTRACT - two namespaces, never interchangeable:
+
+- source id     the TraML <Transition id="..."> attribute, e.g. "1" or
+                "TIC_x". `transitions` is keyed by it, because everything
+                downstream of the join (peptideRef, precursor, protein) lives
+                on the TraML element itself.
+- canonical id  the zero-based position of that <Transition> in TraML
+                document order, as a decimal string ("0", "1", ...).
+                OpenMS replaces every source id with this value in
+                OpenSwathLibraryIDNormalizer::normalizeSourceIDs() before the
+                workflow runs, so OpenSwathWorkflow writes the CANONICAL id
+                as the feature's native_id. The source id survives only in an
+                in-memory map that featureXML never carries.
+
+The mapping between the two is therefore positional and is rebuilt here from
+TraML document order (transition_canonical_to_source). It is derived, not
+inferred from the numeric value: source ids are opaque strings and may be
+non-numeric, non-contiguous or collide with a canonical id, so a native_id is
+never arithmetic-converted and never looked up as a source id directly.
 
 WHAT IS DELIBERATELY NOT COUNTED HERE:
 
@@ -50,9 +71,16 @@ WHAT IS DELIBERATELY NOT COUNTED HERE:
 - FDR / q-values. There is no per-spectrum score and no decoy axis in DIA
   feature output, so neither is defined here.
 
-The join is fail-loud: a feature whose transition native_id is absent from the
-library raises OpenSwathMetricsError rather than being counted, so a run can
-never silently inflate its own identification counts.
+Only MS2-level subordinates take part in the join. OpenSwath also writes MS1
+precursor-extraction subordinates whose native_id is a precursor id of the form
+"<canonical precursor>_Precursor_i<k>"; those never denote a TraML <Transition>,
+so they are excluded by their FeatureLevel userParam - never by matching the
+shape of the id.
+
+The join is fail-loud: a feature whose canonical transition native_id has no
+entry in transition_canonical_to_source - or whose resolved source id is
+absent from the library - raises OpenSwathMetricsError rather than being
+counted, so a run can never silently inflate its own identification counts.
 
 Stdlib only, matching the rest of the benchmarking repo.
 """
@@ -88,9 +116,14 @@ def _local(element):
 
 
 def _cv(element, name):
-    """Value of the direct child cvParam/userParam with the given name."""
+    """Value of the direct child cvParam/userParam with the given name.
+
+    Matched case-insensitively because the two formats spell it differently:
+    TraML writes <cvParam>/<userParam>, featureXML writes <UserParam>.
+    """
     for child in element:
-        if _local(child) in ("cvParam", "userParam") and child.get("name") == name:
+        if (_local(child).lower() in ("cvparam", "userparam")
+                and child.get("name") == name):
             return child.get("value")
     return None
 
@@ -104,6 +137,10 @@ def parse_traml(path):
                                   "proteins": set of Protein ids}}
         transitions {transition_id: {"peptide": peptide_id,
                                      "precursor": (precursor_mz, charge)}}
+        transition_canonical_to_source
+                    {canonical id -> source id}, where the canonical id is
+                    the transition's zero-based position in TraML document
+                    order - the id OpenSwathWorkflow writes as native_id.
         library_peptides / library_precursor_mz / library_transitions /
         library_proteins   integer sizes
 
@@ -118,6 +155,13 @@ def parse_traml(path):
     proteins = set()
     peptides = {}
     transitions = {}
+    canonical_to_source = {}
+    # Zero-based position of the next <Transition> in document order. OpenMS
+    # assigns exactly this value as the transition's canonical id, so it is
+    # counted over EVERY <Transition> element - including one this parser
+    # cannot use - otherwise an unusable transition would silently shift the
+    # canonical ids of every transition after it.
+    transition_index = 0
 
     for element in root.iter():
         tag = _local(element)
@@ -133,9 +177,14 @@ def parse_traml(path):
                                  if _local(c) == "ProteinRef" and c.get("ref")},
                 }
         elif tag == "Transition":
+            canonical_id = str(transition_index)
+            transition_index += 1
             tid = element.get("id")
             peptide_id = element.get("peptideRef")
-            if not tid or not peptide_id:
+            if not tid:
+                continue
+            canonical_to_source[canonical_id] = tid
+            if not peptide_id:
                 continue
             precursor_mz = None
             for child in element:
@@ -152,6 +201,7 @@ def parse_traml(path):
         "proteins": proteins,
         "peptides": peptides,
         "transitions": transitions,
+        "transition_canonical_to_source": canonical_to_source,
         "library_peptides": len(peptides),
         "library_precursor_mz": len(precursors),
         "library_transitions": len(transitions),
@@ -164,11 +214,40 @@ def _feature_native_ids(feature):
 
     OpenSwath writes them as <UserParam name="native_id"> on the feature's
     subordinate features; iterating the whole subtree also covers a library
-    that puts them on the top-level feature.
+    that puts them on the top-level feature. The values are CANONICAL ids
+    (zero-based TraML document positions), not TraML source ids - see the
+    module docstring. Resolving them is count_identifications()'s job.
+
+    Only TRANSITION-level subordinates belong to this join. OpenSwath also
+    emits MS1 precursor-extraction subordinates whose native_id is a PRECURSOR
+    id ("<canonical precursor>_Precursor_i<k>", OpenSwathHelper.h); those have
+    no TraML <Transition> to resolve against. Subordinates are classified by
+    their FeatureLevel userParam - never by the shape of the id - so an MS1
+    subordinate is dropped even if its id happens to look canonical, and an
+    MS2 subordinate is kept even if its id looks exotic.
+
+    A subordinate with no FeatureLevel at all is KEPT: dropping it would make a
+    library that never writes the field silently report zero identifications
+    instead of failing loudly, which is a worse failure than joining it.
     """
-    return [up.get("value") for up in feature.iter()
-            if _local(up) == "UserParam"
-            and up.get("name") == "native_id" and up.get("value")]
+    # nearest enclosing <feature> for every node, so each native_id can be
+    # classified by the feature that actually declares it.
+    owner = {child: node for node in feature.iter() for child in node}
+
+    native_ids = []
+    for up in feature.iter():
+        if (_local(up).lower() != "userparam" or up.get("name") != "native_id"
+                or not up.get("value")):
+            continue
+        enclosing = owner.get(up)
+        while enclosing is not None and _local(enclosing) != "feature":
+            enclosing = owner.get(enclosing)
+        level = None if enclosing is None else _cv(enclosing, "FeatureLevel")
+        if level is not None and level != "MS2":
+            # Explicitly a non-transition level (MS1 precursor extraction).
+            continue
+        native_ids.append(up.get("value"))
+    return native_ids
 
 
 def count_identifications(library, featurexml_path):
@@ -186,8 +265,16 @@ def count_identifications(library, featurexml_path):
     only, because an orphan is structurally incapable of being identified and
     would otherwise impose a ceiling no tool result can exceed.
 
+    Every featureXML native_id is resolved as a CANONICAL transition id
+    through library["transition_canonical_to_source"] before any
+    peptide/precursor/protein lookup, so a library whose TraML source ids are
+    "1".."18" joins against a featureXML written with canonical "0".."17".
+    Only MS2-level subordinates take part in the join; MS1 precursor
+    subordinates are excluded by FeatureLevel (see _feature_native_ids).
+
     Raises OpenSwathMetricsError if the featureXML cannot be parsed or a
-    feature references a transition the library does not define.
+    feature references a canonical transition the library does not define (or
+    one that resolves to a transition the library cannot use).
     """
     try:
         root = ET.parse(featurexml_path).getroot()
@@ -199,6 +286,7 @@ def count_identifications(library, featurexml_path):
     features = [] if feature_list is None else feature_list.findall("feature")
 
     transitions = library["transitions"]
+    canonical_to_source = library["transition_canonical_to_source"]
     peptides = library["peptides"]
     identified_peptides = set()
     identified_precursor_mz = set()
@@ -207,14 +295,26 @@ def count_identifications(library, featurexml_path):
 
     for feature in features:
         for native_id in _feature_native_ids(feature):
-            transition = transitions.get(native_id)
-            if transition is None:
-                # Fail loudly: an unknown transition must never be counted as
-                # an identification.
+            # native_id is the canonical id OpenSwath wrote, so resolve it to
+            # the TraML source id first; it is never used as a source id and
+            # never arithmetic-converted.
+            source_id = canonical_to_source.get(native_id)
+            if source_id is None:
+                # Fail loudly: an unknown canonical transition must never be
+                # counted as an identification.
                 raise OpenSwathMetricsError(
-                    "feature %s references transition native_id %r, which the "
-                    "library does not define" % (feature.get("id"), native_id))
-            transitions_used.add(native_id)
+                    "feature %s references canonical transition native_id %r, "
+                    "which the library does not define"
+                    % (feature.get("id"), native_id))
+            transition = transitions.get(source_id)
+            if transition is None:
+                # The canonical id exists but the underlying TraML transition
+                # carries no usable peptideRef. Still fail loudly.
+                raise OpenSwathMetricsError(
+                    "feature %s references transition native_id %r (canonical "
+                    "id %r), which the library does not define"
+                    % (feature.get("id"), source_id, native_id))
+            transitions_used.add(source_id)
             peptide_id = transition["peptide"]
             identified_peptides.add(peptide_id)
             identified_precursor_mz.add(transition["precursor"])
@@ -222,7 +322,7 @@ def count_identifications(library, featurexml_path):
             if peptide is None:
                 raise OpenSwathMetricsError(
                     "transition %s references peptide %r, which the library "
-                    "does not define" % (native_id, peptide_id))
+                    "does not define" % (source_id, peptide_id))
             identified_proteins.update(peptide["proteins"])
 
     library_peptides = library["library_peptides"]
