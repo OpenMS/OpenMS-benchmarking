@@ -1,0 +1,98 @@
+{
+  "schema": "openms-benchmarking/report/v2",
+  "identity": {
+    "benchmark": "openswath_dia",
+    "benchmark_version": 2,
+    "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
+    "software": {
+      "name": "OpenMS",
+      "version": "dec18943e0faf6932a314a9bdf22796f74407a6b"
+    },
+    "configuration": {},
+    "runtime": {
+      "runtime_source": "package",
+      "package": {
+        "filename": "OpenMS-3.7.0-pre-nightly-2026-10-28-Debian-Linux-x86_64.deb",
+        "sha256": "345fd242182e06927fb23e9eb36e69b71e0fef5bdba4cef98f394e0b981c0e2b",
+        "archive_dir": "2026.10.29",
+        "date": "2026-10-28"
+      }
+    }
+  },
+  "run": {
+    "run_id": "40997004895",
+    "run_at": "2026-10-30T03:24:55Z",
+    "cache": "none"
+  },
+  "performance": {
+    "wall_time_s": 1.6,
+    "cpu_time_s": 0.25,
+    "peak_rss_kb": 86316,
+    "build": {
+      "wall_time_s": 0.0,
+      "artifact_bytes": 724275238
+    },
+    "stages": [
+      {
+        "name": "openswath_workflow",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 1.6,
+        "cpu_time_s": 0.25,
+        "peak_rss_kb": 86316,
+        "status": "pass",
+        "reason": ""
+      }
+    ]
+  },
+  "metrics": {
+    "verdict": "pass",
+    "identified_features": 6,
+    "feature_quality_sum": 13.887464,
+    "total_intensity": 149891.59,
+    "library_peptides": 7,
+    "library_peptides_identifiable": 6,
+    "library_peptides_orphan": 1,
+    "library_precursor_mz": 6,
+    "library_transitions": 18,
+    "identified_peptides": 6,
+    "identified_precursor_mz": 6,
+    "identified_proteins": 1,
+    "transitions_used": 18,
+    "library_coverage": 1.0
+  },
+  "correctness": {
+    "expected_features": 6,
+    "actual_features": 6,
+    "features_match": true,
+    "overall_quality_sum": 13.887464,
+    "total_intensity": 149891.59,
+    "qc_charge_distribution": [
+      [
+        1,
+        19
+      ],
+      [
+        2,
+        19
+      ],
+      [
+        3,
+        19
+      ]
+    ],
+    "library_peptides": 7,
+    "library_peptides_identifiable": 6,
+    "library_peptides_orphan": 1,
+    "library_precursor_mz": 6,
+    "library_transitions": 18,
+    "identified_peptides": 6,
+    "identified_precursor_mz": 6,
+    "identified_proteins": 1,
+    "transitions_used": 18,
+    "library_coverage": 1.0
+  },
+  "tool_versions": {
+    "openswath_version": "Unknown option(s) '[--version]' given. Aborting!"
+  }
+}
