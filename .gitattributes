@@ -9,6 +9,7 @@
 # on Linux runners (DecoyDatabase rejects bare CR characters in sequences).
 *.fasta text eol=lf
 *.mzML text eol=lf
+*.featureXML text eol=lf
 
 # The report generator and result JSONs are read/run on Linux too.
 *.py text eol=lf
