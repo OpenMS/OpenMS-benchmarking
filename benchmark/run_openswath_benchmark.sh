@@ -167,7 +167,7 @@ export RESULTS_DIR
 export FIXTURES_DIR
 export SCRIPT_DIR
 python3 - <<'PY'
-import csv, json, os, sys
+import csv, datetime, json, os, sys
 import xml.etree.ElementTree as ET
 
 results_dir = os.environ["RESULTS_DIR"]
@@ -279,7 +279,7 @@ report = {
     "benchmark": "openswath_dia",
     "milestone": 2,
     "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-    "run_at": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "run_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "openms_sha": meta.get("openms_sha", ""),
     "cache": "none",
     "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
