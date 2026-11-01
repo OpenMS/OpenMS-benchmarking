@@ -42,6 +42,11 @@ jobs:
       - name: Validate benchmark definitions
         run: python benchmark/validate_definitions.py
 
+      # Fails if a tracked benchmark/test_*.py file is not accounted for in
+      # the explicit list below (missing, stale, duplicated, or out of scope).
+      - name: Check test list coverage
+        run: python tests/validate_ci_test_coverage.py
+
       - name: Run Python test suites
         shell: bash
         run: |
