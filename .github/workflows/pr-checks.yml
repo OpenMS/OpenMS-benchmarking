@@ -55,6 +55,7 @@ jobs:
             benchmark/test_openswath_metrics.py \
             benchmark/test_prose_metrics.py \
             benchmark/test_proteobench_compare.py \
+            benchmark/test_runner_timestamps.py \
             benchmark/report/test_generic_renderer.py \
             benchmark/report/test_v2_schema.py; do
             echo "== python $f"

@@ -339,7 +339,7 @@ report = {
         "prose_extra_search_args": meta.get("prose_extra_search_args", ""),
     },
     "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-    "run_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "run_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "tool_versions": {k: v for k, v in meta.items() if k.endswith("_version")},
 }
 
