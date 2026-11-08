@@ -256,13 +256,40 @@ try:
 except om.OpenSwathMetricsError as exc:
     library_error = str(exc)
 
+# Fail closed on the QUALITY of the join, not just on its absence: a positional
+# or mixed assignment (assignment_evidence != "anchor") has no canonical
+# precursor anchor tying features to library peptides, so its counts are
+# unvalidated and must never become a passing benchmark. count_identifications
+# already raises for that case; this guard keeps the invariant even if the call
+# above is ever relaxed, so the JSON verdict cannot disagree with the policy.
+evidence = library_counts.get("assignment_evidence")
+if not library_error and evidence not in ("anchor", "none"):
+    library_error = (
+        "library assignment is unvalidated (assignment_evidence=%r); "
+        "positional or mixed joins cannot pass the benchmark" % (evidence,))
+
+# The reference run must also produce the expected number of picked features. A
+# workflow that exits 0 but picks none (or a different count) is an incomplete
+# result, not a passing benchmark - otherwise an empty output would pass on an
+# "none" evidence stamp, which is the one remaining way to a pass with nothing
+# validated. This is a completeness gate, separate from the library join.
+EXPECTED_FEATURES = 6
+features_match = feature_count == EXPECTED_FEATURES
+feature_count_error = ""
+if not features_match:
+    feature_count_error = (
+        "featureXML contains %d top-level feature(s), but the reference run is "
+        "expected to produce %d; the output is incomplete"
+        % (feature_count, EXPECTED_FEATURES))
+
 required_ok = all(s["status"] == "pass" for s in stages if s["required"])
-verdict = "pass" if required_ok and not library_error else "fail"
+verdict = ("pass" if required_ok and not library_error
+           and not feature_count_error else "fail")
 
 correctness = {
-    "expected_features": 6,
+    "expected_features": EXPECTED_FEATURES,
     "actual_features": feature_count,
-    "features_match": feature_count == 6,
+    "features_match": features_match,
     "overall_quality_sum": round(sum(overall_qualities), 6) if overall_qualities else 0,
     "total_intensity": round(sum(intensities), 2) if intensities else 0,
     "qc_charge_distribution": qc_metrics.get("ChargeDistributionMS1", []),
@@ -272,6 +299,8 @@ correctness = {
 correctness.update(library_counts)
 if library_error:
     correctness["library_error"] = library_error
+if feature_count_error:
+    correctness["feature_count_error"] = feature_count_error
 
 report = {
     "schema": "openms-benchmarking/report/v1",
@@ -304,7 +333,7 @@ if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["verd
   : # openswath.json verdict already combines stage + library-join outcomes
 else
   verdict="fail"
-  log "library join failed - see library_error in openswath.json"
+  log "benchmark correctness validation failed - see library_error / feature_count_error in openswath.json"
 fi
 
 log ""

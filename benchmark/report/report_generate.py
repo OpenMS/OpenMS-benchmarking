@@ -1136,6 +1136,20 @@ def normalize_smoke(args):
 #   features_match        a boolean verdict, and booleans are not numeric
 #   qc_charge_distribution a list, not a scalar
 #   library_error         a string; the failure is already carried by verdict
+#   feature_count_error   a string; same reasoning as library_error, and it
+#                         only exists when the run failed
+#   assignment_evidence   a string stamp (anchor/positional/mixed/none), not a
+#                         measurement; the verdict already enforces its policy
+#   features_without_anchor / ambiguous_hit_features
+#                         join-quality diagnostics, not identification counts:
+#                         they stay in correctness so this change introduces
+#                         no new Trend series
+#   library_transitions_total / library_compound_transitions
+#                         library-shape diagnostics (how many transition
+#                         elements exist, and how many are compound-backed).
+#                         The peptide metrics already exclude compound
+#                         transitions, so lifting these would add series that
+#                         describe the library, not the run
 #
 # PSM / FDR counts are absent by design: DIA emits no spectrum-level
 # identifications. See benchmark/openswath_metrics.py for the definitions.

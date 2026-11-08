@@ -10,6 +10,12 @@
 *.fasta text eol=lf
 *.mzML text eol=lf
 
+# TraML libraries are vendored byte-for-byte from the OpenMS repository pin.
+# Keep them LF as well: with core.autocrlf=true a Windows checkout would
+# otherwise turn them into CRLF, and the documented SHA-256 / cmp provenance
+# checks would fail even though the committed blobs are LF.
+*.TraML text eol=lf
+
 # The report generator and result JSONs are read/run on Linux too.
 *.py text eol=lf
 *.json text eol=lf
