@@ -279,7 +279,9 @@ report = {
     "benchmark": "openswath_dia",
     "milestone": 2,
     "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-    "run_at": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "run_at": __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "openms_sha": meta.get("openms_sha", ""),
     "cache": "none",
     "dataset": "OpenSwathWorkflow_1 (DIA, 7 peptides, 5 SWATH windows)",
