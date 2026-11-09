@@ -94,6 +94,53 @@ contract so the pair cannot drift apart again.
 - Feature picking (MRMTransitionGroupPicker)
 - QC metrics generation
 
+## Duplicate-transition-id libraries (parser tests)
+
+Two upstream TraML libraries whose `<Transition id>` labels repeat are vendored
+byte-for-byte for `benchmark/test_openswath_metrics.py`. They are parser-only
+fixtures: no mzML or reference output is involved, and no OpenMS binary is
+needed to use them.
+
+| File | Source (OpenMS repo) | Size | Content |
+|---|---|---|---|
+| `OpenSwath_identification_input.TraML` | `src/tests/class_tests/openms/data/OpenSwath_identification_input.TraML` | 6,953 B | 2 peptides, 6 transitions; the label `tr2` is used by a transition of `tr_gr1` **and** by one of `tr_gr2` |
+| `OpenSwathDecoyGenerator_input.TraML` | `src/tests/topp/OpenSwathDecoyGenerator_input.TraML` | 27,659 B | 12 peptides, 24 transitions; the label `454` is used twice, both times for peptide `78` |
+
+Both files are byte-identical at `f1768367fa66f7901b4fa78a9ebece64b2ce9024`
+(the fixture pin above) and at `8ab290cc80e1150986b37530ac02dee6d8d6ce58` (the
+benchmark's OpenMS pin); they were copied from the latter.
+
+Why they are vendored: `TransitionType/@id` is `xs:string`, not `xs:ID`, in
+`TraML1.0.0.xsd`, and `OpenSwathLibraryIDNormalizer.h` states that source
+transition ids need not be unique. A parser that keys transitions by source id
+merges distinct transitions, and when the duplicate spans two peptides it
+silently attributes one peptide's transitions to the other. These two files
+lock both cases (across-peptide and within-peptide duplicates) as regression
+tests.
+
+```bash
+SHA=8ab290cc80e1150986b37530ac02dee6d8d6ce58
+for f in src/tests/class_tests/openms/data/OpenSwath_identification_input.TraML \
+         src/tests/topp/OpenSwathDecoyGenerator_input.TraML; do
+  cmp <(git -C /path/to/OpenMS show "$SHA:$f") \
+      "./benchmark/fixtures/$(basename "$f")" && echo "$f OK"
+done
+```
+
+```
+593a344ba475b5e62c72c0835d7a40e3fd066a1ebaff95adf251e70eba9fa159  OpenSwath_identification_input.TraML
+9ed35b6fffaeed8a5f372fa77522938c9a47820db448e1cb37eec5d7fc2cba97  OpenSwathDecoyGenerator_input.TraML
+```
+
+### License
+
+OpenMS is released under the BSD 3-Clause license (upstream `LICENSE`:
+"Copyright OpenMS Inc. -- Eberhard Karls University Tuebingen, ETH Zurich, and
+Freie Universitaet Berlin 2002-present" / "This software is released under a
+three-clause BSD license"; `LICENSE.md`: "BSD 3-Clause License"). Both files are
+upstream test data copied unmodified, so their copyright notice and license
+terms apply unchanged; this repository redistributes only those bytes.
+
 ## Reproducing locally
 
 ```bash
