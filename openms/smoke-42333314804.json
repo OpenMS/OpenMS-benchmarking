@@ -1,0 +1,81 @@
+{
+  "schema": "openms-benchmarking/report/v2",
+  "identity": {
+    "benchmark": "smoke",
+    "benchmark_version": 1,
+    "dataset": "smoke fixture (CometAdapter_3)",
+    "software": {
+      "name": "OpenMS",
+      "version": "05518e68abaa58b39f66b841e08be7be207cdaa8"
+    },
+    "configuration": {
+      "use_ms2rescore": false
+    },
+    "runtime": {
+      "runtime_source": "package",
+      "package": {
+        "filename": "OpenMS-3.7.0-pre-nightly-2026-11-06-Debian-Linux-x86_64.deb",
+        "sha256": "3d56f94e9f4209b38e3e61e3bfffad896c55ddee21c5d946e39fdf3bda9e9a1e",
+        "archive_dir": "2026.11.07",
+        "date": "2026-11-06"
+      }
+    }
+  },
+  "run": {
+    "run_id": "42333314804",
+    "run_at": "2026-11-07T03:18:46Z",
+    "cache": "none"
+  },
+  "performance": {
+    "wall_time_s": 15.32,
+    "cpu_time_s": 0.43,
+    "peak_rss_kb": 82296,
+    "build": {
+      "wall_time_s": 0.0,
+      "artifact_bytes": 726219036
+    },
+    "stages": [
+      {
+        "name": "decoy_database",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 5.03,
+        "cpu_time_s": 0.02,
+        "peak_rss_kb": 53764,
+        "status": "pass",
+        "reason": ""
+      },
+      {
+        "name": "comet",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 5.23,
+        "cpu_time_s": 0.29,
+        "peak_rss_kb": 82296,
+        "status": "pass",
+        "reason": ""
+      },
+      {
+        "name": "percolator",
+        "required": false,
+        "exit_code": 0,
+        "wall_time_s": 5.06,
+        "cpu_time_s": 0.12,
+        "peak_rss_kb": 66496,
+        "status": "pass",
+        "reason": ""
+      }
+    ]
+  },
+  "metrics": {
+    "verdict": "pass"
+  },
+  "tool_versions": {
+    "FileConverter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "CometAdapter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "DecoyDatabase_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "PercolatorAdapter_version": "Unknown option(s) '[--version]' given. Aborting!",
+    "comet_engine_version": "",
+    "percolator_engine_version": "Exception caught: Percolator version 3.06.0, Build Date Mar 11 2025 11:26:42"
+  }
+}
