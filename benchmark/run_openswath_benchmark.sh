@@ -136,7 +136,8 @@ fi
 
 {
   echo "openms_sha=${OPENMS_SHA}"
-  echo "openswath_version=$("${OPENMS_BIN}/OpenSwathWorkflow" --version 2>&1 | head -1 || true)"
+  version="$("${OPENMS_BIN}/OpenSwathWorkflow" -help 2>&1 | sed -n 's/^[[:space:]]*Version:[[:space:]]*//p' | head -n 1 || true)"
+  echo "openswath_version=${version:-unknown}"
 } > "${RESULTS_DIR}/meta.txt"
 log "versions recorded in meta.txt"
 
