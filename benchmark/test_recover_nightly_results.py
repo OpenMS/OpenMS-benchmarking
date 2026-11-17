@@ -489,34 +489,63 @@ class RecoveryFlowTest(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), '{"keep": "me"}')
 
     def test_collision_on_main_ref_refuses(self) -> None:
-        # main still holds the frozen pre-split results; importing the same id
-        # must be refused even though the branch checkout is clean.
+        # Historical results live under benchmark/results/ on main (not at the
+        # data branch's layout), so that is the path the guard must check.
+        historical = "benchmark/results/openms/smoke-999.json"
         git(self.repo, "switch", "-q", "main")
-        target = self.repo / "openms" / "smoke-999.json"
+        target = self.repo / historical
         target.parent.mkdir(parents=True)
         target.write_text("{}", encoding="utf-8")
-        git(self.repo, "add", "openms/smoke-999.json")
-        git(self.repo, "commit", "-qm", "frozen")
+        git(self.repo, "add", historical)
+        git(self.repo, "commit", "-qm", "historical result")
         rel = "openms/smoke-999.json"
-        self.assertTrue(rnr.path_on_ref(self.repo, "refs/heads/main", rel))
-        with self.assertRaises(rnr.RecoveryError):
+        self.assertEqual(rnr.main_result_path(rel), historical)
+        self.assertTrue(rnr.path_on_ref(self.repo, "refs/heads/main", historical))
+        with self.assertRaises(rnr.RecoveryError) as ctx:
             rnr.ensure_no_collision(self.repo, [rel])
+        self.assertIn(historical, str(ctx.exception))
 
     def test_collision_on_fetched_origin_main_refuses_when_local_main_is_stale(self) -> None:
         rel = "openms/smoke-777.json"
+        historical = "benchmark/results/openms/smoke-777.json"
         git(self.repo, "switch", "-q", "main")
-        target = self.repo / rel
+        target = self.repo / historical
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}", encoding="utf-8")
-        git(self.repo, "add", rel)
+        git(self.repo, "add", historical)
         git(self.repo, "commit", "-qm", "upstream only")
         git(self.repo, "push", "-q", "origin", "main")
         git(self.repo, "reset", "-q", "--hard", "HEAD~1")  # local main now stale
         git(self.repo, "fetch", "-q", "origin")
-        self.assertFalse(rnr.path_on_ref(self.repo, "refs/heads/main", rel))
-        self.assertTrue(rnr.path_on_ref(self.repo, "refs/remotes/origin/main", rel))
+        self.assertFalse(rnr.path_on_ref(self.repo, "refs/heads/main", historical))
+        self.assertTrue(
+            rnr.path_on_ref(self.repo, "refs/remotes/origin/main", historical)
+        )
         with self.assertRaises(rnr.RecoveryError):
             rnr.ensure_no_main_collision(self.repo, [rel])
+
+    def test_wrong_path_on_main_is_not_mistaken_for_the_guard(self) -> None:
+        # A file at the data-branch layout on main is not a historical result,
+        # so it must neither satisfy nor trigger the benchmark/results/ guard.
+        git(self.repo, "switch", "-q", "main")
+        wrong = self.repo / "openms" / "smoke-888.json"
+        wrong.parent.mkdir(parents=True)
+        wrong.write_text("{}", encoding="utf-8")
+        git(self.repo, "add", "openms/smoke-888.json")
+        git(self.repo, "commit", "-qm", "same name, wrong path")
+        rnr.ensure_no_main_collision(self.repo, ["openms/smoke-888.json"])
+
+        # The correctly placed historical result for another run is still caught.
+        historical = "benchmark/results/openms/smoke-889.json"
+        target = self.repo / historical
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}", encoding="utf-8")
+        git(self.repo, "add", historical)
+        git(self.repo, "commit", "-qm", "historical result")
+        rnr.ensure_no_main_collision(self.repo, ["openms/smoke-888.json"])
+        with self.assertRaises(rnr.RecoveryError) as ctx:
+            rnr.ensure_no_main_collision(self.repo, ["openms/smoke-889.json"])
+        self.assertIn(historical, str(ctx.exception))
 
     def test_partial_import_resumes_without_duplicating(self) -> None:
         other = "42442257487"

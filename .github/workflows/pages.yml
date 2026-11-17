@@ -13,13 +13,18 @@ name: Pages
 #
 # Storage split (see README "Results storage"):
 #   * main              - workflow/report code, the pinned ProteoBench
-#                         snapshot, and the local tool-reference JSONs.
-#   * benchmark-results - only generated OpenMS benchmark run JSONs.
-# The report renderer takes a single --results-dir, so this workflow copies
-# the generated run families from the data branch plus main's tools/ into
-# `site-results/` before rendering. It deliberately never copies main's
-# benchmark/results/openms or openswath_dia trees: they are frozen history
-# from before the split, and merging them would double-count runs.
+#                         snapshot, the local tool-reference JSONs, and the
+#                         historical generated runs from before the split.
+#   * benchmark-results - generated OpenMS benchmark run JSONs from the split
+#                         onwards.
+# The report renderer takes a single --results-dir, so this workflow assembles
+# `site-results/` as the UNION of two sources per run family: main's historical
+# runs under benchmark/results/<family>/ and the data branch's generated runs
+# at <family>/. Dropping either source would lose runs that only it holds, so
+# neither is excluded. The same relative path may legitimately appear in both;
+# identical copies are collapsed to one, while differing bytes at the same path
+# fail the build instead of one copy silently winning. main's tools/ is copied
+# as before.
 #
 # Deployment uses the official Actions/Deploy pattern with an artifact
 # (not a gh-pages branch) so no force-pushes or extra branches are needed.
@@ -81,15 +86,18 @@ jobs:
           git clone --depth 1 --quiet \
             https://github.com/Proteobench/Results_quant_ion_DDA upstream
 
-      # One results tree for the renderer: generated runs from the data
-      # branch, tool-reference JSONs from main. Nothing else is copied.
+      # One results tree for the renderer: main's historical runs plus the data
+      # branch's generated runs for both families, and main's tool-reference
+      # JSONs. Both run sources are kept, so no history is discarded.
       - name: Assemble combined results tree
         env:
           DATA_DIR: benchmark-data
+          HISTORY_DIR: benchmark/results
           OUT_DIR: site-results
         run: |
           set -euo pipefail
           DATA_DIR="${DATA_DIR:-benchmark-data}"
+          HISTORY_DIR="${HISTORY_DIR:-benchmark/results}"
           OUT_DIR="${OUT_DIR:-site-results}"
 
           for d in openms openswath_dia/openms; do
@@ -98,24 +106,84 @@ jobs:
               exit 1
             fi
           done
-          if [ ! -d "benchmark/results/tools" ]; then
-            echo "::error::benchmark/results/tools is missing; the local tool-reference JSONs must stay on main"
+          if [ ! -d "$HISTORY_DIR/tools" ]; then
+            echo "::error::$HISTORY_DIR/tools is missing; the local tool-reference JSONs must stay on main"
             exit 1
           fi
 
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR/openms" "$OUT_DIR/openswath_dia/openms" "$OUT_DIR/tools"
-          cp -a "$DATA_DIR/openms/." "$OUT_DIR/openms/"
-          cp -a "$DATA_DIR/openswath_dia/openms/." "$OUT_DIR/openswath_dia/openms/"
-          cp -a benchmark/results/tools/. "$OUT_DIR/tools/"
 
-          smoke="$(find "$OUT_DIR/openms" -maxdepth 1 -name 'smoke-*.json' | wc -l)"
-          openswath="$(find "$OUT_DIR/openswath_dia/openms" -maxdepth 1 -name 'openswath_dia-*.json' | wc -l)"
-          if [ "$smoke" -eq 0 ] || [ "$openswath" -eq 0 ]; then
-            echo "::error::branch 'benchmark-results' holds no usable history (smoke=$smoke, openswath=$openswath); refusing to publish an empty report"
+          history_total=0
+          generated_total=0
+          duplicates_identical=0
+          generated_smoke=0
+          generated_openswath=0
+
+          # place copies one result to its family-relative destination. A path
+          # already placed is accepted only when the bytes are identical (both
+          # sources can hold the same run); different contents fail the build,
+          # so one copy can never silently replace the other.
+          place() {
+            src="$1"
+            rel="$2"
+            dst="$OUT_DIR/$rel"
+            if [ -e "$dst" ]; then
+              if cmp -s "$src" "$dst"; then
+                duplicates_identical=$((duplicates_identical + 1))
+                echo "duplicate result with identical contents at $rel; keeping one copy"
+                return 0
+              fi
+              echo "::error::conflicting result at $rel: $src differs from the copy already assembled; refusing to publish a report that would silently pick one"
+              return 1
+            fi
+            mkdir -p "$(dirname "$dst")"
+            cp -p "$src" "$dst"
+            return 0
+          }
+
+          # copy_family copies every JSON of one source tree, keeping the family
+          # prefix so both sources land at the same relative layout.
+          copy_family() {
+            family="$1"
+            source_dir="$2"
+            [ -d "$source_dir" ] || return 0
+            while IFS= read -r -d '' file; do
+              place "$file" "$family/${file#"$source_dir"/}" || exit 1
+            done < <(find "$source_dir" -type f -name '*.json' -print0)
+          }
+
+          for family in openms openswath_dia/openms; do
+            history_dir="$HISTORY_DIR/$family"
+            generated_dir="$DATA_DIR/$family"
+            if [ -d "$history_dir" ]; then
+              history_count="$(find "$history_dir" -type f -name '*.json' | wc -l | tr -d ' ')"
+            else
+              history_count=0
+              echo "$history_dir holds no historical results on main; $family keeps the data branch's runs only"
+            fi
+            generated_count="$(find "$generated_dir" -type f -name '*.json' | wc -l | tr -d ' ')"
+            case "$family" in
+              openms) generated_smoke="$generated_count" ;;
+              openswath_dia/openms) generated_openswath="$generated_count" ;;
+            esac
+            echo "source counts for $family: main history=$history_count, benchmark-results=$generated_count"
+            history_total=$((history_total + history_count))
+            generated_total=$((generated_total + generated_count))
+            copy_family "$family" "$history_dir"
+            copy_family "$family" "$generated_dir"
+          done
+
+          cp -a "$HISTORY_DIR/tools/." "$OUT_DIR/tools/"
+
+          smoke="$(find "$OUT_DIR/openms" -maxdepth 1 -name 'smoke-*.json' | wc -l | tr -d ' ')"
+          openswath="$(find "$OUT_DIR/openswath_dia/openms" -maxdepth 1 -name 'openswath_dia-*.json' | wc -l | tr -d ' ')"
+          if [ "$generated_smoke" -eq 0 ] || [ "$generated_openswath" -eq 0 ]; then
+            echo "::error::branch 'benchmark-results' holds no usable history (smoke=$generated_smoke, openswath=$generated_openswath); refusing to publish an empty report"
             exit 1
           fi
-          echo "assembled $smoke smoke run(s), $openswath openswath run(s), $(find "$OUT_DIR/tools" -name '*.json' | wc -l) tool reference(s)"
+          echo "assembled $smoke smoke run(s), $openswath openswath run(s), $(find "$OUT_DIR/tools" -name '*.json' | wc -l | tr -d ' ') tool reference(s)"
+          echo "sources: main history=$history_total file(s), benchmark-results=$generated_total file(s), identical duplicate(s) collapsed=$duplicates_identical"
 
       - name: Generate site (pinned reference view + optional latest view)
         run: |

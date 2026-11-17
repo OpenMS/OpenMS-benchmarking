@@ -25,9 +25,10 @@ What this tool does
    pair can never be imported;
 4. refreshes ``origin/main`` and ``origin/<data branch>`` first and refuses to
    import unless both resolve (never checks a ref that may be stale);
-5. refuses a destination that exists on ``main``, and on the data branch accepts
-   only a complete, byte-identical pair - so a partially completed import can be
-   re-run: finished runs are reported as already present and skipped;
+5. refuses a destination whose historical result already exists on ``main``
+   under ``benchmark/results/``, and on the data branch accepts only a complete,
+   byte-identical pair - so a partially completed import can be re-run: finished
+   runs are reported as already present and skipped;
 6. in dry-run mode (the default) only stages the files and prints a summary.
 
 With ``--apply`` it writes the two files per run into the current checkout of
@@ -39,18 +40,26 @@ command can simply be run again to resume with the remaining runs.
 
 Recovery procedure
 ------------------
-    # 1. Validate and stage only (no repository changes):
-    python benchmark/recover_nightly_results.py
+``benchmark-results`` holds only result JSONs, so it has no copy of this
+script. Run the script from a ``main`` checkout and point ``--repo-dir`` at a
+separate worktree of the data branch:
 
-    # 2. Review the summary, then switch to the data branch:
-    git switch benchmark-results
+    # 1. From the main checkout that contains this script, create the data
+    #    worktree (skip this if it already exists):
+    git fetch origin
+    git worktree add ../openms-benchmarking-data -b benchmark-results origin/benchmark-results
+    #    (or, when a local benchmark-results branch already exists:)
+    #    git worktree add ../openms-benchmarking-data benchmark-results
 
-    # 3. Import locally (one commit per run, no push):
-    python benchmark/recover_nightly_results.py --apply
+    # 2. Dry run: validates and stages, writes and commits nothing:
+    python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data
 
-    # 4. Review and push yourself:
-    git log --oneline -5
-    git push origin benchmark-results
+    # 3. Review the summary, then import locally - one commit per run, no push:
+    python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data --apply
+
+    # 4. Review the commits in the data worktree and push the branch yourself:
+    git -C ../openms-benchmarking-data log --oneline -5
+    git -C ../openms-benchmarking-data push origin benchmark-results
 
 Exit codes: 0 = ok, 1 = validation/import failure, 2 = usage/environment error.
 """
@@ -89,6 +98,17 @@ BENCHMARKS = (
     ("smoke", "benchmark-results", "smoke-", "openms"),
     ("openswath_dia", "benchmark-openswath", "openswath_dia-", "openswath_dia/openms"),
 )
+
+# Where the same run lives on ``main``: before the storage split, generated
+# results were committed under the results tree, so the data branch's
+# ``openms/smoke-<id>.json`` is ``benchmark/results/openms/smoke-<id>.json``
+# there.
+MAIN_RESULTS_PREFIX = "benchmark/results/"
+
+
+def main_result_path(rel: str) -> str:
+    """The ``main`` path holding the historical result for data path ``rel``."""
+    return f"{MAIN_RESULTS_PREFIX}{rel}"
 
 
 class RecoveryError(RuntimeError):
@@ -383,12 +403,23 @@ def main_refs(repo_dir: Path) -> list[str]:
 
 
 def ensure_no_main_collision(repo_dir: Path, rel_paths: list[str]) -> None:
-    """Refuse a destination that already exists on ``main`` (any known ref)."""
+    """Refuse a destination whose historical result already exists on ``main``.
+
+    ``rel_paths`` are data-branch destinations (``openms/smoke-<id>.json``).
+    Their historical counterparts on ``main`` sit under
+    ``benchmark/results/``, so that is the path each destination is checked
+    against: a file at the data layout on ``main`` is not this guard's concern,
+    and a historical result must never be imported a second time.
+    """
     refs = main_refs(repo_dir)
     for rel in rel_paths:
+        historical = main_result_path(rel)
         for ref in refs:
-            if path_on_ref(repo_dir, ref, rel):
-                raise RecoveryError(f"refusing to overwrite existing {rel} on {ref}")
+            if path_on_ref(repo_dir, ref, historical):
+                raise RecoveryError(
+                    f"refusing to overwrite existing {historical} on {ref} "
+                    f"(destination {rel} on the data branch)"
+                )
 
 
 def ensure_no_collision(repo_dir: Path, rel_paths: list[str]) -> None:

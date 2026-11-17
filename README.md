@@ -159,6 +159,8 @@ Results are machine-readable JSON (schema
 
 ```
 benchmark/results/                 # on main
+  openms/                          # historical runs from before the split
+  openswath_dia/openms/
   proteobench/external/            # pinned ProteoBench snapshot
   tools/                           # reference results from other tools
 
@@ -167,18 +169,42 @@ benchmark-results (branch)         # generated run history (nightly commits)
   openswath_dia/openms/openswath_dia-<run-id>.json
 ```
 
-`main` keeps code, the pinned ProteoBench snapshot and the tool-reference
-JSONs; generated run JSONs are committed by the nightly workflow to the
-unprotected `benchmark-results` branch. The Pages workflow assembles a
-temporary `site-results/` tree from that branch's run families plus `main`'s
-`tools/` and renders it, so the report keeps its full history without merging
-`main`'s frozen pre-split results twice.
+`main` keeps code, the pinned ProteoBench snapshot, the tool-reference JSONs
+and the historical run trees produced before the split; generated run JSONs are
+committed by the nightly workflow to the unprotected `benchmark-results`
+branch. The Pages workflow assembles a temporary `site-results/` tree as the
+**union** of `main`'s historical runs (`benchmark/results/openms/`,
+`benchmark/results/openswath_dia/openms/`) and the data branch's generated
+runs, plus `main`'s `tools/`, and renders it. A run present in both trees is
+kept once when the bytes are identical; differing bytes at the same relative
+path fail the build instead of letting one copy silently replace the other.
+Keeping only one source would drop runs that exist nowhere else.
 
 Recover a nightly run whose persistence failed with
 `benchmark/recover_nightly_results.py`: it is dry-run by default and never
-pushes. After reviewing the summary, check out `benchmark-results`, re-run it
-with `--apply` (one commit per benchmark run), review `git log` and push the
-branch yourself. Before applying it fetches `origin/main` and
+pushes. The data branch holds only result JSONs, so it has no copy of the
+script: keep the code checkout on `main` and give the script a separate
+worktree of `benchmark-results` through `--repo-dir`.
+
+```bash
+# Once, from the main checkout that contains the script:
+#   (omit -b when a local benchmark-results branch already exists)
+git fetch origin
+git worktree add ../openms-benchmarking-data -b benchmark-results origin/benchmark-results
+
+# Dry run: validates and stages, writes and commits nothing.
+python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data
+
+# Import: one commit per benchmark run, no push.
+python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data --apply
+
+# Review the commits in the data worktree, then push the branch yourself.
+git -C ../openms-benchmarking-data log --oneline -5
+git -C ../openms-benchmarking-data push origin benchmark-results
+```
+
+`--apply` requires that worktree to be checked out on `benchmark-results` with
+a clean working tree. Before applying it fetches `origin/main` and
 `origin/benchmark-results` and refuses to continue if either cannot be
 resolved or if the local branch is behind the remote tip, so a stale clone can
 neither miss a collision nor commit onto the wrong base. Both arms of a run
