@@ -9,10 +9,17 @@ name: "Nightly Benchmark (routine package mode)"
 #     -> wait for that run to finish (fail here if it failed)
 #     -> download only its benchmark result artifacts (tiny JSONs)
 #     -> extract the normalized result JSONs (fail loudly if missing)
-#     -> commit them to benchmark/results/ and push to main
+#     -> stage them under persist-staging/ (never inside a git checkout)
+#     -> commit them to the unprotected `benchmark-results` data branch
 #     -> dispatch pages.yml explicitly: a GITHUB_TOKEN push does not fire
 #        pages.yml's push trigger (GitHub never triggers push events for
 #        GITHUB_TOKEN pushes), so the report would otherwise go stale
+#
+# Why a separate branch: `main` is protected by the "Protect Main" ruleset,
+# which requires a pull request for every change. Generated benchmark data is
+# not reviewable source; it lives on `benchmark-results` instead, and the
+# Pages workflow assembles `main`'s code/pinned data with that branch's run
+# history. Nothing here weakens or bypasses the ruleset.
 #
 # Why dispatch instead of adding a schedule to benchmark.yml itself:
 # benchmark.yml is dispatch-only today, its inputs have defaults tuned for
@@ -22,8 +29,11 @@ name: "Nightly Benchmark (routine package mode)"
 #
 # Permissions (minimum required):
 #   actions: write   - dispatch benchmark.yml + download its run artifacts
-#   contents: write  - commit result JSONs and push to main
+#   contents: write  - commit result JSONs and push to benchmark-results
 # Nothing else. The dispatched run itself keeps benchmark.yml's permissions.
+#
+# `benchmark-results` must already exist (created once by a maintainer); this
+# workflow never creates branches and never pushes to `main`.
 
 on:
   schedule:
@@ -51,8 +61,10 @@ jobs:
       - name: Checkout benchmarking repo
         uses: actions/checkout@v6
         with:
-          # Cheap; also keeps the rebase-before-push below safe even if a
-          # commit lands on main while the benchmark is running.
+          # Workflow code always comes from main, independent of which ref
+          # triggered this run.
+          ref: main
+          # Cheap; also keeps any rebase-before-push safe.
           fetch-depth: 0
 
       - name: Dispatch benchmark.yml (package mode) and wait for it
@@ -145,11 +157,13 @@ jobs:
             unzip -o -q "artifact-$artifact_id.zip" -d downloaded
           done < artifact-ids.txt
 
-      # Persist exactly the two normalized result JSONs, renamed to this
+      # Stage exactly the two normalized result JSONs, renamed to this
       # dispatch's run ID (the report keys runs by run_id, so the name must
-      # match the ID inside the file), into the locations the committed
-      # results already use. Everything else in the artifacts (raw JSONs,
-      # resource logs, tools/) stays out of the repository.
+      # match the ID inside the file), under persist-staging/. Staging is
+      # deliberately outside every git checkout: the results-branch checkout
+      # is a separate worktree and must only ever receive the two final files.
+      # Everything else in the artifacts (raw JSONs, resource logs, tools/)
+      # stays out of the repository.
       - name: Extract result JSONs
         run: |
           set -euo pipefail
@@ -170,6 +184,8 @@ jobs:
           python3 - "$smoke" "$openswath" "$BENCH_RUN_ID" <<'PY'
           import json, sys
           smoke_path, openswath_path, expected = sys.argv[1], sys.argv[2], sys.argv[3]
+          REQUIRED = ("filename", "sha256", "archive_dir", "date")
+          packages = {}
           for label, path in (("smoke", smoke_path), ("openswath", openswath_path)):
               with open(path, encoding="utf-8") as fh:
                   data = json.load(fh)
@@ -186,32 +202,163 @@ jobs:
               run_id = data.get("run", {}).get("run_id") or data.get("run_id")
               if str(run_id) != expected:
                   sys.exit(f"{label}: run_id mismatch (file says {run_id!r}, expected {expected})")
-          print("result JSONs valid; package runtime and run_id verified")
+              # Provenance: a package run must carry its package identity, using the
+              # four fields report_generate already requires (empty/null counts as
+              # missing). identity.package is not populated; identity.runtime.package
+              # is the real path.
+              pkg = ((data.get("identity") or {}).get("runtime") or {}).get("package")
+              if not isinstance(pkg, dict):
+                  sys.exit(f"{label}: identity.runtime.package is missing or not an object "
+                           f"({pkg!r}); refusing to persist a package run without provenance")
+              # A field must be a non-empty string: a truthy non-string (true,
+              # 123, []) would otherwise pass and corrupt the report's
+              # provenance rows.
+              absent = [k for k in REQUIRED
+                        if not isinstance(pkg.get(k), str) or not pkg.get(k)]
+              if absent:
+                  sys.exit(f"{label}: identity.runtime.package is missing required metadata: "
+                           f"{', '.join(absent)} (empty or not a string)")
+              packages[label] = pkg
+          # Both arms of one benchmark run must describe the same package: the run
+          # is the unit of comparison, so a mixed pair would present one nightly
+          # build as two. Compare the contract fields only, so additive schema
+          # changes (extra package metadata) stay compatible.
+          for field in REQUIRED:
+              if packages["smoke"][field] != packages["openswath"][field]:
+                  sys.exit(f"package identity mismatch for run {expected}: {field} "
+                           f"smoke={packages['smoke'][field]!r} "
+                           f"openswath={packages['openswath'][field]!r} "
+                           f"- refusing to persist a mixed-package pair")
+          print("result JSONs valid; package runtime, run_id and package-pair identity verified")
           PY
-          mkdir -p benchmark/results/openms benchmark/results/openswath_dia/openms
-          cp "$smoke" "benchmark/results/openms/smoke-$BENCH_RUN_ID.json"
-          cp "$openswath" "benchmark/results/openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
+          mkdir -p "persist-staging/openms" "persist-staging/openswath_dia/openms"
+          cp "$smoke" "persist-staging/openms/smoke-$BENCH_RUN_ID.json"
+          cp "$openswath" "persist-staging/openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
+          echo "staged results for benchmark run $BENCH_RUN_ID"
 
-      - name: Commit results to main
+      # continue-on-error turns a missing/renamed data branch into the explicit
+      # message below instead of GitHub's generic "pathspec did not match".
+      - name: Checkout benchmark-results branch
+        id: results
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          ref: benchmark-results
+          path: results-branch
+          # Full history keeps the rebase-before-push below robust.
+          fetch-depth: 0
+
+      - name: Verify benchmark-results checkout
+        if: steps.results.outcome != 'success'
+        run: |
+          echo "::error::could not check out branch 'benchmark-results'. Generated benchmark results live there; a maintainer must create it (see README 'Results and reporting') before nightly runs can persist results."
+          exit 1
+
+      # Persist the staged pair onto the unprotected data branch. Idempotent
+      # for an identical re-run, loud for any conflicting/incomplete pair, and
+      # retried only when the remote tip actually moved (a genuine race) -
+      # never blindly, and never with --force.
+      - name: Persist results to benchmark-results
         env:
-          GH_TOKEN: ${{ github.token }}
+          STAGE_DIR: ${{ github.workspace }}/persist-staging
+          BRANCH_DIR: ${{ github.workspace }}/results-branch
+          RESULTS_BRANCH: benchmark-results
+          MAX_PUSH_ATTEMPTS: "3"
         run: |
           set -euo pipefail
+          RESULTS_BRANCH="${RESULTS_BRANCH:-benchmark-results}"
+          MAX_PUSH_ATTEMPTS="${MAX_PUSH_ATTEMPTS:-3}"
+          PUSH_LOG="${PUSH_LOG:-${RUNNER_TEMP:-/tmp}/benchmark-results-push.log}"
+          : "${STAGE_DIR:?STAGE_DIR must point at the staged result files}"
+          : "${BRANCH_DIR:?BRANCH_DIR must point at the benchmark-results checkout}"
+
+          smoke_rel="openms/smoke-$BENCH_RUN_ID.json"
+          openswath_rel="openswath_dia/openms/openswath_dia-$BENCH_RUN_ID.json"
+          smoke_src="$STAGE_DIR/$smoke_rel"
+          openswath_src="$STAGE_DIR/$openswath_rel"
+
+          for src in "$smoke_src" "$openswath_src"; do
+            if [ ! -s "$src" ]; then
+              echo "::error::staged result is missing or empty: $src"
+              exit 1
+            fi
+          done
+
+          cd "$BRANCH_DIR"
+
+          if [ -e "$smoke_rel" ] || [ -e "$openswath_rel" ]; then
+            if [ -f "$smoke_rel" ] && [ -f "$openswath_rel" ] \
+               && cmp -s "$smoke_rel" "$smoke_src" && cmp -s "$openswath_rel" "$openswath_src"; then
+              echo "benchmark run $BENCH_RUN_ID is already persisted byte-identically on $RESULTS_BRANCH; nothing to do"
+              exit 0
+            fi
+            echo "::error::benchmark run $BENCH_RUN_ID already exists on $RESULTS_BRANCH but the pair is incomplete or differs; refusing to overwrite ($smoke_rel, $openswath_rel)"
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$smoke_rel")" "$(dirname "$openswath_rel")"
+          cp "$smoke_src" "$smoke_rel"
+          cp "$openswath_src" "$openswath_rel"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add benchmark/results
-          if git diff --cached --quiet; then
+
+          git add -- "$smoke_rel" "$openswath_rel"
+          staged="$(git diff --cached --name-only)"
+          if [ -z "$staged" ]; then
             echo "::error::nothing new to persist for benchmark run $BENCH_RUN_ID (unexpected for a fresh run)"
             exit 1
           fi
+          expected="$(printf '%s\n%s\n' "$smoke_rel" "$openswath_rel" | sort)"
+          if [ "$(printf '%s\n' "$staged" | sort)" != "$expected" ]; then
+            echo "::error::staged paths are not exactly the two expected result files:"
+            printf '%s\n' "$staged" >&2
+            exit 1
+          fi
           git commit -m "Persist package-mode benchmark results (benchmark run $BENCH_RUN_ID)"
-          git fetch origin main
-          git rebase origin/main
-          git push origin HEAD:main
 
-          # Regenerate the report explicitly: the GITHUB_TOKEN push above does
-          # not trigger pages.yml's push trigger, but workflow_dispatch is the
-          # documented exception GITHUB_TOKEN dispatches are allowed to run.
-          # Last command of this step under set -e: only reached after a
-          # successful commit AND push, and a failed dispatch fails the job.
-          gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main
+          attempt=1
+          while :; do
+            git fetch origin "$RESULTS_BRANCH"
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/$RESULTS_BRANCH" >/dev/null; then
+              echo "::error::branch '$RESULTS_BRANCH' does not exist on the remote; a maintainer must create it before this workflow can persist results"
+              exit 1
+            fi
+            base="$(git rev-parse "refs/remotes/origin/$RESULTS_BRANCH")"
+            if ! git rebase "refs/remotes/origin/$RESULTS_BRANCH"; then
+              git rebase --abort || true
+              echo "::error::rebase onto origin/$RESULTS_BRANCH hit a conflict; resolve manually (result files for a run ID must never be rewritten)"
+              exit 1
+            fi
+            if git push origin "HEAD:$RESULTS_BRANCH" >"$PUSH_LOG" 2>&1; then
+              echo "pushed benchmark run $BENCH_RUN_ID to $RESULTS_BRANCH"
+              break
+            fi
+            cat "$PUSH_LOG" >&2 || true
+            if [ "$attempt" -ge "$MAX_PUSH_ATTEMPTS" ]; then
+              echo "::error::push to $RESULTS_BRANCH failed after $attempt attempt(s); not retrying further"
+              exit 1
+            fi
+            # Retry ONLY for a genuine race: the push failed and the remote
+            # tip moved since the base we rebased onto. Any other failure
+            # (credentials, ruleset, protection, network) fails immediately
+            # instead of being retried as if it were a lost update.
+            git fetch origin "$RESULTS_BRANCH"
+            new_tip="$(git rev-parse "refs/remotes/origin/$RESULTS_BRANCH")"
+            if [ "$new_tip" = "$base" ]; then
+              echo "::error::push to $RESULTS_BRANCH failed and the remote tip did not move; this is not a race (check token permissions, ruleset scope, or branch protection)"
+              exit 1
+            fi
+            echo "origin/$RESULTS_BRANCH moved from $base to $new_tip; rebasing and retrying (attempt $((attempt + 1))/$MAX_PUSH_ATTEMPTS)"
+            attempt=$((attempt + 1))
+          done
+
+      # Regenerate the report explicitly: the GITHUB_TOKEN push above does not
+      # trigger pages.yml's push trigger, but workflow_dispatch is the
+      # documented exception GITHUB_TOKEN dispatches are allowed to run.
+      # Separate step, so it only runs after the persistence step succeeded:
+      # a failed push, conflict, or permission error fails the job before this.
+      - name: Dispatch Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main

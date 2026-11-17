@@ -55,6 +55,7 @@ jobs:
             benchmark/test_openswath_metrics.py \
             benchmark/test_prose_metrics.py \
             benchmark/test_proteobench_compare.py \
+            benchmark/test_recover_nightly_results.py \
             benchmark/test_runner_timestamps.py \
             benchmark/report/test_generic_renderer.py \
             benchmark/report/test_v2_schema.py; do
@@ -68,3 +69,5 @@ jobs:
           set -euo pipefail
           bash tests/test_id_validation.sh
           bash tests/test_dispatch_step.sh
+          bash tests/test_pages_assembly.sh
+          bash tests/test_persist_step.sh
