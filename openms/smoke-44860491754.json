@@ -1,0 +1,81 @@
+{
+  "schema": "openms-benchmarking/report/v2",
+  "identity": {
+    "benchmark": "smoke",
+    "benchmark_version": 1,
+    "dataset": "smoke fixture (CometAdapter_3)",
+    "software": {
+      "name": "OpenMS",
+      "version": "6be4c551f95e6b314132c268e956113861f821cf"
+    },
+    "configuration": {
+      "use_ms2rescore": false
+    },
+    "runtime": {
+      "runtime_source": "package",
+      "package": {
+        "filename": "OpenMS-3.7.0-pre-nightly-2026-11-19-Debian-Linux-x86_64.deb",
+        "sha256": "8ddd5904794f6b24fb18e9753b14001b160c0ed3e818d94f413eaf54a6d0f34a",
+        "archive_dir": "2026.11.20",
+        "date": "2026-11-19"
+      }
+    }
+  },
+  "run": {
+    "run_id": "44860491754",
+    "run_at": "2026-11-21T03:20:32Z",
+    "cache": "none"
+  },
+  "performance": {
+    "wall_time_s": 15.309999999999999,
+    "cpu_time_s": 0.4,
+    "peak_rss_kb": 82248,
+    "build": {
+      "wall_time_s": 0.0,
+      "artifact_bytes": 706543151
+    },
+    "stages": [
+      {
+        "name": "decoy_database",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 5.02,
+        "cpu_time_s": 0.01,
+        "peak_rss_kb": 53432,
+        "status": "pass",
+        "reason": ""
+      },
+      {
+        "name": "comet",
+        "required": true,
+        "exit_code": 0,
+        "wall_time_s": 5.23,
+        "cpu_time_s": 0.28,
+        "peak_rss_kb": 82248,
+        "status": "pass",
+        "reason": ""
+      },
+      {
+        "name": "percolator",
+        "required": false,
+        "exit_code": 0,
+        "wall_time_s": 5.06,
+        "cpu_time_s": 0.11,
+        "peak_rss_kb": 65932,
+        "status": "pass",
+        "reason": ""
+      }
+    ]
+  },
+  "metrics": {
+    "verdict": "pass"
+  },
+  "tool_versions": {
+    "FileConverter_version": "3.7.0-pre-nightly-2026-11-19 Nov 20 2026, 01:21:19, Revision: 6be4c55",
+    "CometAdapter_version": "3.7.0-pre-nightly-2026-11-19 Nov 20 2026, 01:21:19, Revision: 6be4c55",
+    "DecoyDatabase_version": "3.7.0-pre-nightly-2026-11-19 Nov 20 2026, 01:21:19, Revision: 6be4c55",
+    "PercolatorAdapter_version": "3.7.0-pre-nightly-2026-11-19 Nov 20 2026, 01:21:19, Revision: 6be4c55",
+    "comet_engine_version": "",
+    "percolator_engine_version": "Exception caught: Percolator version 3.06.0, Build Date Mar 11 2025 11:26:42"
+  }
+}
