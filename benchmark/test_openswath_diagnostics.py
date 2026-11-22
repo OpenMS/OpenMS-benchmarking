@@ -2,9 +2,10 @@
 """Tests for openswath_diagnostics.py (OpenSwath DIA failure diagnostics).
 
 Covers the cases the runner has to survive once openswath.json says "not pass":
-a real library_error, an empty one, a missing key, malformed JSON, a JSON value
-that is not an object, and a missing file. Also checks that the rendered output
-stays bounded, because it is written to a CI log.
+a real library_error, a real feature_count_error, both together, empty and
+non-string values, a missing library key, malformed JSON, a JSON value that is
+not an object, and a missing file. Also checks that the rendered output stays
+bounded, because it is written to a CI log.
 
 Run:  python3 benchmark/test_openswath_diagnostics.py
 """
@@ -139,6 +140,53 @@ def test_non_string_library_error_is_reported():
     print("PASS: a non-string library_error is reported by type, not dumped")
 
 
+def test_valid_feature_count_error_is_reported():
+    with tempfile.TemporaryDirectory() as tmp:
+        message = (
+            "featureXML contains 5 top-level feature(s), but the reference run "
+            "is expected to produce 6; the output is incomplete"
+        )
+        path = _write(tmp, _report(feature_count_error=message))
+        out = _joined(od.describe_failure(path))
+
+        assert "verdict: fail" in out, out
+        assert ("feature_count_error: " + message) in out, out
+        # a feature-count-only failure has no library_error, and that is explicit
+        assert "library_error: (key absent" in out, out
+    print("PASS: a valid feature_count_error is printed verbatim")
+
+
+def test_feature_and_library_errors_coexist():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = _report(
+            library_error="join failed",
+            feature_count_error="featureXML contains 5 top-level feature(s)",
+        )
+        out = _joined(od.describe_failure(_write(tmp, report)))
+
+        assert "library_error: join failed" in out, out
+        assert "feature_count_error: featureXML contains 5" in out, out
+    print("PASS: library and feature-count errors are both reported")
+
+
+def test_empty_feature_count_error_is_named():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, _report(feature_count_error="   "))
+        out = _joined(od.describe_failure(path))
+
+        assert "feature_count_error: (empty string)" in out, out
+    print("PASS: an empty feature_count_error is named instead of printed as blank")
+
+
+def test_non_string_feature_count_error_is_reported():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, _report(feature_count_error={"detail": "nested"}))
+        out = _joined(od.describe_failure(path))
+
+        assert "feature_count_error: (not a string: dict)" in out, out
+    print("PASS: a non-string feature_count_error is reported by type, not dumped")
+
+
 def test_main_never_changes_exit_status():
     with tempfile.TemporaryDirectory() as tmp:
         missing = os.path.join(tmp, "absent.json")
@@ -157,6 +205,10 @@ def main():
     test_missing_file_is_reported()
     test_long_error_is_clipped()
     test_non_string_library_error_is_reported()
+    test_valid_feature_count_error_is_reported()
+    test_feature_and_library_errors_coexist()
+    test_empty_feature_count_error_is_named()
+    test_non_string_feature_count_error_is_reported()
     test_main_never_changes_exit_status()
     print("\nAll openswath_diagnostics tests passed.")
 

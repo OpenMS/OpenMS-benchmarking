@@ -1,0 +1,286 @@
+name: Runner smoke test
+
+# First-stage validation of the self-hosted benchmark runner (issue #24).
+#
+# Trust model and safety properties:
+#   * Manual dispatch only. workflow_dispatch requires write access to the
+#     repository, so untrusted fork code can never trigger this workflow.
+#     There is deliberately no pull_request / push / schedule trigger.
+#   * No actions/checkout: the smoke test must not execute repository-controlled
+#     scripts, build hooks or checked-out content on the self-hosted machine.
+#   * Read-only probe: no package installation, no system/runner configuration
+#     changes, no secrets referenced, no artifacts uploaded. Findings are printed
+#     to the job log only.
+#
+# This repository is public, so the job log is public too. Output is therefore
+# limited to non-identifying environment facts: no host name, no user or
+# directory layout, no device names, no environment dump, no credentials.
+#
+# Scope: this job validates *only* that the runner is reachable and that the
+# basic toolchain is present. It deliberately does NOT validate:
+#   * outbound network access (github.com, raw.githubusercontent.com,
+#     archive.openms.de) needed by the build and package paths;
+#   * vcpkg/CMake configuration or an OpenMS source build;
+#   * realistic disk headroom for a full build plus artifacts;
+#   * benchmark execution or result correctness (smoke/OpenSwath stages).
+# Those are separate, later validation stages.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: Self-hosted runner smoke test
+    # Targeting: the runner's label set is unconfirmed - the repository contains
+    # no self-hosted reference, no job has ever run on it, and the runners API
+    # requires admin auth (HTTP 401). `self-hosted` is therefore the only label
+    # we can justify, and it matches *any* self-hosted runner registered to this
+    # repository. Precondition: the owner confirms that this single runner is
+    # the only self-hosted runner in scope; otherwise replace this with explicit
+    # labels (e.g. [self-hosted, linux, x64, <custom>]) once they are known.
+    # The CPU count and memory below reveal which machine actually ran the job.
+    runs-on: self-hosted
+    timeout-minutes: 15
+
+    steps:
+      - name: Runner identity
+        run: |
+          set -uo pipefail
+
+          echo "RUNNER_OS:          ${RUNNER_OS:-<unset>}"
+          echo "RUNNER_ARCH:        ${RUNNER_ARCH:-<unset>}"
+          echo "RUNNER_ENVIRONMENT: ${RUNNER_ENVIRONMENT:-<unset>}"
+          echo "run_id:             ${GITHUB_RUN_ID:-<unset>}"
+          echo "trigger_ref:        ${GITHUB_REF:-<unset>}"
+          echo "workflow:           ${GITHUB_WORKFLOW:-<unset>}"
+
+          # Deliberately not printed: RUNNER_NAME (usually the host name), the
+          # full environment, and any token/credential variable.
+
+      - name: Operating system
+        run: |
+          set -uo pipefail
+
+          # -srm omits the node name so the host name is not disclosed.
+          echo "uname -srm: $(uname -srm 2>&1)"
+          echo "kernel:     $(uname -r 2>&1)"
+          echo "machine:    $(uname -m 2>&1)"
+
+          if [ -r /etc/os-release ]; then
+            echo "distribution (/etc/os-release):"
+            while IFS='=' read -r key value; do
+              case "$key" in
+                PRETTY_NAME|NAME|ID|ID_LIKE|VERSION_ID|VERSION_CODENAME)
+                  echo "  ${key}=${value//\"/}"
+                  ;;
+              esac
+            done < /etc/os-release
+          else
+            echo "distribution: /etc/os-release not readable"
+          fi
+
+          if [ -r /etc/issue ]; then
+            echo "distribution (/etc/issue): $(head -n 1 /etc/issue | sed 's/[[:space:]]*$//')"
+          fi
+
+      - name: Hardware
+        run: |
+          set -uo pipefail
+
+          if command -v nproc >/dev/null 2>&1; then
+            echo "cpu_count: $(nproc)"
+            # nproc reports the processing units available to this process (its
+            # CPU affinity mask, further bounded by OMP_NUM_THREADS /
+            # OMP_THREAD_LIMIT when set); nproc --all reports every installed
+            # processor, ignoring affinity. A gap therefore indicates a
+            # restricted CPU set, not a CFS bandwidth quota.
+            echo "cpu_count_host: $(nproc --all 2>/dev/null || echo unsupported)"
+          else
+            echo "cpu_count: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
+          fi
+
+          if [ -r /proc/cpuinfo ]; then
+            model="$(grep -m1 -E '^(model name|Hardware|Processor)[[:space:]]*:' /proc/cpuinfo | sed 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//')"
+            echo "cpu_model: ${model:-not reported by /proc/cpuinfo}"
+          else
+            echo "cpu_model: /proc/cpuinfo not readable"
+          fi
+
+          # Host memory as reported by the kernel. On a containerized runner
+          # this is the host's view, not necessarily what this job may use.
+          if [ -r /proc/meminfo ]; then
+            mem_total="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+            mem_avail="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            mem_free="$(awk '/^MemFree:/ {print $2}' /proc/meminfo)"
+            echo "mem_host_total_kb:     ${mem_total:-?}"
+            echo "mem_host_available_kb: ${mem_avail:-${mem_free:-?}}"
+            if [ -n "${mem_total:-}" ]; then
+              echo "mem_host_total_gib: $(awk -v kb="$mem_total" 'BEGIN {printf "%.1f", kb / 1048576}')"
+            fi
+          else
+            echo "mem_host: /proc/meminfo not readable"
+          fi
+
+          # Effective memory limit imposed by the cgroup hierarchy, if any.
+          # cgroup v2: /sys/fs/cgroup/memory.max ("max" = no limit set).
+          # cgroup v1: .../memory.limit_in_bytes (a huge page-aligned sentinel
+          # around 9223372036854771712 = no limit set).
+          # Nested or unusual cgroup layouts can hide the effective limit, so a
+          # numeric value here is the best available signal, not proof of what
+          # this job can actually allocate.
+          mem_cgroup_limit_bytes=""
+          mem_cgroup_note="unknown - no usable cgroup memory limit"
+          for limit_file in /sys/fs/cgroup/memory.max \
+                            /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+            [ -r "$limit_file" ] || continue
+            raw_limit="$(head -n 1 "$limit_file" 2>/dev/null | tr -d '[:space:]')"
+            case "$raw_limit" in
+              max) mem_cgroup_note="none reported - memory.max is 'max'"; break ;;
+              ''|*[!0-9]*) continue ;;
+            esac
+            # 19+ digits is the v1 unlimited sentinel, not a real byte limit.
+            if [ "${#raw_limit}" -gt 18 ]; then
+              mem_cgroup_note="none reported - v1 unlimited sentinel"
+              break
+            fi
+            if [ "$raw_limit" -eq 0 ]; then continue; fi
+            mem_cgroup_limit_bytes="$raw_limit"
+            break
+          done
+          if [ -n "$mem_cgroup_limit_bytes" ]; then
+            echo "mem_cgroup_limit_bytes: $mem_cgroup_limit_bytes"
+            echo "mem_cgroup_limit_gib:   $(awk -v b="$mem_cgroup_limit_bytes" 'BEGIN {printf "%.1f", b / 1073741824}')"
+          else
+            echo "mem_cgroup_limit: $mem_cgroup_note"
+          fi
+
+          # Sizes only: device names and mount paths are internal details that
+          # do not belong in a public job log. stat -f is used instead of df,
+          # whose columns shift when a device name contains spaces.
+          disk_row() {
+            label="$1"
+            target="$2"
+            line="$(stat -f -c '%S %b %a' "$target" 2>/dev/null | awk -v label="$label" \
+              'NF == 3 { printf "  %-9s total=%.1f GiB available=%.1f GiB used=%.0f%%\n", label, $1 * $2 / 1073741824, $1 * $3 / 1073741824, ($2 > 0 ? 100 - 100 * $3 / $2 : 0) }')"
+            echo "${line:-  ${label}: disk info unavailable}"
+          }
+          echo "disk (GiB):"
+          disk_row root /
+          disk_row workspace "${GITHUB_WORKSPACE:-.}"
+          disk_row temp "${RUNNER_TEMP:-/tmp}"
+
+      - name: Required tools
+        run: |
+          set -uo pipefail
+          fail=0
+
+          ok()     { printf 'OK       required: %-14s %s\n' "$1" "$2"; }
+          bad()    { printf 'MISSING  required: %-14s %s\n' "$1" "$2"; fail=1; }
+          broken() { printf 'BROKEN   required: %-14s %s\n' "$1" "$2"; fail=1; }
+
+          # A required tool counts as usable only if it exists AND its version
+          # command succeeds with output: a broken shim or wrapper would
+          # otherwise be reported as merely present.
+          check_tool() {
+            tool="$1"
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              bad "$tool" "not found on PATH"
+              return
+            fi
+            tool_out="$("$tool" --version 2>&1)"
+            tool_rc=$?
+            tool_first="${tool_out%%$'\n'*}"
+            if [ "$tool_rc" -eq 0 ] && [ -n "$tool_first" ]; then
+              ok "$tool" "$tool_first"
+            else
+              broken "$tool" "found on PATH but --version exited $tool_rc: ${tool_first:-<no output>}"
+            fi
+          }
+
+          if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+            ok "platform" "Linux"
+          else
+            bad "platform" "$(uname -s 2>/dev/null || echo unknown) - all benchmark workflows require Linux"
+          fi
+
+          check_tool bash
+          check_tool git
+          check_tool python3
+          check_tool cmake
+          check_tool ninja
+
+          compiler=""
+          compiler_version=""
+          compiler_problem=""
+          for candidate in g++ clang++ c++; do
+            command -v "$candidate" >/dev/null 2>&1 || continue
+            candidate_out="$("$candidate" --version 2>&1)"
+            candidate_rc=$?
+            candidate_first="${candidate_out%%$'\n'*}"
+            if [ "$candidate_rc" -eq 0 ] && [ -n "$candidate_first" ]; then
+              compiler="$candidate"
+              compiler_version="$candidate_first"
+              break
+            fi
+            compiler_problem="$candidate: --version exited $candidate_rc"
+          done
+          if [ -n "$compiler" ]; then
+            ok "C++ compiler" "$compiler: $compiler_version"
+          elif [ -n "$compiler_problem" ]; then
+            broken "C++ compiler" "found on PATH but not usable ($compiler_problem)"
+          else
+            bad "C++ compiler" "none of g++, clang++ or c++ found on PATH"
+          fi
+
+          # The benchmark runners use `/usr/bin/time -v`; a BSD time binary
+          # accepts no -v and would silently degrade CPU/RSS metrics.
+          if [ ! -e /usr/bin/time ]; then
+            bad "GNU time" "/usr/bin/time absent (benchmark peak-RSS/CPU metrics degrade)"
+          elif /usr/bin/time --version 2>&1 | head -n 1 | grep -qi 'GNU time'; then
+            ok "GNU time" "$(/usr/bin/time --version 2>&1 | head -n 1)"
+          else
+            bad "GNU time" "/usr/bin/time present but not GNU time (no -v support)"
+          fi
+
+          echo
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Required runner prerequisites are missing or unusable (see MISSING/BROKEN lines above)."
+            exit 1
+          fi
+          echo "All required runner prerequisites are present and working."
+
+      - name: Optional tools (non-blocking)
+        if: always()
+        run: |
+          set -uo pipefail
+
+          note() { printf '%-8s optional: %-8s %s\n' "$1" "$2" "$3"; }
+          have() { command -v "$1" >/dev/null 2>&1; }
+
+          if have ccache; then
+            note PRESENT ccache "$(ccache --version 2>&1 | head -n 1)"
+          else
+            note ABSENT ccache "not installed - builds would run cold"
+          fi
+
+          if have sudo; then
+            # -n never prompts and changes nothing: it only reports whether
+            # passwordless sudo would work for deps-ubuntu.sh.
+            if sudo -n true >/dev/null 2>&1; then
+              note PRESENT sudo "passwordless sudo works (deps-ubuntu.sh could install build tools)"
+            else
+              note ABSENT sudo "installed but no passwordless access (deps-ubuntu.sh would fail)"
+            fi
+          else
+            note ABSENT sudo "not installed (deps-ubuntu.sh would fail)"
+          fi
+
+          echo
+          echo "Optional tools never fail this job."

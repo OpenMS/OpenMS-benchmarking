@@ -90,6 +90,16 @@ write_report '{"verdict":"fail","stages":[{"name":"openswath_workflow","required
 check "absent library_error" "library_error: (key absent"
 check "failing stage is named" "stage openswath_workflow: status=fail exit_code=1"
 
+# --- feature-count failure ---------------------------------------------------
+write_report '{"verdict":"fail","stages":[],"correctness":{"feature_count_error":"featureXML contains 5 top-level feature(s), but the reference run is expected to produce 6; the output is incomplete"}}'
+check "feature_count_error" "feature_count_error: featureXML contains 5 top-level feature(s), but the reference run is expected to produce 6; the output is incomplete"
+check "feature-count failure keeps the absent library note" "library_error: (key absent"
+
+# --- both correctness errors -------------------------------------------------
+write_report '{"verdict":"fail","stages":[],"correctness":{"library_error":"join failed","feature_count_error":"featureXML contains 5 top-level feature(s); output incomplete"}}'
+check "both errors: library" "library_error: join failed"
+check "both errors: feature count" "feature_count_error: featureXML contains 5 top-level feature(s); output incomplete"
+
 # --- malformed JSON ----------------------------------------------------------
 write_report '{"verdict": "fail", "correctness": {'
 check "malformed JSON" "not valid JSON"

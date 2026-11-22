@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """Explain a failed OpenSwath benchmark report from openswath.json.
 
-The runner used to print only::
-
-    library join failed - see library_error in openswath.json
-
-which names the field but not its value, so a CI failure did not say *why* the
-TraML <-> featureXML join failed. This module renders that value, or states
-precisely why there is none (missing file, unreadable file, malformed JSON,
-absent or empty ``correctness.library_error``), and lists the non-passing
-stages and the artifacts the join consumed.
+The runner used to print only a field name, so a CI failure did not say *why*
+the run failed. This module renders the correctness errors in openswath.json
+(``library_error`` and ``feature_count_error``), states precisely why a present
+field has no usable value (missing file, unreadable file, malformed JSON, absent
+or empty field), and lists the non-passing stages and the artifacts the run
+produced.
 
 Everything here is best-effort: the caller is already on a failure path, so
 ``describe_failure`` never raises for bad input and ``main`` never changes the
@@ -20,16 +17,16 @@ import json
 import os
 import sys
 
-#: A library_error is a short message from openswath_metrics, but clip anyway:
-#: a future error could embed a whole transition list, and the log is not a
-#: place for that.
+#: A correctness error is a short message from the runner, but clip anyway: a
+#: future error could embed a whole transition list, and the log is not a place
+#: for that.
 MAX_ERROR_CHARS = 2000
 
 #: Stages are already summarised in stages.tsv; the log only needs the ones
 #: that did not pass.
 MAX_STAGE_LINES = 8
 
-#: Files the join consumes or produces, reported as present/absent with size.
+#: Files the run consumes or produces, reported as present/absent with size.
 ARTIFACTS = ("output.featureXML", "output.chrom.mzML", "output.json")
 
 
@@ -123,6 +120,23 @@ def describe_failure(json_path):
                 lines.extend("  %s" % part for part in clipped.splitlines())
             else:
                 lines.append("library_error: %s" % clipped)
+
+    if isinstance(correctness, dict) and "feature_count_error" in correctness:
+        error = correctness["feature_count_error"]
+        if not isinstance(error, str):
+            lines.append(
+                "feature_count_error: (not a string: %s)"
+                % type(error).__name__
+            )
+        elif not error.strip():
+            lines.append("feature_count_error: (empty string)")
+        else:
+            clipped = _clip(error)
+            if "\n" in clipped:
+                lines.append("feature_count_error:")
+                lines.extend("  %s" % part for part in clipped.splitlines())
+            else:
+                lines.append("feature_count_error: %s" % clipped)
 
     lines.extend(_stage_lines(report))
     lines.extend(_artifact_lines(os.path.dirname(os.path.abspath(json_path))))

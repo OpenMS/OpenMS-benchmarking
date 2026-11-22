@@ -199,7 +199,8 @@ log "  [OK] Percolator: ${PERCOLATOR_EXE}"
   echo "peptdeep_instrument=${PEPTDEEP_INSTRUMENT}"
   echo "threads=${PROSE_THREADS}"
   echo "prose_extra_search_args=${PROSE_EXTRA_SEARCH_ARGS:-}"
-  echo "prose_version=$("${PROSE_EXE}" --version 2>&1 | head -1 || true)"
+  version="$("${PROSE_EXE}" -help 2>&1 | sed -n 's/^[[:space:]]*Version:[[:space:]]*//p' | head -n 1 || true)"
+  echo "prose_version=${version:-unknown}"
 } > "${RESULTS_DIR}/meta.txt"
 log "versions recorded in meta.txt"
 
@@ -339,7 +340,7 @@ report = {
         "prose_extra_search_args": meta.get("prose_extra_search_args", ""),
     },
     "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-    "run_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "run_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "tool_versions": {k: v for k, v in meta.items() if k.endswith("_version")},
 }
 

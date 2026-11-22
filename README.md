@@ -1,4 +1,4 @@
-# OpenMS Benchmarking
+﻿# OpenMS Benchmarking
 
 [![CI](https://github.com/OpenMS/OpenMS-benchmarking/actions/workflows/benchmark.yml/badge.svg)](https://github.com/OpenMS/OpenMS-benchmarking/actions/workflows/benchmark.yml)
 
@@ -73,15 +73,15 @@ SWATH window list). The vendored fixtures include OpenMS' reference outputs,
 which the benchmark uses to validate correctness alongside the performance
 measurements. It runs in CI as a separate job after the OpenMS build. Runner:
 `benchmark/run_openswath_benchmark.sh` (definition: `openswath.json`). Raw
-results are normalized with `normalize openswath` and stored under
-`benchmark/results/openswath_dia/openms/`, giving OpenSwath the same
-baseline/history/comparison lifecycle as the smoke benchmark.
+results are normalized with `normalize openswath` and stored on the
+`benchmark-results` branch under `openswath_dia/openms/`, giving OpenSwath the
+same baseline/history/comparison lifecycle as the smoke benchmark.
 
 ### ProteoBench reference results
 
 ProteoBench results - produced externally by a local ProteoBench scorer
-(quantms on the PXD028735 dataset) - are stored under
-`benchmark/results/tools/` and pulled into the HTML report as external
+(quantms on the PXD028735 dataset) - stay on `main` under
+`benchmark/results/tools/` and are pulled into the HTML report as external
 reference context. They are not an OpenMS version-to-version baseline, and the
 report does not rank tools or workflows. Definition: `proteobench.json` (no
 runner - results are generated externally and normalized locally).
@@ -105,7 +105,8 @@ raw benchmark results              smoke.json / openswath.json, stages.tsv, logs
 report_generate.py normalize       convert raw output to the common schema
         |
         v
-benchmark/results/                 stored, schema-versioned results
+benchmark-results/ (branch)        generated run history (nightly commits)
+benchmark/results/tools/           reference results from other tools (main)
         |
         v
 report_generate.py render          compare current run vs stored baseline
@@ -153,16 +154,71 @@ and pipeline outputs.
 Results and reporting
 --------
 
-Results are machine-readable JSON, stored under `benchmark/results/`
-(schema `openms-benchmarking/report/v2`; older v1 files are promoted
-automatically):
+Results are machine-readable JSON (schema
+`openms-benchmarking/report/v2`; older v1 files are promoted automatically):
 
 ```
-benchmark/results/
-  openms/   smoke-<run-id>.json     # OpenMS benchmark runs (the comparison history)
-  openswath_dia/openms/             # stored OpenSwath DIA runs (comparison history)
-  tools/    proteobench-*.json      # reference results from other tools/sources
+benchmark/results/                 # on main
+  openms/                          # historical runs from before the split
+  openswath_dia/openms/
+  proteobench/external/            # pinned ProteoBench snapshot
+  tools/                           # reference results from other tools
+
+benchmark-results (branch)         # generated run history (nightly commits)
+  openms/smoke-<run-id>.json
+  openswath_dia/openms/openswath_dia-<run-id>.json
 ```
+
+`main` keeps code, the pinned ProteoBench snapshot, the tool-reference JSONs
+and the historical run trees produced before the split; generated run JSONs are
+committed by the nightly workflow to the unprotected `benchmark-results`
+branch. The Pages workflow assembles a temporary `site-results/` tree as the
+**union** of `main`'s historical runs (`benchmark/results/openms/`,
+`benchmark/results/openswath_dia/openms/`) and the data branch's generated
+runs, plus `main`'s `tools/`, and renders it. A run present in both trees is
+kept once when the bytes are identical; differing bytes at the same relative
+path fail the build instead of letting one copy silently replace the other.
+Keeping only one source would drop runs that exist nowhere else.
+
+Recover a nightly run whose persistence failed with
+`benchmark/recover_nightly_results.py`: it is dry-run by default and never
+pushes. The data branch holds only result JSONs, so it has no copy of the
+script: keep the code checkout on `main` and give the script a separate
+worktree of `benchmark-results` through `--repo-dir`.
+
+```bash
+# Once, from the main checkout that contains the script:
+#   (omit -b when a local benchmark-results branch already exists)
+git fetch origin
+git worktree add ../openms-benchmarking-data -b benchmark-results origin/benchmark-results
+
+# Dry run: validates and stages, writes and commits nothing.
+python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data
+
+# Import: one commit per benchmark run, no push.
+python benchmark/recover_nightly_results.py --repo-dir ../openms-benchmarking-data --apply
+
+# Review the commits in the data worktree, then push the branch yourself.
+git -C ../openms-benchmarking-data log --oneline -5
+git -C ../openms-benchmarking-data push origin benchmark-results
+```
+
+`--apply` requires that worktree to be checked out on `benchmark-results` with
+a clean working tree. Before applying it fetches `origin/main` and
+`origin/benchmark-results` and refuses to continue if either cannot be
+resolved or if the local branch is behind the remote tip, so a stale clone can
+neither miss a collision nor commit onto the wrong base. Both arms of a run
+must also carry the same package identity (`identity.runtime.package`:
+`filename`, `sha256`, `archive_dir`, `date`, each a non-empty string) - the
+same contract the nightly workflow enforces before staging - so a
+mixed-package or pair missing the required package identity is refused rather than imported.
+Re-running the same selection is safe: runs already present byte-identically
+are reported as already present and skipped, a partially present or differing
+pair fails closed, and a failure partway through restores the checkout so the command can
+simply be run again. The preflight fetch bounds, but does not eliminate, the
+race with a branch moving during the download: `main` is protected, so no
+concurrent run can add a result file there, and all writes target the data
+branch, whose tip the nightly workflow re-fetches right before pushing.
 
 `benchmark/report/report_generate.py` has two stages: `normalize` converts a
 raw result into the common schema, adding run metadata the runner cannot know
@@ -251,8 +307,9 @@ that have actually executed - it is never inferred from binary availability.
 (`.github/workflows/nightly-benchmark.yml`) runs the package-mode pipeline
 daily (and on `workflow_dispatch`): it dispatches `benchmark.yml` with
 `runtime_source=package`, waits for the run, persists the resulting
-Smoke/OpenSwath result JSONs to `benchmark/results/`, and pushes them to
-`main`; the Pages workflow then publishes the updated history. No build or
+Smoke/OpenSwath result JSONs to the unprotected `benchmark-results` branch
+(never to `main`); the Pages workflow then assembles the report input from
+that branch plus main's `tools/` and publishes the updated history. No build or
 runner logic is involved.
 
 Jobs, in dependency order:
@@ -340,8 +397,9 @@ benchmark/
     test_v2_schema.py             # v1 -> v2 promotion + schema tests
     test_generic_renderer.py      # generic renderer tests
   results/
-    openms/                       # stored OpenMS run results (comparison baseline)
-    tools/                        # reference results from other tools
+    proteobench/external/         # pinned ProteoBench snapshot (stays on main)
+    tools/                        # reference results from other tools (stays on main)
+                                  #   generated run JSONs live on the `benchmark-results` branch
   reports/                        # generated report.html
 ```
 
