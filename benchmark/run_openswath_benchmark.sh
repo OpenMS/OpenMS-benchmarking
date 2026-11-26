@@ -118,6 +118,14 @@ run_stage() {
   record_stage "${name}" "${required}" "${rc}" "${wall_s}" "${cpu_s}" "${peak_kb}" "${status}" "${reason}"
 }
 
+# Print why openswath.json did not pass, without changing the exit status.
+# Best effort: a missing interpreter, a missing file or malformed JSON must not
+# replace the benchmark failure with a diagnostic error.
+report_openswath_failure() {
+  python3 "${SCRIPT_DIR}/openswath_diagnostics.py" "${RESULTS_DIR}/openswath.json" 2>&1 \
+    | while IFS= read -r line; do log "  ${line}"; done
+}
+
 # --- checks ------------------------------------------------------------------
 
 echo "=== OpenMS benchmark: OpenSwath DIA ===" | tee "${RESULTS_DIR}/summary.txt"
@@ -337,6 +345,9 @@ if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["verd
 else
   verdict="fail"
   log "benchmark correctness validation failed - see library_error / feature_count_error in openswath.json"
+  if ! report_openswath_failure; then
+    log "  (openswath diagnostics unavailable - see openswath.json)"
+  fi
 fi
 
 log ""

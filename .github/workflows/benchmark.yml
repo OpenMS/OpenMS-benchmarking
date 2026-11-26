@@ -774,6 +774,28 @@ jobs:
           name: benchmark-openswath-${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
           path: results-openswath
           if-no-files-found: error
+
+      # A failed "Run OpenSwath benchmark" step skips every later step (they
+      # default to success()), so the normalization and the results upload
+      # above would both be skipped and the evidence the failure needs would be
+      # lost with the runner. Capture it here instead. `failure() && !cancelled()`
+      # keeps the upload off cancelled runs; the explicit paths plus
+      # if-no-files-found: ignore mean a run that died before writing anything
+      # cannot turn one failure into two.
+      - name: Upload OpenSwath diagnostics on failure
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-openswath-diagnostics-${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
+          path: |
+            results-openswath/openswath.json
+            results-openswath/output.featureXML
+            results-openswath/output.json
+            results-openswath/summary.txt
+            results-openswath/stages.tsv
+            results-openswath/meta.txt
+            results-openswath/logs/**
+          if-no-files-found: ignore
   # ---------------------------------------------------------------------------
   # ProSE + PeptDeep ONNX pipeline validation.
   #

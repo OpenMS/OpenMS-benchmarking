@@ -53,6 +53,7 @@ jobs:
           set -euo pipefail
           for f in \
             benchmark/test_openswath_metrics.py \
+            benchmark/test_openswath_diagnostics.py \
             benchmark/test_prose_metrics.py \
             benchmark/test_proteobench_compare.py \
             benchmark/test_recover_nightly_results.py \
@@ -67,6 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bash benchmark/test_openswath_diagnostics.sh
           bash tests/test_id_validation.sh
           bash tests/test_dispatch_step.sh
           bash tests/test_pages_assembly.sh
