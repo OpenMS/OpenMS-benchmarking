@@ -644,6 +644,26 @@ jobs:
           path: results
           if-no-files-found: error
 
+      # A failed "Run smoke benchmark" step skips normalization and the upload
+      # above. Capture the runner's partial outputs here on failure (never on
+      # cancellation); explicit paths plus if-no-files-found: ignore ensure an
+      # early exit before results/ exists cannot mask the original failure.
+      - name: Upload smoke diagnostics on failure
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-smoke-diagnostics-${{ inputs.runtime_source == 'package' && needs.package-runtime.outputs.openms_sha || needs.build-openms.outputs.openms_sha }}
+          path: |
+            results/smoke.json
+            results/decoy.fasta
+            results/comet.idXML
+            results/rescored.idXML
+            results/summary.txt
+            results/stages.tsv
+            results/meta.txt
+            results/logs/**
+          if-no-files-found: ignore
+
   run-openswath-benchmark:
     name: "OpenSwath DIA benchmark"
     runs-on: ubuntu-24.04
@@ -1236,6 +1256,26 @@ jobs:
           path: results-prose
           if-no-files-found: error
 
+      # A failed benchmark or guard step skips normalization and the upload
+      # above. Capture the runner's per-arm outputs and logs here on failure
+      # (never on cancellation), tolerating missing paths on early aborts.
+      - name: Upload ProSE+PeptDeep diagnostics on failure
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-prose-diagnostics-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: |
+            results-prose/prose.json
+            results-prose/baseline.idXML
+            results-prose/peptdeep.idXML
+            results-prose/baseline_summary.yaml
+            results-prose/peptdeep_summary.yaml
+            results-prose/summary.txt
+            results-prose/stages.tsv
+            results-prose/meta.txt
+            results-prose/logs/**
+          if-no-files-found: ignore
+
   # ---------------------------------------------------------------------------
   # PXD028735 scientific-dataset benchmark (Phase-2c). Same pipeline-validation
   # scope as run-prose-peptdeep-benchmark above: the guards assert execution
@@ -1449,6 +1489,35 @@ jobs:
             results-prose-pxd028735-A
             results-prose-pxd028735-B
           if-no-files-found: error
+
+      # Capture evidence from both isolated PXD028735 runs on failure (never on
+      # cancellation). If run A fails before run B starts, if-no-files-found:
+      # ignore prevents missing run B paths from causing a secondary failure.
+      - name: Upload PXD028735 diagnostics on failure
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-prose-pxd028735-diagnostics-${{ needs.build-openms-onnx.outputs.openms_sha }}
+          path: |
+            results-prose-pxd028735-A/prose.json
+            results-prose-pxd028735-A/baseline.idXML
+            results-prose-pxd028735-A/peptdeep.idXML
+            results-prose-pxd028735-A/baseline_summary.yaml
+            results-prose-pxd028735-A/peptdeep_summary.yaml
+            results-prose-pxd028735-A/summary.txt
+            results-prose-pxd028735-A/stages.tsv
+            results-prose-pxd028735-A/meta.txt
+            results-prose-pxd028735-A/logs/**
+            results-prose-pxd028735-B/prose.json
+            results-prose-pxd028735-B/baseline.idXML
+            results-prose-pxd028735-B/peptdeep.idXML
+            results-prose-pxd028735-B/baseline_summary.yaml
+            results-prose-pxd028735-B/peptdeep_summary.yaml
+            results-prose-pxd028735-B/summary.txt
+            results-prose-pxd028735-B/stages.tsv
+            results-prose-pxd028735-B/meta.txt
+            results-prose-pxd028735-B/logs/**
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Nightly Debian .deb probe (opt-in, via the nightly_deb_probe input).
