@@ -9,11 +9,15 @@
 #
 # Creates (deterministically; nothing is vendored or committed):
 #   <out>/LFQ_Orbitrap_DDA_Condition_{A,B}_Sample_Alpha_01.mzML
-#   <out>/entrapment_hye.fasta     HYE targets + ENTRAPMENT_-prefixed real
-#                                  S. cellulosum So ce56 targets, via
-#                                  make_hye_entrapment_fasta.py (the source
-#                                  must be decoy-free - ProSE generates decoys
-#                                  itself via -Search:decoys auto)
+#   <out>/entrapment_hye_soce.fasta
+#                                  HYE targets + ENTRAPMENT_-prefixed real
+#                                  S. cellulosum So ce56 targets via
+#                                  make_hye_entrapment_fasta.py. SoCe-only:
+#                                  the non-SoCe/contaminant source entries are
+#                                  excluded (they overlap the HYE targets), and
+#                                  the source must be decoy-free - ProSE
+#                                  generates decoys itself via
+#                                  -Search:decoys auto
 #   <out>/PROVENANCE.txt           dataset accession, source URLs, sizes,
 #                                  sha256 of every input/output, parameters
 #
@@ -39,6 +43,7 @@ HYE_SHA256="d9ac434d88492c10c8e9a587ee7dbc9480fa0995fa07a6ba35a7da8abf39aa25"
 HYE_SIZE=16670994
 SOCE="doc/pyopenms/src/data/18Protein_SoCe_Tr_detergents_trace.fasta"
 SOCE_SHA256="714d53edaf768c5162715cae974cb3fa040477879bd999a45c28c66712a04ca8"
+ENTRAPMENT_FASTA="entrapment_hye_soce.fasta"
 
 # Pinned mzML runs: sha256 (from the Phase-2a pilot) + byte size (Content-Length).
 RUN_SHA_A="d044284fbb07ea14c3f2aa28b2f94f932d76cabba59f9a6238968f3fcda1d083"
@@ -117,12 +122,47 @@ for R in ${RUNS}; do
   fi
 done
 
-# 3. combined target + entrapment FASTA (fails closed on decoy-marked sources)
-echo "  [fasta] entrapment_hye.fasta"
+# 3. combined target + entrapment FASTA (SoCe-only; fails closed on
+# decoy-marked sources, target-overlapping entries or duplicate identifiers)
+echo "  [fasta] ${ENTRAPMENT_FASTA}"
+SUMMARY_FILE="$(mktemp)"
+trap 'rm -f "${SUMMARY_FILE}"' EXIT
 python3 "${HERE}/make_hye_entrapment_fasta.py" \
   --hye "${OUT_DIR}/ProteoBenchFASTA_MixedSpecies_HYE.fasta" \
   --soce "${SOCE_PATH}" \
-  --out "${OUT_DIR}/entrapment_hye.fasta" --force
+  --out "${OUT_DIR}/${ENTRAPMENT_FASTA}" \
+  --summary "${SUMMARY_FILE}" --force
+
+summary() { grep -E "^$1=" "${SUMMARY_FILE}" | head -1 | cut -d= -f2; }
+ENT_SOURCE=$(summary source_entries)
+ENT_RETAINED=$(summary retained_entries)
+ENT_EXCLUDED=$(summary excluded_entries)
+ENT_ACCESSIONS=$(summary overlap_accessions)
+ENT_NAMES=$(summary overlap_names)
+ENT_SEQUENCES=$(summary overlap_sequences)
+ENT_PEPTIDES=$(summary entrapment_peptides)
+ENT_SHARED=$(summary shared_peptides)
+ENT_SHARED_PCT=$(summary shared_peptide_pct)
+for value in "${ENT_SOURCE}" "${ENT_RETAINED}" "${ENT_EXCLUDED}" \
+             "${ENT_PEPTIDES}" "${ENT_SHARED}"; do
+  [[ "${value}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: incomplete entrapment summary (${SUMMARY_FILE})" >&2
+    exit 4
+  }
+done
+[[ $((ENT_RETAINED + ENT_EXCLUDED)) -eq ${ENT_SOURCE} ]] || {
+  echo "ERROR: entrapment entry counts do not add up" >&2
+  exit 4
+}
+[[ "${ENT_RETAINED}" -gt 0 ]] || {
+  echo "ERROR: no S. cellulosum So ce56 entrapment entries retained" >&2
+  exit 4
+}
+[[ "${ENT_ACCESSIONS}" == "0" && "${ENT_NAMES}" == "0" \
+   && "${ENT_SEQUENCES}" == "0" ]] || {
+  echo "ERROR: entrapment set overlaps the HYE targets" >&2
+  exit 4
+}
 
 # 4. provenance record
 {
@@ -136,6 +176,16 @@ python3 "${HERE}/make_hye_entrapment_fasta.py" \
   echo "hye_fasta_sha256=${HYE_SHA256}"
   echo "soce_fasta=${SOCE}"
   echo "soce_fasta_sha256=${SOCE_SHA256}"
+  echo "entrapment_fasta=${ENTRAPMENT_FASTA}"
+  echo "entrapment_fasta_sha256=$(sha256sum "${OUT_DIR}/${ENTRAPMENT_FASTA}" | cut -d' ' -f1)"
+  echo "entrapment_source_entries=${ENT_SOURCE}"
+  echo "entrapment_retained_entries=${ENT_RETAINED}"
+  echo "entrapment_excluded_entries=${ENT_EXCLUDED}"
+  echo "entrapment_excluded_definition=non-SoCe source entries: 104 bare ACC|NAME contaminants without OS= (human keratins, trypsins, BSA, ...) plus 15 db-prefixed entries from other organisms"
+  echo "entrapment_target_overlap=accessions ${ENT_ACCESSIONS}, protein names ${ENT_NAMES}, sequences ${ENT_SEQUENCES}"
+  echo "entrapment_shared_peptides=${ENT_SHARED}/${ENT_PEPTIDES} (${ENT_SHARED_PCT}%; engine-independent measurement)"
+  echo "entrapment_shared_peptide_definition=measurement convention only, engine-independent - NOT the ProSE or Sage search settings: trypsin (KR|P), 0-2 missed cleavages, 7-50 aa; shared peptides counted as entrapment (conservative)"
+  echo "entrapment_shared_peptide_note=the percentage is a property of the two FASTA sets, not of the search configuration; ProSE's actual defaults (trypsin, 7-40 aa, 1 missed cleavage, 100-9000 Da) measure 0.150% on the same sets; Sage's DEFAULT digestion (5-50 aa, 1 missed cleavage, no mass window) measures 3.59%, which describes Sage defaults only and not the explicitly configured one-off Sage run"
   echo "base_url=${BASE_URL}"
   for R in ${RUNS}; do
     GZ="LFQ_Orbitrap_DDA_Condition_${R}_Sample_Alpha_01.mzML.gz"
@@ -144,12 +194,12 @@ python3 "${HERE}/make_hye_entrapment_fasta.py" \
     echo "run_${R}_size=${RUN_SIZE[${R}]}"
   done
   echo "# all files below, sha256:"
-  ( cd "${OUT_DIR}" && sha256sum ProteoBenchFASTA_MixedSpecies_HYE.fasta entrapment_hye.fasta \
+  ( cd "${OUT_DIR}" && sha256sum ProteoBenchFASTA_MixedSpecies_HYE.fasta "${ENTRAPMENT_FASTA}" \
       LFQ_Orbitrap_DDA_Condition_*_Sample_Alpha_01.mzML.gz \
       LFQ_Orbitrap_DDA_Condition_*_Sample_Alpha_01.mzML )
   echo "# search parameters (applied identically to both arms by run_prose_benchmark.sh):"
   echo "search_params=precursor 10 ppm (ProSE default, published); fragment 0.02 Da (published; passed via PROSE_EXTRA_SEARCH_ARGS); closed search; decoys auto"
-  echo "entrapment_design=absent-organism S. cellulosum So ce56 targets, ENTRAPMENT_-prefixed; shared tryptic peptides count as entrapment (conservative)"
+  echo "entrapment_design=absent-organism S. cellulosum So ce56 ONLY (9,320 of 9,439 source entries retained; 119 non-SoCe/contaminant entries excluded), ENTRAPMENT_-prefixed; zero accession/name/sequence overlap with the HYE target FASTA; shared tryptic peptides count as entrapment (conservative)"
   echo "generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 } > "${OUT_DIR}/PROVENANCE.txt"
 
