@@ -1291,7 +1291,7 @@ jobs:
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           PROSE_INPUT: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/LFQ_Orbitrap_DDA_Condition_A_Sample_Alpha_01.mzML
-          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
+          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye_soce.fasta
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
           LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib
@@ -1360,7 +1360,7 @@ jobs:
         env:
           OPENMS_BIN: ${{ github.workspace }}/openms/build/bin
           PROSE_INPUT: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/LFQ_Orbitrap_DDA_Condition_B_Sample_Alpha_01.mzML
-          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye.fasta
+          PROSE_FASTA: ${{ github.workspace }}/benchmark/generated/prose-pxd028735/entrapment_hye_soce.fasta
           ENGINES_DIR: ${{ github.workspace }}/openms/_thirdparty
           PROSE_EXTRA_SEARCH_ARGS: "-Search:fragment:mass_tolerance 0.02 -Search:fragment:mass_tolerance_unit Da"
           LD_LIBRARY_PATH: ${{ github.workspace }}/openms/build/lib:${{ github.workspace }}/openms/build/vcpkg_installed/x64-linux-dynamic/lib

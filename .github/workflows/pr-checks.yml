@@ -54,6 +54,7 @@ jobs:
           for f in \
             benchmark/test_openswath_metrics.py \
             benchmark/test_prose_metrics.py \
+            benchmark/test_make_hye_entrapment_fasta.py \
             benchmark/test_proteobench_compare.py \
             benchmark/test_recover_nightly_results.py \
             benchmark/test_runner_timestamps.py \
