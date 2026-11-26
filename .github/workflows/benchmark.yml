@@ -781,7 +781,9 @@ jobs:
       # lost with the runner. Capture it here instead. `failure() && !cancelled()`
       # keeps the upload off cancelled runs; the explicit paths plus
       # if-no-files-found: ignore mean a run that died before writing anything
-      # cannot turn one failure into two.
+      # cannot turn one failure into two. On the vendored fixture,
+      # output.chrom.mzML is ~47 KB reference / ~120 KB runtime (comparable to
+      # output.featureXML at ~36 KB / ~82 KB).
       - name: Upload OpenSwath diagnostics on failure
         if: ${{ failure() && !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -790,6 +792,7 @@ jobs:
           path: |
             results-openswath/openswath.json
             results-openswath/output.featureXML
+            results-openswath/output.chrom.mzML
             results-openswath/output.json
             results-openswath/summary.txt
             results-openswath/stages.tsv
