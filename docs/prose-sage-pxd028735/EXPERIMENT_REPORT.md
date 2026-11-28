@@ -415,3 +415,11 @@ the audit machine); they are provenance, not repository content.
 | `logs/` | per-run command line, stdout, stderr, exit code, `/usr/bin/time -v` |
 | `results/` | the six raw outputs listed above |
 | `scripts/` | run scripts, parameter set, preflight guard |
+
+## Acknowledgements and Project Contributions
+
+All research decisions, experimental design, analysis, documentation, repository changes, and
+commits were carried out by the project author. Codebuff and ChatGPT provided AI-assisted support
+during the development, auditing, analysis, documentation, and reproducibility review of this
+work. The project author retained responsibility for reviewing and approving the work and its
+final results.
